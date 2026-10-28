@@ -100,8 +100,9 @@ struct SetArgs {
     int skip_le = 0;   // (the tiles) the experts of at most this many rows are left out: the light kernels took them
 };
 /// (DS4_IQ_SET2, gate / up) the caller's room for a set's gathered F16 input rows: xg, nrows x n_embd halves (nrows: the
-/// set's rows, bounds[n_exp] - row0).  Not given (or xg null): set2's own scratch, up to 64 MB (set2_gathers says when the
-/// engine gives it).  Apart from SetArgs: the kernels' argument as before
+/// set's rows, bounds[n_exp] - row0 - no fewer: the tiles would read the rows past it as 0; xg 16-byte aligned, else
+/// set_tc_kernel's).  Not given (or xg null): set2's own scratch, up to 64 MB (set2_gathers says when the engine gives it).
+/// Apart from SetArgs: the kernels' argument as before
 struct Set2Room {
     uint16_t* xg = nullptr;
     int nrows = 0;

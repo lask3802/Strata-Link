@@ -958,7 +958,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         # times; needs a GPU, no model.  _k8: Turing's m16n8k8 path on any GPU; _none: an sm_60 / sm_70 build's stand-in
         # (DS4_IQ_SET2_FORCE_NONE: the kernels trap, never taken)
         foreach(_t ds4_iq_set2_test ds4_iq_set2_test_k8 ds4_iq_set2_test_none)
-          add_executable(${_t} tests/dsv41/iq_set2_test.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu)
+          add_executable(${_t} tests/dsv41/iq_set2_test.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu src/dsv41/ds4_gguf.cu)
           target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
           target_link_libraries(${_t} PRIVATE ${_strata_gpu_runtime_target})

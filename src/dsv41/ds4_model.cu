@@ -612,7 +612,7 @@ struct Chunk {
     size_t w16_once_elems = 0;
     // DS4_IQ_SET2: the gate / up sets' input rows gathered as F16, C rows of D (a set's rows: C at most, run_set) - null:
     // off, or none of this device's layers' experts of a type it takes (iq::set2_gathers)
-    uint16_t* xg = nullptr;
+    uint16_t* set2_x16 = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *bounds = nullptr, *row_tok = nullptr, *pos = nullptr;
     uint8_t* eg_rows = nullptr;
     int* bounds_pin = nullptr;   // pinned: the sort's bounds, read back
@@ -3609,7 +3609,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: DS4_DQ_ONCE=%s: off - 1 turns it on\n", dq_once_env);
             if (chunk > 0 && dq_once) alloc_dq_once();
             for (size_t di = 0; di < chunks.size(); ++di)   // (DS4_IQ_SET2: its buffer, among the prompt path's)
-                if (chunks[di] && chunks[di]->xg != nullptr)
+                if (chunks[di] && chunks[di]->set2_x16 != nullptr)
                     std::fprintf(stderr, "ds4: DS4_IQ_SET2: the gate / up sets' gathered input in the prompt path's buffers: "
                                          "%.1f MB on CUDA%d (chunks of %d rows)\n",
                                  (double) align256((size_t) chunks[di]->C * g.dim * 2) / 1e6, devs[di].id, chunks[di]->C);
@@ -4019,7 +4019,7 @@ struct Model::Impl {
                       dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
-            if (has_xg && !dalloc(d, c.xg, C * D, err)) return false;
+            if (has_xg && !dalloc(d, c.set2_x16, C * D, err)) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
             if (has_eg) {
                 const size_t ES = 256, per = (size_t) cols * (ehd + ehd / 32);
@@ -4835,7 +4835,7 @@ struct Model::Impl {
                 sa.n_ff = FF;
                 sa.limit = g.lim;
                 sa.nrows = nrows;
-                sa.xg = nrows <= c.C ? c.xg : nullptr;   // (DS4_IQ_SET2's room: null when off)
+                sa.xg = nrows <= c.C ? c.set2_x16 : nullptr;   // (DS4_IQ_SET2's room: null when off)
                 EkMark ek{};
                 const bool ekp = prof_chunk;
                 if (ekp) {

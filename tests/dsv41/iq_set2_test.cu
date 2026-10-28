@@ -3,11 +3,13 @@
 // IQ2_XXS, IQ2_XS) x gate / up and down x row mixes: <= 16 (the light kernels' alone: set2 not launched), 17-40, 64, 65-128,
 // > 128 (several row blocks), a 4K and a 30K prompt's mixes (with experts of a few rows: skip_le), 20 experts x 499 rows (past
 // set2's own 64 MB scratch: set_tc_kernel's without the engine's room), the rows at a row0 not 0; gate / up both with the
-// engine's room for the gathered input (Set2Room: xg, nrows) and without it (set2's scratch); set2_gathers (whether the
-// engine allocates that room): none off, the three types on.
+// engine's room for the gathered input (Set2Room: xg, nrows) and without it (set2's scratch), and as the engine calls them
+// (gg::set_gate_up with x3::SetArgs's nrows and xg: the room handed on); set2_gathers (whether the engine allocates that
+// room): none off, the three types on.
 // --bench [--runs N]: us an expert, current / BM 64 / BM 128 (CUDA events, the median of N after 3 warm-ups).  Needs a GPU, no
 // model.  ds4_iq_set2_test_k8: Turing's m16n8k8 path on any GPU; ds4_iq_set2_test_none: DS4_IQ_SET2_FORCE_NONE (an sm_60 /
 // sm_70 build's stand-in: never launched, set_tc_kernel's bits).  Exit 0 PASS, 1 FAIL, 2 bad arguments.
+#include "../../src/dsv41/ds4_gguf.cuh"
 #include "../../src/dsv41/ds4_iq.cuh"
 
 #include <cuda_fp16.h>
@@ -21,7 +23,9 @@
 #include <string>
 #include <vector>
 
+namespace gg = strata::ds4::gguf;
 namespace iq = strata::ds4::gguf::iq;
+namespace x3 = strata::dsv41k::exl3;
 
 namespace {
 
@@ -216,25 +220,49 @@ int main(int argc, char** argv) {
             gu.xf = dx, gu.idx = di, gu.ldx = D, gu.h = dho, gu.ldo = F;
             dn.xh = dh, dn.ldx = F, dn.y = dyo, dn.ldo = D;
             const iq::Set2Room room{dxg, rows};   // (as the engine's run_set: its room and the set's rows)
+            x3::SetArgs sa;   // (as run_set fills it: the GGUF experts' layout, nrows and xg)
+            sa.wbase = dw;
+            sa.stride = stride;
+            sa.lay.fmt = gg::kFmtMXFP4;
+            for (int r = 0; r < 3; ++r) sa.lay.K[r] = type;
+            sa.lay.trellis[0] = 0, sa.lay.trellis[1] = tr1, sa.lay.trellis[2] = tr2;
+            sa.n_exp = a.n_exp;
+            sa.bounds = db;
+            sa.row0 = kRow0;
+            sa.max_rows = max_rows;
+            sa.n_embd = D;
+            sa.n_ff = F;
+            sa.limit = a.limit;
+            sa.nrows = rows;
+            sa.xg = dxg;
             // set2's own scratch takes a set of n_exp x max_rows rows up to 64 MB (set_tc_kernel's past it)
             const bool fits = (size_t) a.n_exp * max_rows * D * 2 <= ((size_t) 64 << 20);
-            auto run = [&](int mode, bool gate_up, bool xg) {
+            auto run = [&](int mode, bool gate_up, bool xg, bool engine = false) {
                 iq::set2_kernel() = mode;
+                if (engine) {   // (gg's errors: launch_errors)
+                    const int e0 = gg::launch_errors();
+                    gg::set_gate_up(sa, dx, D, di, dho, F, s);
+                    if (gg::launch_errors() != e0) {
+                        std::fprintf(stderr, "gg::set_gate_up: failed\n");
+                        std::exit(1);
+                    }
+                    return;
+                }
                 const bool ok = gate_up ? iq::set_gate_up(gu, s, xg ? &room : nullptr) : iq::set_down(dn, s);
                 if (!ok) {
                     std::fprintf(stderr, "set_%s: not covered\n", gate_up ? "gate_up" : "down");
                     std::exit(1);
                 }
             };
-            for (int pass = 0; pass < 3; ++pass) {   // gate / up with the engine's room, without it; down
-                const bool gate_up = pass < 2, xg = pass == 0;
-                const char* role = pass == 0 ? "gate+up" : pass == 1 ? "gu (own)" : "down";
+            for (int pass = 0; pass < 4; ++pass) {   // gate / up with the engine's room, without it; down; gate / up as the engine
+                const bool gate_up = pass != 2, xg = pass == 0 || pass == 3, engine = pass == 3;
+                const char* role = pass == 0 ? "gate+up" : pass == 1 ? "gu (own)" : pass == 2 ? "down" : "gu (gg)";
                 const size_t nb = gate_up ? h.size() * 2 : (size_t) rows * D * 4;
                 void* out = gate_up ? (void*) dho : (void*) dyo;
                 CU(cudaMemset(out, 0xa5, nb));
                 const unsigned long long z64 = iq::set2_runs(64), z128 = iq::set2_runs(128);
                 CU(cudaMemset(dxg, 0xff, (size_t) rows * D * 2));   // (NaNs: a row the gather did not write shows)
-                run(0, gate_up, xg);   // (off: set_tc_kernel's - set2 not launched)
+                run(0, gate_up, xg, engine);   // (off: set_tc_kernel's - set2 not launched)
                 CU(cudaStreamSynchronize(s));
                 CU(cudaGetLastError());
                 const std::vector<uint8_t> ref = get((const uint8_t*) out, nb);
@@ -242,7 +270,7 @@ int main(int argc, char** argv) {
                 for (int mode : {64, 128}) {
                     CU(cudaMemset(out, 0x5a, nb));   // (a pattern unlike the reference's: a row not written shows)
                     const unsigned long long n0 = iq::set2_runs(mode), o0 = iq::set2_runs(mode == 64 ? 128 : 64);
-                    run(mode, gate_up, xg);
+                    run(mode, gate_up, xg, engine);
                     CU(cudaStreamSynchronize(s));
                     CU(cudaGetLastError());
                     const unsigned long long ran = iq::set2_runs(mode) - n0, other = iq::set2_runs(mode == 64 ? 128 : 64) - o0;
@@ -266,7 +294,7 @@ int main(int argc, char** argv) {
                                 diff ? (" (first: local row " + std::to_string(first / (gate_up ? F : D)) + ")").c_str() : "",
                                 ran, off_ok && other == 0 ? "" : " (and with it off / at the other row block)", ok ? "PASS" : "FAIL");
                 }
-                if (bench && m.tiles && pass != 1) {
+                if (bench && m.tiles && pass != 1 && pass != 3) {
                     auto timed = [&](int mode) {
                         for (int i = 0; i < 3; ++i) run(mode, gate_up, xg);
                         std::vector<float> t;

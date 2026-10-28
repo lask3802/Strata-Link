@@ -1603,7 +1603,8 @@ bool set2_launch(const SetArgs& a, cudaStream_t s, const Set2Room* room) {
         const uintptr_t w = (uintptr_t) a.wbase | (uintptr_t) a.stride | (uintptr_t) a.tr[0] | (uintptr_t) a.tr[1] | (uintptr_t) a.tr[2];
         const bool al = (w & 7u) == 0 &&
                         (GU ? ((uintptr_t) a.xf & 15u) == 0 && a.ldx % 4 == 0 && ((uintptr_t) a.h & 3u) == 0 && a.ldo % 2 == 0
-                            : ((uintptr_t) a.xh & 15u) == 0 && a.ldx % 8 == 0 && ((uintptr_t) a.y & 7u) == 0 && a.ldo % 2 == 0);
+                            : ((uintptr_t) a.xh & 15u) == 0 && a.ldx % 8 == 0 && ((uintptr_t) a.y & 7u) == 0 && a.ldo % 2 == 0) &&
+                        (!GU || room == nullptr || ((uintptr_t) room->xg & 15u) == 0);   // (the room: the tiles' 16-byte loads)
         if (!al) {
             if (!g_s2_align.exchange(true))
                 std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: a set's operands not aligned for its 16-byte loads: set_tc_kernel\n", set2_name());
