@@ -3994,7 +3994,10 @@ struct Model::Impl {
                     if (member(l, m).dev == (int) di && !l.mtp) {
                         has_eg = has_eg || l.eg >= 0;
                         has_first = has_first || l.il == 0;
-                        has_xg = has_xg || gg::iq::set2_gathers(gg::expert_type(l.lay, 0));   // (DS4_IQ_SET2 unset: false, no call)
+                        // (DS4_IQ_SET2 unset: false, no call.  MTP / dspark layers are left out: the room is the
+                        // chunk's, so on a device with trunk layers their sets take it too; a device of MTP layers
+                        // alone takes set2's own scratch, the old path)
+                        has_xg = has_xg || gg::iq::set2_gathers(gg::expert_type(l.lay, 0));
                         stride = std::max(stride, align256(unit(member(l, m))));
                     }
             const size_t A = (size_t) c.A, AI = (size_t) c.AI, ss = (size_t) o.max_context + 64;
@@ -4019,7 +4022,19 @@ struct Model::Impl {
                       dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
-            if (has_xg && !dalloc(d, c.set2_x16, C * D, err)) return false;
+            if (has_xg) {   // (DS4_IQ_SET2's room: a speed-up - no room drops it, never the chunk's size, which would
+                            //  stream every expert twice as often on a long prompt.  DS4_IQ_SET2_NO_ROOM=1, tests: as if
+                            //  its allocation failed)
+                static const bool no_room = std::getenv("DS4_IQ_SET2_NO_ROOM") != nullptr &&
+                                            std::atoi(std::getenv("DS4_IQ_SET2_NO_ROOM")) == 1;
+                std::string xe;
+                if (no_room || !dalloc(d, c.set2_x16, C * D, xe)) {
+                    c.set2_x16 = nullptr;
+                    (void) cudaGetLastError();
+                    std::fprintf(stderr, "ds4: DS4_IQ_SET2: no room for the gathered input (%.1f MB on CUDA%d): set2's "
+                                         "own scratch, up to 64 MB\n", (double) align256(C * D * 2) / 1e6, d.id);
+                }
+            }
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
             if (has_eg) {
                 const size_t ES = 256, per = (size_t) cols * (ehd + ehd / 32);
