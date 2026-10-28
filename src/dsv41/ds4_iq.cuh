@@ -139,8 +139,8 @@ int& dq_kernel();
 /// device and its kernels are sm_75+ (an sm_60 / sm_70 build, or a GPU below 7.5, keeps set_tc_kernel, said in one line);
 /// the other types, the light kernels' experts (<= 16 rows) and HIP are as before.  (a test sets it: both in one process)
 int& set2_kernel();
-/// set2_tile_kernel's launches so far (0 under HIP), for a test to tell it ran.
-unsigned long long set2_runs();
+/// set2_tile_kernel's launches so far at row blocks of bm (64 or 128; 0 under HIP), for a test to tell which ran.
+unsigned long long set2_runs(int bm);
 
 /// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
 /// (ds4_tq_cpu.cpp: int8 activations with an F32 scale a 32, exact weights), on the tensor cores of gfx12 (WMMA) or in FMAs.

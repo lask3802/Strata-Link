@@ -3,7 +3,8 @@
 // IQ2_XXS, IQ2_XS) x gate / up and down x row mixes: <= 16 (the light kernels' alone: set2 not launched), 17-40, 64, 65-128,
 // > 128 (several row blocks), a 4K and a 30K prompt's mixes (with experts of a few rows: skip_le), the rows at a row0 not 0.
 // --bench [--runs N]: us an expert, current / BM 64 / BM 128 (CUDA events, the median of N after 3 warm-ups).  Needs a GPU, no
-// model.  ds4_iq_set2_test_k8: Turing's m16n8k8 path on any GPU.  Exit 0 PASS, 1 FAIL, 2 bad arguments.
+// model.  ds4_iq_set2_test_k8: Turing's m16n8k8 path on any GPU; ds4_iq_set2_test_none: DS4_IQ_SET2_FORCE_NONE (an sm_60 /
+// sm_70 build's stand-in: never launched, set_tc_kernel's bits).  Exit 0 PASS, 1 FAIL, 2 bad arguments.
 #include "../../src/dsv41/ds4_iq.cuh"
 
 #include <cuda_fp16.h>
@@ -38,7 +39,8 @@ uint16_t f16(float v) {
     std::memcpy(&u, &h, 2);
     return u;
 }
-// a matrix of n rows of k values of the type: random codes, scales and signs, the F16 block scale 0.002 .. 0.02
+// a matrix of n rows of k values of the type: random codes, scales and signs, the F16 block scale +-0.002 .. 0.02 (a block
+// in 64: +-0, the decode's sign by XOR there)
 void fill(int type, uint8_t* m, int n, int k, std::mt19937& g) {
     std::uniform_int_distribution<int> byte(0, 255);
     std::uniform_real_distribution<float> dd(0.002f, 0.02f);
@@ -46,7 +48,8 @@ void fill(int type, uint8_t* m, int n, int k, std::mt19937& g) {
     for (size_t i = 0; i < (size_t) n * nb; ++i) {
         uint8_t* p = m + i * bb;
         for (int j = 0; j < bb; ++j) p[j] = (uint8_t) byte(g);
-        const uint16_t d = f16(dd(g));
+        const uint32_t r = (uint32_t) g();
+        const uint16_t d = (uint16_t) ((r % 64 == 0 ? 0u : f16(dd(g))) | (r & 64u ? 0x8000u : 0u));
         if (type == iq::kIQ1_M) {   // (d: the top nibbles of the four u16 scales at 48)
             for (int q = 0; q < 4; ++q) {
                 uint16_t s = (uint16_t) (p[48 + 2 * q] | p[49 + 2 * q] << 8);
@@ -203,17 +206,19 @@ int main(int argc, char** argv) {
                 const size_t nb = gate_up ? h.size() * 2 : (size_t) rows * D * 4;
                 void* out = gate_up ? (void*) dho : (void*) dyo;
                 CU(cudaMemset(out, 0xa5, nb));
-                run(0, gate_up);
+                const unsigned long long z64 = iq::set2_runs(64), z128 = iq::set2_runs(128);
+                run(0, gate_up);   // (off: set_tc_kernel's - set2 not launched)
                 CU(cudaStreamSynchronize(s));
                 CU(cudaGetLastError());
                 const std::vector<uint8_t> ref = get((const uint8_t*) out, nb);
+                const bool off_ok = iq::set2_runs(64) == z64 && iq::set2_runs(128) == z128;
                 for (int mode : {64, 128}) {
                     CU(cudaMemset(out, 0x5a, nb));   // (a pattern unlike the reference's: a row not written shows)
-                    const unsigned long long n0 = iq::set2_runs();
+                    const unsigned long long n0 = iq::set2_runs(mode), o0 = iq::set2_runs(mode == 64 ? 128 : 64);
                     run(mode, gate_up);
                     CU(cudaStreamSynchronize(s));
                     CU(cudaGetLastError());
-                    const unsigned long long ran = iq::set2_runs() - n0;
+                    const unsigned long long ran = iq::set2_runs(mode) - n0, other = iq::set2_runs(mode == 64 ? 128 : 64) - o0;
                     const std::vector<uint8_t> got = get((const uint8_t*) out, nb);
                     const size_t es = gate_up ? 2 : 4;
                     size_t diff = 0, first = (size_t) -1;
@@ -221,14 +226,18 @@ int main(int argc, char** argv) {
                         if (std::memcmp(&got[i * es], &ref[i * es], es) != 0) {
                             if (diff++ == 0) first = i;
                         }
-                    const bool launched_ok = m.tiles ? ran == 1 : ran == 0;
-                    const bool ok = diff == 0 && launched_ok;
+#if defined(DS4_IQ_SET2_FORCE_NONE)
+                    const bool launched_ok = ran == 0 && other == 0;   // (not taken: set_tc_kernel)
+#else
+                    const bool launched_ok = (m.tiles ? ran == 1 : ran == 0) && other == 0;
+#endif
+                    const bool ok = diff == 0 && launched_ok && off_ok;
                     ++cases;
                     fails += ok ? 0 : 1;
-                    std::printf("%-8s %-7s %-22s BM %3d: %8zu of %9zu differ%s, set2 launched %llu  %s\n", iq::name(type), role, m.name,
+                    std::printf("%-8s %-7s %-22s BM %3d: %8zu of %9zu differ%s, set2 launched %llu%s  %s\n", iq::name(type), role, m.name,
                                 mode, diff, nb / es,
                                 diff ? (" (first: local row " + std::to_string(first / (gate_up ? F : D)) + ")").c_str() : "",
-                                ran, ok ? "PASS" : "FAIL");
+                                ran, off_ok && other == 0 ? "" : " (and with it off / at the other row block)", ok ? "PASS" : "FAIL");
                 }
                 if (bench && m.tiles) {
                     auto timed = [&](int mode) {

@@ -1022,6 +1022,7 @@ __global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a,
     for (int m = 0; m < R; ++m) wrow[m] = blob + a.tr[GU ? m : 2] + (size_t) (c0 + tr) * rb;
     const __half* xin = GU ? xh : (const __half*) a.xh;
     const size_t ldx = GU ? (size_t) a.n_embd : (size_t) a.ldx;
+    const int xrows = a.n_exp * a.max_rows;   // (xh's rows: set2_launch's bound on the local rows)
     uint4 xr[XV], wr[R];
     Iq1mRow blk[R];
     auto load = [&](int kb) {   // sub-block kb into registers: the roles' 8 values (tr, tq), x's BM x 32 as uint4s
@@ -1042,7 +1043,8 @@ __global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a,
 #pragma unroll
         for (int v = 0; v < XV; ++v) {
             const int i = tid + v * kThreads, r = i >> 2, q = i & 3;
-            xr[v] = r < nr ? *(const uint4*) (xin + (size_t) (r0 + r) * ldx + (size_t) kb * 32 + q * 8) : make_uint4(0u, 0u, 0u, 0u);
+            const bool in = r < nr && (!GU || r0 + r < xrows);
+            xr[v] = in ? *(const uint4*) (xin + (size_t) (r0 + r) * ldx + (size_t) kb * 32 + q * 8) : make_uint4(0u, 0u, 0u, 0u);
         }
     };
     auto store = [&](int st) {
@@ -1122,8 +1124,8 @@ __global__ void __launch_bounds__(128) set2_gather_kernel(const SetArgs a, __hal
     const int e = blockIdx.z, i = blockIdx.y;
     const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
     const int c = (blockIdx.x * 128 + (int) threadIdx.x) * 4;
-    if (i >= hi - lo || hi - lo <= a.skip_le || c >= a.n_embd) return;
     const int r = lo + i;
+    if (i >= hi - lo || hi - lo <= a.skip_le || c >= a.n_embd || r < 0 || r >= a.n_exp * a.max_rows) return;   // (xh's rows)
     const float4 v = *(const float4*) (a.xf + (size_t) a.idx[r] * a.ldx + c);
     const __half2 h0 = __halves2half2(__float2half_rn(v.x), __float2half_rn(v.y)), h1 = __halves2half2(__float2half_rn(v.z), __float2half_rn(v.w));
     uint2 o;
@@ -1527,22 +1529,30 @@ bool set2_ok() {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         cudaFuncAttributes fa{};
         const bool got = cudaFuncGetAttributes(&fa, set2_tile_kernel<kIQ1_M, true, 128>) == cudaSuccess;
-        v = got && major * 10 + minor >= 75 && fa.binaryVersion >= 75 ? 1 : 2;
+        // (ptxVersion: the architecture the code was compiled for - __CUDA_ARCH__; a compute_60 / _70 PTX JIT-compiled for
+        // this device reports this device's binaryVersion but traps; DS4_IQ_SET2_FORCE_NONE: a test's stand-in for them)
+#if defined(DS4_IQ_SET2_FORCE_NONE)
+        v = 2;
+#else
+        v = got && major * 10 + minor >= 75 && fa.ptxVersion >= 75 && fa.binaryVersion >= 75 ? 1 : 2;
+#endif
+        bool err = !got;
         if (v == 1) {
 #define S2_CARVE_(T)                                                                                                     \
-    cudaFuncSetAttribute(set2_tile_kernel<T, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);  \
-    cudaFuncSetAttribute(set2_tile_kernel<T, true, 128>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared); \
-    cudaFuncSetAttribute(set2_tile_kernel<T, false, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared); \
-    cudaFuncSetAttribute(set2_tile_kernel<T, false, 128>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared)
+    err |= cudaFuncSetAttribute(set2_tile_kernel<T, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared) != cudaSuccess;  \
+    err |= cudaFuncSetAttribute(set2_tile_kernel<T, true, 128>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared) != cudaSuccess; \
+    err |= cudaFuncSetAttribute(set2_tile_kernel<T, false, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared) != cudaSuccess; \
+    err |= cudaFuncSetAttribute(set2_tile_kernel<T, false, 128>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared) != cudaSuccess
             S2_CARVE_(kIQ1_M);
             S2_CARVE_(kIQ2_XXS);
             S2_CARVE_(kIQ2_XS);
 #undef S2_CARVE_
         } else {
-            std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: not taken on CUDA%d (compute capability %d.%d, kernels built for sm_%d): "
-                                 "the expert sets stay on set_tc_kernel\n", set2_name(), dev, major, minor, got ? fa.binaryVersion : 0);
+            std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: not taken on CUDA%d (compute capability %d.%d, kernels compiled for "
+                                 "compute_%d, run as sm_%d): the expert sets stay on set_tc_kernel\n", set2_name(), dev, major,
+                         minor, got ? fa.ptxVersion : 0, got ? fa.binaryVersion : 0);
         }
-        cudaGetLastError();   // (an attribute call's error is not the stream's)
+        if (err) cudaGetLastError();   // (an attribute call's error is not the stream's; nothing else's cleared)
         state[dev].store(v, std::memory_order_relaxed);
     }
     return v == 1;
@@ -1551,7 +1561,8 @@ bool set2_ok() {
 constexpr size_t kSet2Cap = (size_t) 64 << 20;
 struct Set2Buf {
     __half* p = nullptr;
-    size_t cap = 0;   // bytes
+    size_t cap = 0;        // bytes
+    bool failed = false;   // (its allocation failed once: not tried again, the stream's sets set_tc_kernel's)
 };
 std::mutex g_s2mu;
 std::map<std::pair<int, cudaStream_t>, Set2Buf> g_s2;
@@ -1560,20 +1571,24 @@ __half* set2_buf(cudaStream_t s, size_t bytes) {
     int dev = 0;
     cudaGetDevice(&dev);
     Set2Buf& b = g_s2[{dev, s}];
+    if (b.failed) return nullptr;
     if (b.cap < bytes) {
         if (b.p != nullptr) cudaFree(b.p);
         b = Set2Buf{};
         if (cudaMalloc(&b.p, bytes) != cudaSuccess) {
             cudaGetLastError();
-            std::fprintf(stderr, "ds4: DS4_IQ_SET2: the gathered input's scratch (%zu MB) failed: set_tc_kernel\n", bytes >> 20);
+            b = Set2Buf{};
+            b.failed = true;
+            std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: the gathered input's scratch (%zu MB) failed: set_tc_kernel for this "
+                                 "stream's sets\n", set2_name(), bytes >> 20);
             return nullptr;
         }
         b.cap = bytes;
     }
     return b.p;
 }
-std::atomic<bool> g_s2_said{false}, g_s2_big{false}, g_s2_align{false};
-std::atomic<unsigned long long> g_s2_runs{0};   // (set2_runs())
+std::atomic<bool> g_s2_said{false}, g_s2_big{false}, g_s2_align{false}, g_s2_notc{false};
+std::atomic<unsigned long long> g_s2_runs[2];   // (set2_runs(): row blocks of 64, of 128)
 // set2_tile_kernel for a set set_tc_kernel would take, when DS4_IQ_SET2 is on and the device and operands take it; false:
 // nothing launched (set_tc_kernel's then)
 template <int T, bool GU>
@@ -1610,7 +1625,7 @@ bool set2_launch(const SetArgs& a, cudaStream_t s) {
         const dim3 grid((unsigned) ((a.max_rows + bm - 1) / bm), (unsigned) ((GU ? a.n_ff : a.n_embd) / BN), (unsigned) a.n_exp);
         if (bm == 64) set2_tile_kernel<T, GU, 64><<<grid, kThreads, set2_smem<GU>(64), s>>>(a, xh);
         else set2_tile_kernel<T, GU, 128><<<grid, kThreads, set2_smem<GU>(128), s>>>(a, xh);
-        g_s2_runs.fetch_add(1, std::memory_order_relaxed);
+        g_s2_runs[bm == 128 ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
         if (!g_s2_said.exchange(true))
             std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: the chunked prompt's IQ1_M / IQ2_XXS / IQ2_XS expert sets in pipelined "
                                  "tensor-core tiles of %d rows (set_tc_kernel's bits)\n", set2_name(), bm);
@@ -1630,8 +1645,7 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
         return;
     }
     if (kSet2<T> && set2_kernel() != 0) {   // (set, but this device's sets are the F32 kernel's: said once)
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true))
+        if (!g_s2_notc.exchange(true))
             std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: not taken (no tensor-core sets here: below sm_70 or STRATA_DS4_NO_TC=1): "
                                  "the expert sets stay on set_kernel\n", set2_name());
     }
@@ -1927,11 +1941,12 @@ int& set2_kernel() {
     return v;
 }
 
-unsigned long long set2_runs() {
+unsigned long long set2_runs(int bm) {
 #if defined(STRATA_USE_HIP)
+    (void) bm;
     return 0;
 #else
-    return g_s2_runs.load(std::memory_order_relaxed);
+    return bm == 64 || bm == 128 ? g_s2_runs[bm == 128 ? 1 : 0].load(std::memory_order_relaxed) : 0;
 #endif
 }
 
