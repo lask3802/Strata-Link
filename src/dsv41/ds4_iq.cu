@@ -894,6 +894,243 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
         else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
     }
 }
+
+// ---------------------------------------------------------------- DS4_IQ_SET2: set_tc_kernel's products, pipelined
+// (sm_75+: mma.sync m16n8k8 / k16 and ldmatrix; a build for sm_60 / sm_70 compiles these to a trap, and set2_ok() sends
+// its sets to set_tc_kernel: the kernels' binary version says which code a device runs)
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750) || defined(DS4_IQ_SET2_FORCE_NONE)
+#define DS4_IQ_SET2_NONE 1
+#endif
+__device__ __forceinline__ void s2_ldsm4(uint32_t (&r)[4], const void* p) {
+#if defined(DS4_IQ_SET2_NONE)
+    (void) p;
+    r[0] = r[1] = r[2] = r[3] = 0u;
+    __trap();
+#else
+    const unsigned at = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
+#endif
+}
+// d += a b over k 16: one m16n8k16 (sm_80+) or two m16n8k8 in k order (sm_75's shape; DS4_IQ_SET2_K8: on any device, the
+// test's).  The same instruction over the same operands in the same order as set_tc_kernel's WMMA: the same F32 sums.
+__device__ __forceinline__ void s2_mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(DS4_IQ_SET2_NONE)
+    (void) d, (void) a, (void) b0, (void) b1;
+    __trap();
+#elif __CUDA_ARCH__ >= 800 && !defined(DS4_IQ_SET2_K8)
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
+}
+// IQ1_M without deq8's byte loads a sub-block and conversion a weight: a thread's row block (56 bytes, 7 8-byte loads a 256
+// values) reduced at once to its value group p's bytes of the 8 sub-blocks (registers, constant indices: no local memory)
+struct Iq1mRow {
+    uint64_t qs, qh;   // byte ib: qs[4 ib + p]; the qh byte of p's half of sub-block ib
+    uint32_t sh;       // bits 3 ib ..: the 3-bit scale of p's half of sub-block ib
+    float d;           // the block's F16 scale
+};
+__device__ __forceinline__ void iq1m_row(const uint8_t* __restrict__ b, int p, Iq1mRow& r) {
+    uint32_t w[14];
+#pragma unroll
+    for (int i = 0; i < 7; ++i) {
+        const uint2 v = ((const uint2*) b)[i];
+        w[2 * i] = v.x;
+        w[2 * i + 1] = v.y;
+    }
+    r.qs = r.qh = 0ull;
+    r.sh = 0u;
+    const int hq = p < 2 ? 0 : 1;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        r.qs |= (uint64_t) ((w[ib] >> (8 * p)) & 255u) << (8 * ib);
+        r.qh |= (uint64_t) ((w[8 + (ib >> 1)] >> (8 * ((2 * ib + hq) & 3))) & 255u) << (8 * ib);   // byte 32 + 2 ib + hq
+        const uint32_t sc = (w[12 + (ib >> 2)] >> (16 * ((ib >> 1) & 1))) & 0xffffu;            // u16 ib >> 1 at 48
+        r.sh |= ((sc >> (6 * (ib & 1) + 3 * hq)) & 7u) << (3 * ib);
+    }
+    const uint32_t s0 = w[12] & 0xffffu, s1 = w[12] >> 16, s2 = w[13] & 0xffffu, s3 = w[13] >> 16;   // (iq1m_d)
+    r.d = __half2float(__ushort_as_half((uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00f0u) | ((s2 >> 4) & 0x0f00u) | (s3 & 0xf000u))));
+}
+// values [8 p, 8 p + 8) of sub-block ib as F16, deq8's bits: the group's codes are +-1, +-7, +-9 (iq1_codes), one scale dl
+// and one delta sign, so the three magnitudes RN(dl), RN(7 dl), RN(9 dl) - each product exact in F32 before its rounding,
+// as deq8's dl * code is - are picked by byte permutes
+__device__ __forceinline__ uint4 iq1m_h8(const Iq1mRow& r, int ib, int p, const uint32_t* tab) {
+    const uint32_t qs = (uint32_t) (r.qs >> (8 * ib)) & 255u, qh = (uint32_t) (r.qh >> (8 * ib)) & 255u;
+    const uint32_t g = tab[qs | ((qh << (p & 1 ? 4 : 8)) & 0x700u)];
+    const bool neg = (p & 1 ? qh & 0x80u : qh & 0x08u) != 0;
+    const int sh = (int) ((r.sh >> (3 * ib)) & 7u);
+    const float dl = r.d * (float) (2 * sh + 1) * 0.125f;
+    const uint32_t m1 = __half_as_ushort(__float2half_rn(dl)), m7 = __half_as_ushort(__float2half_rn(dl * 7.0f)),
+                   m9 = __half_as_ushort(__float2half_rn(dl * 9.0f));
+    // nibble n (0, 1, 2) -> code 8 (n - 1) + (neg ? -1 : 1): -7 / -9, +1 / -1, +9 / +7 (the sign by XOR: dl may be negative)
+    const uint32_t v0 = (neg ? m9 : m7) ^ 0x8000u, v1 = neg ? m1 ^ 0x8000u : m1, v2 = neg ? m7 : m9;
+    const uint32_t lo = v0 | v1 << 16;   // halves 0, 1 in lo, 2 in v2
+    uint32_t o[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {   // values 2 j, 2 j + 1 (g: values 0..3 the low nibbles of its bytes, 4..7 the high)
+        const int va = 2 * j, vb = 2 * j + 1;
+        const uint32_t na = (g >> (va < 4 ? 8 * va : 8 * (va - 4) + 4)) & 15u, nb = (g >> (vb < 4 ? 8 * vb : 8 * (vb - 4) + 4)) & 15u;
+        o[j] = __byte_perm(lo, v2, (2 * na) | (2 * na + 1) << 4 | (2 * nb) << 8 | (2 * nb + 1) << 12);
+    }
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+constexpr int kLdS2 = 40;   // halves a tile row (32 + 8: ldmatrix's rows 80 bytes apart, no bank conflicts)
+template <bool GU>
+constexpr int set2_smem(int bm) { return 2 * (bm + (GU ? 2 : 1) * BN) * kLdS2 * 2; }   // two stages of x and the roles
+template <int T>
+__device__ __forceinline__ const uint32_t* set2_tab() {   // (the codebook from global memory, through L1)
+    return T == kIQ2_XXS ? (const uint32_t*) iq2xxs_grid : T == kIQ2_XS ? (const uint32_t*) iq2xs_grid : (const uint32_t*) iq1s_grid_gpu;
+}
+
+// set_tc_kernel's products in the same order (weights deq8 -> F16 RN, activations F16, F32 sums sub-block by sub-block,
+// k 0..15 then 16..31), with: BM rows a block (128: an expert of up to 128 rows decodes each weight once - set_tc_kernel's
+// 64 decode it twice from 65), the warps' 16-row strips past the expert's rows not issued; two stages in shared memory and
+// one barrier a sub-block (the next one's loads and decode ahead of this one's mma); the gate / up input as F16 rows
+// gathered once a set (set2_gather_kernel: xh, local rows), not converted once a column tile; IQ1_M through iq1m_h8.
+// 8 warps: 4 x 2 over BM rows x 64 outputs (each BM / 64 strips of 16 rows x 4 n8 tiles of each role).  Two blocks an SM
+// (at most 128 registers: IQ1_M's gate / up at 128 rows would take 140, one block an SM, the slower).
+template <int T, bool GU, int BM>
+__global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a, const __half* __restrict__ xh) {
+    extern __shared__ __align__(16) unsigned char s2sm[];
+    constexpr int R = GU ? 2 : 1, MS = BM / 64, XV = BM * 4 / kThreads;
+    constexpr bool FAST = T == kIQ1_M;
+    __half(*xs)[BM][kLdS2] = reinterpret_cast<__half(*)[BM][kLdS2]>(s2sm);
+    __half(*ws)[R][BN][kLdS2] = reinterpret_cast<__half(*)[R][BN][kLdS2]>(s2sm + 2 * BM * kLdS2 * 2);
+    const int e = blockIdx.z;
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + blockIdx.x * BM;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
+    const int nr = min(BM, hi - r0);
+    const int c0 = blockIdx.y * BN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GU ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    const uint32_t* tab = set2_tab<T>();
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int tr = tid >> 2, tq = tid & 3;
+    const uint8_t* wrow[R];
+#pragma unroll
+    for (int m = 0; m < R; ++m) wrow[m] = blob + a.tr[GU ? m : 2] + (size_t) (c0 + tr) * rb;
+    const __half* xin = GU ? xh : (const __half*) a.xh;
+    const size_t ldx = GU ? (size_t) a.n_embd : (size_t) a.ldx;
+    uint4 xr[XV], wr[R];
+    Iq1mRow blk[R];
+    auto load = [&](int kb) {   // sub-block kb into registers: the roles' 8 values (tr, tq), x's BM x 32 as uint4s
+#pragma unroll
+        for (int m = 0; m < R; ++m) {
+            if constexpr (FAST) {
+                if ((kb & 7) == 0) iq1m_row(wrow[m] + (size_t) (kb >> 3) * Ty<T>::B, tq, blk[m]);
+                wr[m] = iq1m_h8(blk[m], kb & 7, tq, tab);
+            } else {
+                float w8[8];
+                deq8<T>(wrow[m], kb, tq, tab, w8);
+                __half2 h[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) h[j] = __halves2half2(__float2half_rn(w8[2 * j]), __float2half_rn(w8[2 * j + 1]));
+                wr[m] = *reinterpret_cast<const uint4*>(h);
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < XV; ++v) {
+            const int i = tid + v * kThreads, r = i >> 2, q = i & 3;
+            xr[v] = r < nr ? *(const uint4*) (xin + (size_t) (r0 + r) * ldx + (size_t) kb * 32 + q * 8) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    auto store = [&](int st) {
+#pragma unroll
+        for (int m = 0; m < R; ++m) *(uint4*) &ws[st][m][tr][tq * 8] = wr[m];
+#pragma unroll
+        for (int v = 0; v < XV; ++v) {
+            const int i = tid + v * kThreads;
+            *(uint4*) &xs[st][i >> 2][(i & 3) * 8] = xr[v];
+        }
+    };
+    const int wm_ = warp >> 1, wn = (warp & 1) * 32;
+    float acc[R][MS][4][4];
+#pragma unroll
+    for (int m = 0; m < R; ++m)
+#pragma unroll
+        for (int s = 0; s < MS; ++s)
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[m][s][t][j] = 0.0f;
+    bool live[MS];
+#pragma unroll
+    for (int s = 0; s < MS; ++s) live[s] = (wm_ * MS + s) * 16 < nr;
+    const int nk = K / 32;
+    load(0);
+    store(0);
+    __syncthreads();
+    for (int kb = 0; kb < nk; ++kb) {
+        const int st = kb & 1;
+        if (kb + 1 < nk) load(kb + 1);
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            uint32_t bf[R][2][4];   // x4 over n 16 x k 16: (n 0-7, k 0-7) (n 0-7, k 8-15) (n 8-15, k 0-7) (n 8-15, k 8-15)
+#pragma unroll
+            for (int m = 0; m < R; ++m)
+#pragma unroll
+                for (int p = 0; p < 2; ++p)
+                    s2_ldsm4(bf[m][p], &ws[st][m][wn + p * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + ((lane >> 3) & 1) * 8]);
+#pragma unroll
+            for (int s = 0; s < MS; ++s) {
+                if (!live[s]) continue;
+                uint32_t af[4];
+                s2_ldsm4(af, &xs[st][(wm_ * MS + s) * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
+#pragma unroll
+                for (int m = 0; m < R; ++m)
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) s2_mma(acc[m][s][t], af, bf[m][t >> 1][(t & 1) * 2], bf[m][t >> 1][(t & 1) * 2 + 1]);
+            }
+        }
+        if (kb + 1 < nk) store(st ^ 1);   // (stage st ^ 1 was last read a step ago, before that step's barrier)
+        __syncthreads();
+    }
+#pragma unroll
+    for (int s = 0; s < MS; ++s) {
+        if (!live[s]) continue;
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+#pragma unroll
+            for (int hf = 0; hf < 2; ++hf) {   // (the accumulator: rows lane / 4 and + 8, columns 2 (lane % 4) ..)
+                const int r = (wm_ * MS + s) * 16 + (lane >> 2) + hf * 8, c = c0 + wn + t * 8 + (lane & 3) * 2;
+                if (r >= nr) continue;
+                const size_t lr = (size_t) (r0 + r);
+                if constexpr (GU) {
+                    const __half2 v = __halves2half2(__float2half_rn(swiglu(acc[0][s][t][2 * hf], acc[R - 1][s][t][2 * hf], a.limit)),
+                                                     __float2half_rn(swiglu(acc[0][s][t][2 * hf + 1], acc[R - 1][s][t][2 * hf + 1], a.limit)));
+                    *(__half2*) &a.h[lr * a.ldo + c] = v;
+                } else {
+                    *(float2*) &a.y[lr * a.ldo + c] = make_float2(acc[0][s][t][2 * hf], acc[0][s][t][2 * hf + 1]);
+                }
+            }
+    }
+}
+// grid (n_embd / 512, max_rows, n_exp): the gate / up input as F16 rows, xh[local] = F16 RN of xf[idx[local]] (set_tc_kernel's
+// rounding of its tile loads), the rows of the tiles' experts only
+__global__ void __launch_bounds__(128) set2_gather_kernel(const SetArgs a, __half* __restrict__ xh) {
+    const int e = blockIdx.z, i = blockIdx.y;
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int c = (blockIdx.x * 128 + (int) threadIdx.x) * 4;
+    if (i >= hi - lo || hi - lo <= a.skip_le || c >= a.n_embd) return;
+    const int r = lo + i;
+    const float4 v = *(const float4*) (a.xf + (size_t) a.idx[r] * a.ldx + c);
+    const __half2 h0 = __halves2half2(__float2half_rn(v.x), __float2half_rn(v.y)), h1 = __halves2half2(__float2half_rn(v.z), __float2half_rn(v.w));
+    uint2 o;
+    o.x = *(const uint32_t*) &h0;
+    o.y = *(const uint32_t*) &h1;
+    *(uint2*) (xh + (size_t) r * a.n_embd + c) = o;
+}
 #endif
 
 // ---------------------------------------------------------------- GEMVs
@@ -1266,6 +1503,121 @@ void dn_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     else launch_dn<T, 16>(a, groups, s);
 }
 #include "ds4_iq_hip.inc"
+#if !defined(STRATA_USE_HIP)
+// ---------------------------------------------------------------- DS4_IQ_SET2 (set2_kernel(), ds4_iq.cuh)
+const char*& set2_env() {   // (DS4_IQ_SET2 as set: the lines say it)
+    static const char* e = nullptr;
+    return e;
+}
+const char* set2_name() { return set2_env() != nullptr ? set2_env() : "(a test's)"; }
+template <int T>
+constexpr bool kSet2 = T == kIQ1_M || T == kIQ2_XXS || T == kIQ2_XS;   // (the types of the packs: the others set_tc_kernel)
+// whether this device runs set2_tile_kernel's code: compute capability 7.5+ and kernels built for sm_75+ (a sm_60 / sm_70 build's
+// trap; the binary version is the code the device loaded) - per device, once, said once when not; the two blocks an SM
+// sm_75's 64 KiB hold (30 KiB each) want the carveout at its most shared memory
+bool set2_ok() {
+    static std::atomic<int> state[16];   // 0: unknown, 1: yes, 2: no
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return false;
+    int v = state[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaFuncAttributes fa{};
+        const bool got = cudaFuncGetAttributes(&fa, set2_tile_kernel<kIQ1_M, true, 128>) == cudaSuccess;
+        v = got && major * 10 + minor >= 75 && fa.binaryVersion >= 75 ? 1 : 2;
+        if (v == 1) {
+#define S2_CARVE_(T)                                                                                                     \
+    cudaFuncSetAttribute(set2_tile_kernel<T, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);  \
+    cudaFuncSetAttribute(set2_tile_kernel<T, true, 128>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared); \
+    cudaFuncSetAttribute(set2_tile_kernel<T, false, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared); \
+    cudaFuncSetAttribute(set2_tile_kernel<T, false, 128>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared)
+            S2_CARVE_(kIQ1_M);
+            S2_CARVE_(kIQ2_XXS);
+            S2_CARVE_(kIQ2_XS);
+#undef S2_CARVE_
+        } else {
+            std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: not taken on CUDA%d (compute capability %d.%d, kernels built for sm_%d): "
+                                 "the expert sets stay on set_tc_kernel\n", set2_name(), dev, major, minor, got ? fa.binaryVersion : 0);
+        }
+        cudaGetLastError();   // (an attribute call's error is not the stream's)
+        state[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+// the gate / up's gathered F16 rows (local row r at r n_embd), per (device, stream), grown as needed up to kSet2Cap
+constexpr size_t kSet2Cap = (size_t) 64 << 20;
+struct Set2Buf {
+    __half* p = nullptr;
+    size_t cap = 0;   // bytes
+};
+std::mutex g_s2mu;
+std::map<std::pair<int, cudaStream_t>, Set2Buf> g_s2;
+__half* set2_buf(cudaStream_t s, size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_s2mu);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    Set2Buf& b = g_s2[{dev, s}];
+    if (b.cap < bytes) {
+        if (b.p != nullptr) cudaFree(b.p);
+        b = Set2Buf{};
+        if (cudaMalloc(&b.p, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "ds4: DS4_IQ_SET2: the gathered input's scratch (%zu MB) failed: set_tc_kernel\n", bytes >> 20);
+            return nullptr;
+        }
+        b.cap = bytes;
+    }
+    return b.p;
+}
+std::atomic<bool> g_s2_said{false}, g_s2_big{false}, g_s2_align{false};
+std::atomic<unsigned long long> g_s2_runs{0};   // (set2_runs())
+// set2_tile_kernel for a set set_tc_kernel would take, when DS4_IQ_SET2 is on and the device and operands take it; false:
+// nothing launched (set_tc_kernel's then)
+template <int T, bool GU>
+bool set2_launch(const SetArgs& a, cudaStream_t s) {
+    if constexpr (!kSet2<T>) {
+        (void) a, (void) s;
+        return false;
+    } else {
+        const int mode = set2_kernel();
+        if (mode == 0 || !set2_ok()) return false;
+        // (the 16-byte x / weight loads and 8-byte stores; the engine's operands - rows of 5120 / 2304 - are all aligned)
+        const uintptr_t w = (uintptr_t) a.wbase | (uintptr_t) a.stride | (uintptr_t) a.tr[0] | (uintptr_t) a.tr[1] | (uintptr_t) a.tr[2];
+        const bool al = (w & 7u) == 0 &&
+                        (GU ? ((uintptr_t) a.xf & 15u) == 0 && a.ldx % 4 == 0 && ((uintptr_t) a.h & 3u) == 0 && a.ldo % 2 == 0
+                            : ((uintptr_t) a.xh & 15u) == 0 && a.ldx % 8 == 0 && ((uintptr_t) a.y & 7u) == 0 && a.ldo % 2 == 0);
+        if (!al) {
+            if (!g_s2_align.exchange(true))
+                std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: a set's operands not aligned for its 16-byte loads: set_tc_kernel\n", set2_name());
+            return false;
+        }
+        __half* xh = nullptr;
+        if constexpr (GU) {
+            const size_t bytes = (size_t) a.n_exp * (size_t) a.max_rows * (size_t) a.n_embd * 2;   // (local rows < n_exp max_rows)
+            if (bytes > kSet2Cap) {
+                if (!g_s2_big.exchange(true))
+                    std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: a set of %d experts x %d rows past the gathered input's %zu MB: "
+                                         "set_tc_kernel for such sets\n", set2_name(), a.n_exp, a.max_rows, kSet2Cap >> 20);
+                return false;
+            }
+            if ((xh = set2_buf(s, bytes)) == nullptr) return false;
+            set2_gather_kernel<<<dim3((unsigned) ((a.n_embd + 511) / 512), (unsigned) a.max_rows, (unsigned) a.n_exp), 128, 0, s>>>(a, xh);
+        }
+        const int bm = mode == 128 ? 128 : 64;
+        const dim3 grid((unsigned) ((a.max_rows + bm - 1) / bm), (unsigned) ((GU ? a.n_ff : a.n_embd) / BN), (unsigned) a.n_exp);
+        if (bm == 64) set2_tile_kernel<T, GU, 64><<<grid, kThreads, set2_smem<GU>(64), s>>>(a, xh);
+        else set2_tile_kernel<T, GU, 128><<<grid, kThreads, set2_smem<GU>(128), s>>>(a, xh);
+        g_s2_runs.fetch_add(1, std::memory_order_relaxed);
+        if (!g_s2_said.exchange(true))
+            std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: the chunked prompt's IQ1_M / IQ2_XXS / IQ2_XS expert sets in pipelined "
+                                 "tensor-core tiles of %d rows (set_tc_kernel's bits)\n", set2_name(), bm);
+        return true;
+    }
+}
+#endif
 template <int T, bool GU>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
@@ -1273,8 +1625,15 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #endif
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) {
+        if (set2_launch<T, GU>(a, s)) return;   // (DS4_IQ_SET2: the pack's types)
         set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
         return;
+    }
+    if (kSet2<T> && set2_kernel() != 0) {   // (set, but this device's sets are the F32 kernel's: said once)
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: not taken (no tensor-core sets here: below sm_70 or STRATA_DS4_NO_TC=1): "
+                                 "the expert sets stay on set_kernel\n", set2_name());
     }
 #endif
     if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
@@ -1550,6 +1909,31 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel3(const uint8_t* __res
 }
 
 }  // namespace
+
+int& set2_kernel() {
+    static int v = [] {
+#if defined(STRATA_USE_HIP)
+        return 0;
+#else
+        const char* e = std::getenv("DS4_IQ_SET2");
+        set2_env() = e;
+        if (e == nullptr || e[0] == '\0' || std::strcmp(e, "0") == 0) return 0;
+        if (std::strcmp(e, "1") == 0 || std::strcmp(e, "64") == 0) return 64;
+        if (std::strcmp(e, "128") == 0) return 128;
+        std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: off - 1 or 64 (tiles of 64 rows) or 128 (of 128 rows) turns it on\n", e);
+        return 0;
+#endif
+    }();
+    return v;
+}
+
+unsigned long long set2_runs() {
+#if defined(STRATA_USE_HIP)
+    return 0;
+#else
+    return g_s2_runs.load(std::memory_order_relaxed);
+#endif
+}
 
 int& dq_kernel() {
     static int v = [] {

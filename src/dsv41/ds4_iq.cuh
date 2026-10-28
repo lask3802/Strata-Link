@@ -132,6 +132,15 @@ bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* 
 /// Set to anything else: 0, said in one line.
 /// (a test sets it to compare them in one process)
 int& dq_kernel();
+/// DS4_IQ_SET2 (read once): the prompt sets' tiles (set_gate_up / set_down, CUDA's tensor-core case) of IQ1_M, IQ2_XXS and
+/// IQ2_XS in set2_tile_kernel instead of set_tc_kernel - the same products in the same order (the same bits), pipelined, each
+/// weight decoded once a row block (IQ1_M without a conversion a weight).  Unset, "" or 0: off; 1 or 64: row blocks of 64 (the
+/// faster on a 3070); 128: of 128; anything else: off, said in one line.  The value is the row block (0: off).  Taken where the
+/// device and its kernels are sm_75+ (an sm_60 / sm_70 build, or a GPU below 7.5, keeps set_tc_kernel, said in one line);
+/// the other types, the light kernels' experts (<= 16 rows) and HIP are as before.  (a test sets it: both in one process)
+int& set2_kernel();
+/// set2_tile_kernel's launches so far (0 under HIP), for a test to tell it ran.
+unsigned long long set2_runs();
 
 /// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
 /// (ds4_tq_cpu.cpp: int8 activations with an F32 scale a 32, exact weights), on the tensor cores of gfx12 (WMMA) or in FMAs.
