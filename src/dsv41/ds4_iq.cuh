@@ -150,8 +150,9 @@ int& set2_kernel();
 /// set2_tile_kernel's launches so far at row blocks of bm (64 or 128; 0 under HIP), for a test to tell which ran.
 unsigned long long set2_runs(int bm);
 /// Whether the current device's gate / up sets of type t (gate's) take set2_tile_kernel (DS4_IQ_SET2 on, a pack type, the
-/// tensor-core sets, sm_75 code; said in one line when set and not taken): the engine then gives them a Set2Room (x3::SetArgs::xg: C rows
-/// of n_embd halves a device, in its VRAM plan) - without it set2 gathers into a scratch of its own, up to 64 MB.
+/// tensor-core sets, sm_75 code; said in one line when set and not taken): the engine then gives them a Set2Room
+/// (x3::SetArgs::xg: C rows of n_embd halves a device, in its VRAM plan) - without it set2 gathers into a scratch of its
+/// own, up to 64 MB.
 bool set2_gathers(int t);
 
 /// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
