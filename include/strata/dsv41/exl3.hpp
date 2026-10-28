@@ -154,6 +154,8 @@ struct SetArgs {
     int max_rows = 0;   // the most rows one expert of the set has
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    int nrows = 0;               // the set's rows (bounds[n_exp] - row0; 0: not given)
+    uint16_t* xg = nullptr;      // (ds4's GGUF low-bit sets, DS4_IQ_SET2) room for their gate / up input as F16, nrows rows
 };
 /// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, cudaStream_t s);

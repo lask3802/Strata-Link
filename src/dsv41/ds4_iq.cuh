@@ -99,7 +99,14 @@ struct SetArgs {
     int tg = 0, td = 0;
     int skip_le = 0;   // (the tiles) the experts of at most this many rows are left out: the light kernels took them
 };
-bool set_gate_up(const SetArgs& a, cudaStream_t s);
+/// (DS4_IQ_SET2, gate / up) the caller's room for a set's gathered F16 input rows: xg, nrows x n_embd halves (nrows: the
+/// set's rows, bounds[n_exp] - row0).  Not given (or xg null): set2's own scratch, up to 64 MB (set2_gathers says when the
+/// engine gives it).  Apart from SetArgs: the kernels' argument as before
+struct Set2Room {
+    uint16_t* xg = nullptr;
+    int nrows = 0;
+};
+bool set_gate_up(const SetArgs& a, cudaStream_t s, const Set2Room* room = nullptr);
 bool set_down(const SetArgs& a, cudaStream_t s);
 /// The light form alone (the set's experts of at most 16 rows; the others untouched), for any of these types and MXFP4
 /// (tg / td 39: ds4_gguf.cu's experts): false (nothing launched) when it is switched off - the caller's tiles take every
@@ -141,6 +148,10 @@ int& dq_kernel();
 int& set2_kernel();
 /// set2_tile_kernel's launches so far at row blocks of bm (64 or 128; 0 under HIP), for a test to tell which ran.
 unsigned long long set2_runs(int bm);
+/// Whether the current device's gate / up sets of type t (gate's) take set2_tile_kernel (DS4_IQ_SET2 on, a pack type, the
+/// tensor-core sets, sm_75 code; said in one line when set and not taken): the engine then gives them a Set2Room (x3::SetArgs::xg: C rows
+/// of n_embd halves a device, in its VRAM plan) - without it set2 gathers into a scratch of its own, up to 64 MB.
+bool set2_gathers(int t);
 
 /// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
 /// (ds4_tq_cpu.cpp: int8 activations with an F32 scale a 32, exact weights), on the tensor cores of gfx12 (WMMA) or in FMAs.

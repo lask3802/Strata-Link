@@ -1,7 +1,10 @@
 // DS4_IQ_SET2 (ds4_iq.cu set2_tile_kernel): the chunked prompt's expert sets (iq::set_gate_up / set_down) with set2_tile_kernel at
 // row blocks of 64 and 128 against set_tc_kernel (set2_kernel() 0), bit for bit, for each type of the packs (IQ1_M,
 // IQ2_XXS, IQ2_XS) x gate / up and down x row mixes: <= 16 (the light kernels' alone: set2 not launched), 17-40, 64, 65-128,
-// > 128 (several row blocks), a 4K and a 30K prompt's mixes (with experts of a few rows: skip_le), the rows at a row0 not 0.
+// > 128 (several row blocks), a 4K and a 30K prompt's mixes (with experts of a few rows: skip_le), 20 experts x 499 rows (past
+// set2's own 64 MB scratch: set_tc_kernel's without the engine's room), the rows at a row0 not 0; gate / up both with the
+// engine's room for the gathered input (Set2Room: xg, nrows) and without it (set2's scratch); set2_gathers (whether the
+// engine allocates that room): none off, the three types on.
 // --bench [--runs N]: us an expert, current / BM 64 / BM 128 (CUDA events, the median of N after 3 warm-ups).  Needs a GPU, no
 // model.  ds4_iq_set2_test_k8: Turing's m16n8k8 path on any GPU; ds4_iq_set2_test_none: DS4_IQ_SET2_FORCE_NONE (an sm_60 /
 // sm_70 build's stand-in: never launched, set_tc_kernel's bits).  Exit 0 PASS, 1 FAIL, 2 bad arguments.
@@ -31,7 +34,7 @@ namespace {
         }                                                                                        \
     } while (0)
 
-constexpr int D = 5120, F = 2304, NE = 16, kRow0 = 37;
+constexpr int D = 5120, F = 2304, NE = 16, NB = 20, kRow0 = 37;   // (NB: the blobs, the largest mix's experts)
 
 uint16_t f16(float v) {
     const __half h = __float2half_rn(v);
@@ -105,6 +108,7 @@ std::vector<Mix> mixes(std::mt19937& g) {
     k30[1] = 3, k30[2] = 200, k30[3] = 129;
     m.push_back({"4K-like (mean 66)", k4, true});
     m.push_back({"30K-like (mean 121)", k30, true});
+    m.push_back({"20 x 499 (past 64 MB)", std::vector<int>(NB, 499), true});
     return m;
 }
 
@@ -139,17 +143,34 @@ int main(int argc, char** argv) {
     cudaEvent_t e0, e1;
     CU(cudaEventCreate(&e0));
     CU(cudaEventCreate(&e1));
+    int fails = 0, cases = 0;
     std::mt19937 g(20261028);
+    {   // set2_gathers (the engine's allocation of the room, alloc_chunks): off - none; on - the pack's types alone
+        int bad = 0;
+        iq::set2_kernel() = 0;
+        for (int t : {iq::kIQ1_M, iq::kIQ2_XXS, iq::kIQ2_XS, 39}) bad += iq::set2_gathers(t) ? 1 : 0;
+        iq::set2_kernel() = 64;
+#if defined(DS4_IQ_SET2_FORCE_NONE)
+        const bool want = false;   // (not taken: no room)
+#else
+        const bool want = true;
+#endif
+        for (int t : {iq::kIQ1_M, iq::kIQ2_XXS, iq::kIQ2_XS}) bad += iq::set2_gathers(t) != want ? 1 : 0;
+        bad += iq::set2_gathers(39) ? 1 : 0;   // (MXFP4: not set2's)
+        iq::set2_kernel() = 0;
+        std::printf("set2_gathers: off none, on the three types%s  %s\n", want ? "" : " (none: not taken)", bad ? "FAIL" : "PASS");
+        fails += bad ? 1 : 0;
+        ++cases;
+    }
     const std::vector<Mix> mx = mixes(g);
     const int types[3] = {iq::kIQ1_M, iq::kIQ2_XXS, iq::kIQ2_XS};
-    int fails = 0, cases = 0;
     std::normal_distribution<float> nd(0.0f, 1.0f);
     for (int type : types) {
         // the experts' blobs: gate [F][D], up [F][D], down [D][F]
         const size_t rbg = iq::row_bytes(type, D), rbd = iq::row_bytes(type, F);
         const size_t tr1 = (size_t) F * rbg, tr2 = 2 * tr1, stride = tr2 + (size_t) D * rbd;
-        std::vector<uint8_t> wb(stride * NE);
-        for (int e = 0; e < NE; ++e) {
+        std::vector<uint8_t> wb(stride * NB);
+        for (int e = 0; e < NB; ++e) {
             fill(type, wb.data() + e * stride, F, D, g);
             fill(type, wb.data() + e * stride + tr1, F, D, g);
             fill(type, wb.data() + e * stride + tr2, D, F, g);
@@ -174,8 +195,9 @@ int main(int argc, char** argv) {
             uint16_t* dh = up(h);
             int* db = up(bounds);
             int* di = up(idx);
-            uint16_t* dho;
+            uint16_t *dho, *dxg;
             float* dyo;
+            CU(cudaMalloc(&dxg, (size_t) rows * D * 2));   // (the engine's room: the set's rows)
             CU(cudaMalloc(&dho, h.size() * 2));
             CU(cudaMalloc(&dyo, (size_t) rows * D * 4));
             iq::SetArgs a;
@@ -185,7 +207,7 @@ int main(int argc, char** argv) {
             a.bounds = db;
             a.row0 = kRow0;
             a.max_rows = max_rows;
-            a.n_exp = NE;
+            a.n_exp = (int) m.rows.size();
             a.n_embd = D;
             a.n_ff = F;
             a.limit = 10.0f;
@@ -193,21 +215,26 @@ int main(int argc, char** argv) {
             iq::SetArgs gu = a, dn = a;
             gu.xf = dx, gu.idx = di, gu.ldx = D, gu.h = dho, gu.ldo = F;
             dn.xh = dh, dn.ldx = F, dn.y = dyo, dn.ldo = D;
-            auto run = [&](int mode, bool gate_up) {
+            const iq::Set2Room room{dxg, rows};   // (as the engine's run_set: its room and the set's rows)
+            // set2's own scratch takes a set of n_exp x max_rows rows up to 64 MB (set_tc_kernel's past it)
+            const bool fits = (size_t) a.n_exp * max_rows * D * 2 <= ((size_t) 64 << 20);
+            auto run = [&](int mode, bool gate_up, bool xg) {
                 iq::set2_kernel() = mode;
-                const bool ok = gate_up ? iq::set_gate_up(gu, s) : iq::set_down(dn, s);
+                const bool ok = gate_up ? iq::set_gate_up(gu, s, xg ? &room : nullptr) : iq::set_down(dn, s);
                 if (!ok) {
                     std::fprintf(stderr, "set_%s: not covered\n", gate_up ? "gate_up" : "down");
                     std::exit(1);
                 }
             };
-            for (bool gate_up : {true, false}) {
-                const char* role = gate_up ? "gate+up" : "down";
+            for (int pass = 0; pass < 3; ++pass) {   // gate / up with the engine's room, without it; down
+                const bool gate_up = pass < 2, xg = pass == 0;
+                const char* role = pass == 0 ? "gate+up" : pass == 1 ? "gu (own)" : "down";
                 const size_t nb = gate_up ? h.size() * 2 : (size_t) rows * D * 4;
                 void* out = gate_up ? (void*) dho : (void*) dyo;
                 CU(cudaMemset(out, 0xa5, nb));
                 const unsigned long long z64 = iq::set2_runs(64), z128 = iq::set2_runs(128);
-                run(0, gate_up);   // (off: set_tc_kernel's - set2 not launched)
+                CU(cudaMemset(dxg, 0xff, (size_t) rows * D * 2));   // (NaNs: a row the gather did not write shows)
+                run(0, gate_up, xg);   // (off: set_tc_kernel's - set2 not launched)
                 CU(cudaStreamSynchronize(s));
                 CU(cudaGetLastError());
                 const std::vector<uint8_t> ref = get((const uint8_t*) out, nb);
@@ -215,7 +242,7 @@ int main(int argc, char** argv) {
                 for (int mode : {64, 128}) {
                     CU(cudaMemset(out, 0x5a, nb));   // (a pattern unlike the reference's: a row not written shows)
                     const unsigned long long n0 = iq::set2_runs(mode), o0 = iq::set2_runs(mode == 64 ? 128 : 64);
-                    run(mode, gate_up);
+                    run(mode, gate_up, xg);
                     CU(cudaStreamSynchronize(s));
                     CU(cudaGetLastError());
                     const unsigned long long ran = iq::set2_runs(mode) - n0, other = iq::set2_runs(mode == 64 ? 128 : 64) - o0;
@@ -229,7 +256,7 @@ int main(int argc, char** argv) {
 #if defined(DS4_IQ_SET2_FORCE_NONE)
                     const bool launched_ok = ran == 0 && other == 0;   // (not taken: set_tc_kernel)
 #else
-                    const bool launched_ok = (m.tiles ? ran == 1 : ran == 0) && other == 0;
+                    const bool launched_ok = (m.tiles && (xg || !gate_up || fits) ? ran == 1 : ran == 0) && other == 0;
 #endif
                     const bool ok = diff == 0 && launched_ok && off_ok;
                     ++cases;
@@ -239,18 +266,18 @@ int main(int argc, char** argv) {
                                 diff ? (" (first: local row " + std::to_string(first / (gate_up ? F : D)) + ")").c_str() : "",
                                 ran, off_ok && other == 0 ? "" : " (and with it off / at the other row block)", ok ? "PASS" : "FAIL");
                 }
-                if (bench && m.tiles) {
+                if (bench && m.tiles && pass != 1) {
                     auto timed = [&](int mode) {
-                        for (int i = 0; i < 3; ++i) run(mode, gate_up);
+                        for (int i = 0; i < 3; ++i) run(mode, gate_up, xg);
                         std::vector<float> t;
                         for (int i = 0; i < runs; ++i) {
                             CU(cudaEventRecord(e0, s));
-                            run(mode, gate_up);
+                            run(mode, gate_up, xg);
                             CU(cudaEventRecord(e1, s));
                             CU(cudaEventSynchronize(e1));
                             float ms = 0;
                             CU(cudaEventElapsedTime(&ms, e0, e1));
-                            t.push_back(ms * 1e3f / NE);
+                            t.push_back(ms * 1e3f / a.n_exp);
                         }
                         return median(t);
                     };
@@ -264,6 +291,7 @@ int main(int argc, char** argv) {
             CU(cudaFree(db));
             CU(cudaFree(di));
             CU(cudaFree(dho));
+            CU(cudaFree(dxg));
             CU(cudaFree(dyo));
         }
         CU(cudaFree(dw));

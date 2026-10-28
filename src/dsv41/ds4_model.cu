@@ -610,6 +610,9 @@ struct Chunk {
     // (null: off, or not had - the slabs reconstruct them each into w16)
     uint16_t* w16_once = nullptr;
     size_t w16_once_elems = 0;
+    // DS4_IQ_SET2: the gate / up sets' input rows gathered as F16, C rows of D (a set's rows: C at most, run_set) - null:
+    // off, or none of this device's layers' experts of a type it takes (iq::set2_gathers)
+    uint16_t* xg = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *bounds = nullptr, *row_tok = nullptr, *pos = nullptr;
     uint8_t* eg_rows = nullptr;
     int* bounds_pin = nullptr;   // pinned: the sort's bounds, read back
@@ -3605,6 +3608,11 @@ struct Model::Impl {
             if (dq_once_env != nullptr && !dq_once)   // (set to anything else: said - a mistyped arm is not silently off)
                 std::fprintf(stderr, "ds4: DS4_DQ_ONCE=%s: off - 1 turns it on\n", dq_once_env);
             if (chunk > 0 && dq_once) alloc_dq_once();
+            for (size_t di = 0; di < chunks.size(); ++di)   // (DS4_IQ_SET2: its buffer, among the prompt path's)
+                if (chunks[di] && chunks[di]->xg != nullptr)
+                    std::fprintf(stderr, "ds4: DS4_IQ_SET2: the gate / up sets' gathered input in the prompt path's buffers: "
+                                         "%.1f MB on CUDA%d (chunks of %d rows)\n",
+                                 (double) align256((size_t) chunks[di]->C * g.dim * 2) / 1e6, devs[di].id, chunks[di]->C);
         }
         // a remote stage's prompt chunks: the main process's two slots of rows out, the worker's four the link lends
         // (and with bf16 rows its two fp32 ones) - pageable (a chunk's rows cross the network at its pace; on Linux a
@@ -3979,13 +3987,14 @@ struct Model::Impl {
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
             c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
             c.w16_elems = (size_t) 8 << 20;
-            bool has_eg = false, has_first = false;
+            bool has_eg = false, has_first = false, has_xg = false;
             size_t stride = 0;
             for (const Layer& l : L)
                 for (int m = 0; m < l.nm; ++m)
                     if (member(l, m).dev == (int) di && !l.mtp) {
                         has_eg = has_eg || l.eg >= 0;
                         has_first = has_first || l.il == 0;
+                        has_xg = has_xg || gg::iq::set2_gathers(gg::expert_type(l.lay, 0));   // (DS4_IQ_SET2 unset: false, no call)
                         stride = std::max(stride, align256(unit(member(l, m))));
                     }
             const size_t A = (size_t) c.A, AI = (size_t) c.AI, ss = (size_t) o.max_context + 64;
@@ -4010,6 +4019,7 @@ struct Model::Impl {
                       dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
+            if (has_xg && !dalloc(d, c.xg, C * D, err)) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
             if (has_eg) {
                 const size_t ES = 256, per = (size_t) cols * (ehd + ehd / 32);
@@ -4824,6 +4834,8 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+                sa.nrows = nrows;
+                sa.xg = nrows <= c.C ? c.xg : nullptr;   // (DS4_IQ_SET2's room: null when off)
                 EkMark ek{};
                 const bool ekp = prof_chunk;
                 if (ekp) {
