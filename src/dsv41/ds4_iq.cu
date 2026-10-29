@@ -999,7 +999,7 @@ __device__ __forceinline__ const uint32_t* set2_tab() {   // (the codebook from 
 // 8 warps: 4 x 2 over BM rows x 64 outputs (each BM / 64 strips of 16 rows x 4 n8 tiles of each role).  Two blocks an SM
 // (at most 128 registers: IQ1_M's gate / up at 128 rows would take 140, one block an SM, the slower).
 template <int T, bool GU, int BM>
-__global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a, const __half* __restrict__ xh) {
+__global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a, const __half* __restrict__ xh, int xrows) {
     extern __shared__ __align__(16) unsigned char s2sm[];
     constexpr int R = GU ? 2 : 1, MS = BM / 64, XV = BM * 4 / kThreads;
     constexpr bool FAST = T == kIQ1_M;
@@ -1022,7 +1022,7 @@ __global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a,
     for (int m = 0; m < R; ++m) wrow[m] = blob + a.tr[GU ? m : 2] + (size_t) (c0 + tr) * rb;
     const __half* xin = GU ? xh : (const __half*) a.xh;
     const size_t ldx = GU ? (size_t) a.n_embd : (size_t) a.ldx;
-    const int xrows = a.n_exp * a.max_rows;   // (xh's rows: set2_launch's bound on the local rows)
+    // (xrows: xh's rows, set2_launch's bound on the local rows)
     uint4 xr[XV], wr[R];
     Iq1mRow blk[R];
     auto load = [&](int kb) {   // sub-block kb into registers: the roles' 8 values (tr, tq), x's BM x 32 as uint4s
@@ -1119,13 +1119,13 @@ __global__ void __launch_bounds__(kThreads, 2) set2_tile_kernel(const SetArgs a,
     }
 }
 // grid (n_embd / 512, max_rows, n_exp): the gate / up input as F16 rows, xh[local] = F16 RN of xf[idx[local]] (set_tc_kernel's
-// rounding of its tile loads), the rows of the tiles' experts only
-__global__ void __launch_bounds__(128) set2_gather_kernel(const SetArgs a, __half* __restrict__ xh) {
+// rounding of its tile loads), the rows of the tiles' experts only (local rows < xrows: xh's)
+__global__ void __launch_bounds__(128) set2_gather_kernel(const SetArgs a, __half* __restrict__ xh, int xrows) {
     const int e = blockIdx.z, i = blockIdx.y;
     const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
     const int c = (blockIdx.x * 128 + (int) threadIdx.x) * 4;
     const int r = lo + i;
-    if (i >= hi - lo || hi - lo <= a.skip_le || c >= a.n_embd || r < 0 || r >= a.n_exp * a.max_rows) return;   // (xh's rows)
+    if (i >= hi - lo || hi - lo <= a.skip_le || c >= a.n_embd || r < 0 || r >= xrows) return;   // (xh's rows)
     const float4 v = *(const float4*) (a.xf + (size_t) a.idx[r] * a.ldx + c);
     const __half2 h0 = __halves2half2(__float2half_rn(v.x), __float2half_rn(v.y)), h1 = __halves2half2(__float2half_rn(v.z), __float2half_rn(v.w));
     uint2 o;
@@ -1592,9 +1592,9 @@ std::atomic<unsigned long long> g_s2_runs[2];   // (set2_runs(): row blocks of 6
 // set2_tile_kernel for a set set_tc_kernel would take, when DS4_IQ_SET2 is on and the device and operands take it; false:
 // nothing launched (set_tc_kernel's then)
 template <int T, bool GU>
-bool set2_launch(const SetArgs& a, cudaStream_t s) {
+bool set2_launch(const SetArgs& a, cudaStream_t s, const Set2Room* room) {
     if constexpr (!kSet2<T>) {
-        (void) a, (void) s;
+        (void) a, (void) s, (void) room;
         return false;
     } else {
         const int mode = set2_kernel();
@@ -1603,28 +1603,36 @@ bool set2_launch(const SetArgs& a, cudaStream_t s) {
         const uintptr_t w = (uintptr_t) a.wbase | (uintptr_t) a.stride | (uintptr_t) a.tr[0] | (uintptr_t) a.tr[1] | (uintptr_t) a.tr[2];
         const bool al = (w & 7u) == 0 &&
                         (GU ? ((uintptr_t) a.xf & 15u) == 0 && a.ldx % 4 == 0 && ((uintptr_t) a.h & 3u) == 0 && a.ldo % 2 == 0
-                            : ((uintptr_t) a.xh & 15u) == 0 && a.ldx % 8 == 0 && ((uintptr_t) a.y & 7u) == 0 && a.ldo % 2 == 0);
+                            : ((uintptr_t) a.xh & 15u) == 0 && a.ldx % 8 == 0 && ((uintptr_t) a.y & 7u) == 0 && a.ldo % 2 == 0) &&
+                        (!GU || room == nullptr || ((uintptr_t) room->xg & 15u) == 0);   // (the room: the tiles' 16-byte loads)
         if (!al) {
             if (!g_s2_align.exchange(true))
                 std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: a set's operands not aligned for its 16-byte loads: set_tc_kernel\n", set2_name());
             return false;
         }
         __half* xh = nullptr;
+        int xrows = 0;   // (xh's rows: the bound on the gather's and the tiles' local rows)
         if constexpr (GU) {
-            const size_t bytes = (size_t) a.n_exp * (size_t) a.max_rows * (size_t) a.n_embd * 2;   // (local rows < n_exp max_rows)
-            if (bytes > kSet2Cap) {
-                if (!g_s2_big.exchange(true))
-                    std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: a set of %d experts x %d rows past the gathered input's %zu MB: "
-                                         "set_tc_kernel for such sets\n", set2_name(), a.n_exp, a.max_rows, kSet2Cap >> 20);
-                return false;
+            if (room != nullptr && room->xg != nullptr && room->nrows > 0) {   // the engine's room (C rows: a set's at most)
+                xh = (__half*) room->xg;
+                xrows = room->nrows;
+            } else {   // set2's own scratch (local rows < n_exp max_rows), up to kSet2Cap
+                xrows = a.n_exp * a.max_rows;
+                const size_t bytes = (size_t) xrows * (size_t) a.n_embd * 2;
+                if (bytes > kSet2Cap) {
+                    if (!g_s2_big.exchange(true))
+                        std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: a set of %d experts x %d rows past the gathered input's %zu MB: "
+                                             "set_tc_kernel for such sets\n", set2_name(), a.n_exp, a.max_rows, kSet2Cap >> 20);
+                    return false;
+                }
+                if ((xh = set2_buf(s, bytes)) == nullptr) return false;
             }
-            if ((xh = set2_buf(s, bytes)) == nullptr) return false;
-            set2_gather_kernel<<<dim3((unsigned) ((a.n_embd + 511) / 512), (unsigned) a.max_rows, (unsigned) a.n_exp), 128, 0, s>>>(a, xh);
+            set2_gather_kernel<<<dim3((unsigned) ((a.n_embd + 511) / 512), (unsigned) a.max_rows, (unsigned) a.n_exp), 128, 0, s>>>(a, xh, xrows);
         }
         const int bm = mode == 128 ? 128 : 64;
         const dim3 grid((unsigned) ((a.max_rows + bm - 1) / bm), (unsigned) ((GU ? a.n_ff : a.n_embd) / BN), (unsigned) a.n_exp);
-        if (bm == 64) set2_tile_kernel<T, GU, 64><<<grid, kThreads, set2_smem<GU>(64), s>>>(a, xh);
-        else set2_tile_kernel<T, GU, 128><<<grid, kThreads, set2_smem<GU>(128), s>>>(a, xh);
+        if (bm == 64) set2_tile_kernel<T, GU, 64><<<grid, kThreads, set2_smem<GU>(64), s>>>(a, xh, xrows);
+        else set2_tile_kernel<T, GU, 128><<<grid, kThreads, set2_smem<GU>(128), s>>>(a, xh, xrows);
         g_s2_runs[bm == 128 ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
         if (!g_s2_said.exchange(true))
             std::fprintf(stderr, "ds4: DS4_IQ_SET2=%s: the chunked prompt's IQ1_M / IQ2_XXS / IQ2_XS expert sets in pipelined "
@@ -1634,13 +1642,14 @@ bool set2_launch(const SetArgs& a, cudaStream_t s) {
 }
 #endif
 template <int T, bool GU>
-void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
+void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s, const Set2Room* room = nullptr) {
 #if defined(STRATA_USE_HIP)
+    (void) room;   // (set2: CUDA's)
     if (hipk::launch<T, GU>(a, s)) return;   // (gfx12, STRATA_DS4_HIPK=1: the matrix-core tiles)
 #endif
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) {
-        if (set2_launch<T, GU>(a, s)) return;   // (DS4_IQ_SET2: the pack's types)
+        if (set2_launch<T, GU>(a, s, room)) return;   // (DS4_IQ_SET2: the pack's types)
         set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
         return;
     }
@@ -1950,6 +1959,17 @@ unsigned long long set2_runs(int bm) {
 #endif
 }
 
+bool set2_gathers(int t) {
+#if defined(STRATA_USE_HIP)
+    (void) t;
+    return false;
+#else
+    // (off: no CUDA call at all; a type set2 does not take: neither)
+    if (set2_kernel() == 0 || !(t == kIQ1_M || t == kIQ2_XXS || t == kIQ2_XS)) return false;
+    return tc_ok() && set2_ok();
+#endif
+}
+
 int& dq_kernel() {
     static int v = [] {
         const char* e = std::getenv("DS4_DQ_NEW");
@@ -2120,7 +2140,7 @@ bool light_down(const SetArgs& a, cudaStream_t s) {
     return light_set(a, false, s);
 }
 
-bool set_gate_up(const SetArgs& a, cudaStream_t s) {
+bool set_gate_up(const SetArgs& a, cudaStream_t s, const Set2Room* room) {
     if (is_tq(a.tg)) return tq::set_gate_up(a, s);
     if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
     SetArgs t = a;
@@ -2129,7 +2149,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
         t.skip_le = kLightRows;
     }
     const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (a.n_ff / BN), (unsigned) a.n_exp);
-#define SG_(T) launch_set<T, true>(t, grid, s)
+#define SG_(T) launch_set<T, true>(t, grid, s, room)
     DS4_IQ_SWITCH(a.tg, SG_)
 #undef SG_
     return true;

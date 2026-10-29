@@ -1493,7 +1493,8 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         q.ldo = ldh;
         q.tg = ia.tg;
         q.td = ia.td;
-        if (!iq::set_gate_up(q, s)) fail("set_gate_up: not covered");
+        const iq::Set2Room room{sa.xg, sa.nrows};   // (DS4_IQ_SET2: the engine's room, when it gives one)
+        if (!iq::set_gate_up(q, s, &room)) fail("set_gate_up: not covered");
         check("set_gate_up");
         return;
     }
