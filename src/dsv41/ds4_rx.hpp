@@ -92,6 +92,9 @@ enum Msg : uint32_t {
 
 constexpr double kSpinMs = 200.0;      // a receive spins while bytes came or went this recently, then waits in poll
 constexpr double kWakeQuietMs = 100.0; // a Wake goes out only when the main sent nothing for this long (half the spin)
+// DS4_RX_PREWAKE: a wake request's seq (Main::prewake): this bit and a count from 1 - serve_lane's own seqs count from
+// 1 and reach it only after 2^31 requests (weeks of decode); a reply matches only a wake still out (Main::took_wake_)
+constexpr uint32_t kPrewakeSeq = 0x80000000u;
 
 /// The link core (DS4_EP_CPU, 2 by default; -1, "off" or not a number: none): the logical CPU the thread that drives
 /// the link runs on, on either PC - the main's service thread, the server's serve loop.  -1 also where this PC has no
@@ -388,6 +391,71 @@ struct Backoff {
     }
 };
 
+/// DS4_RX_PREWAKE: when a prompt's wake request is due (serve_lane sends it, Main::prewake).  A GPU that idled through
+/// a long prompt is slow to wake (the 3080: ~22 ms on its first request after ~20 s) and that stall made the decode's
+/// first replies late, 8 of 64 - rx::Backoff idled the link for the next `hold` requests.  The wake's own request
+/// takes the stall shortly before the decode.  Once a feed (arm at its start): when its last unit starts (a
+/// layer-major run's last layer, a window prompt's last window - units short against the lead), or the last step's
+/// pace leaves lead_ms or less (a chunked run's chunks: the pace alone, a chunk may take long); and at a chunked run's
+/// end whether due before or not (run_end).  The lane sends them as WakeSeries spaces them
+struct PreWake {
+    double lead_ms = 1000.0;
+    bool armed = false;
+    double t_step = 0.0, d_step = 0.0, ms_unit = -1.0;   // (the last step: when, the units done then; ms a unit, -1 none)
+    void arm(double now) {
+        armed = true;
+        t_step = now;
+        d_step = 0.0;
+        ms_unit = -1.0;
+    }
+    /// `done` of `total` units at `now` (`last`: the last unit has started): true once an arm, when the wake is due
+    bool due(double now, double done, double total, bool last) {
+        if (!armed) return false;
+        if (done > d_step) {   // (a step: its pace, ms a unit)
+            ms_unit = (now - t_step) / (done - d_step);
+            t_step = now;
+            d_step = done;
+        }
+        const bool soon = ms_unit >= 0.0 && ms_unit * (total - done) - (now - t_step) <= lead_ms;
+        if (!last && done < total && !soon) return false;
+        armed = false;
+        return true;
+    }
+    /// a chunked run's chunks: the pace alone decides (its last chunk may take longer than the series lasts)
+    bool chunk_due(double now, double done, double total) { return due(now, done, total, false); }
+    /// a chunked run's end: due, armed or not - a wake sent earlier in the run may be the series' last long before it
+    /// (WakeSeries keeps the two apart by its gap)
+    bool run_end() {
+        armed = false;
+        return true;
+    }
+};
+
+/// DS4_RX_PREWAKE, serve_lane's side: a due wake goes out at once unless one went out less than gap_ms ago, then again
+/// each gap_ms until the lane's next request, kReps a go() at most - the settle after a run does not use the lead
+/// up, and a feed's wake that comes sooner waits for the gap.  Feeds of 16 tokens (--prefill-chunk 0), whose windows
+/// send the server nothing, keep it warm with about one wake a gap through the whole prompt: the point, at one 1-row
+/// request a gap
+struct WakeSeries {
+    static constexpr int kReps = 8;
+    double gap_ms = 1000.0;
+    bool on = false;
+    int reps = 0;
+    double sent = -1.0;   // (the last wake's send, steady ms; -1 none)
+    void go() {
+        on = true;
+        reps = 0;
+    }
+    /// a wake to send now
+    bool send_now(double now) const { return on && (sent < 0.0 || now - sent >= gap_ms); }
+    /// it went out at now (or there was none to send: stop)
+    void sent_at(double now) {
+        sent = now;
+        if (++reps >= kReps) on = false;
+    }
+    void stop() { on = false; }   // (the lane's next request, or no expert to name)
+};
+
 uint16_t f2bf(float f);   // round to nearest even (NaN kept a NaN)
 float bf2f(uint16_t h);
 double now_ms();          // steady clock
@@ -480,6 +548,30 @@ public:
     /// a window starts: a Wake when nothing went out for kWakeQuietMs (the server's spin may have run out); true if sent
     bool wake(std::string& err);
     uint64_t wakes = 0;   // Wakes sent
+    /// DS4_RX_PREWAKE: a request of one row (row and its x: a held expert) under a seq of its own (kPrewakeSeq; in
+    /// *seq): its reply - or its Stale - never reaches a wait's result, take_late or stales; take_woke has it.  (Only
+    /// the last 64 wakes out are matched: an older one's reply, never seen with a server that answers in order, would
+    /// be a late one's)
+    bool prewake(int layer, const ReqRow& row, const float* x, std::string& err, uint32_t* seq = nullptr);
+    /// a wake's reply read: its seq, when it went out and came in, the server's time
+    struct Woke {
+        uint32_t seq = 0;
+        double sent = 0.0, in = -1.0, read = 0.0;   // (steady ms: the send; the kernel's arrival, -1 unknown; the read)
+        int srv_us = -1;                            // (the server's time; -1: its Stale - no GPU work)
+        int layer = 0, e = 0;
+    };
+    /// the wakes' replies read since the last call
+    std::vector<Woke> take_woke() {
+        std::vector<Woke> v;
+        v.swap(woke_);
+        return v;
+    }
+    /// a wake's reply still to come
+    bool prewake_out() const { return !wk_out_.empty(); }
+    /// while a wake is out: what is in already, without a wait (the wakes' into take_woke, a late request's into
+    /// take_late, a Stale counted - as wait_resp takes them); 0, or -1: the link failed (err)
+    int poll_wake(std::string& err);
+    uint64_t prewakes = 0;   // wake requests sent
     void close() { c_.close(); }
     bool ok() const { return c_.ok(); }
     uint64_t bytes_out() const { return c_.bytes_out; }
@@ -492,11 +584,20 @@ private:
         while (i < n && s[i] != '\0') ++i;
         return i;
     }
+    bool took_wake_(const Hdr& h);   // (a Resp or Stale for a wake still out: into woke_)
     Conn c_;
     HelloMsg peer_hello_;
     int n_embd_ = 0;
     std::vector<uint8_t> tx_, rx_;
     std::vector<std::pair<uint32_t, double>> late_;   // (take_late)
+    struct WakeOut {
+        uint32_t seq;
+        double sent;
+        int layer, e;
+    };
+    std::vector<WakeOut> wk_out_;   // (the wakes out, oldest first: 64 at most)
+    std::vector<Woke> woke_;        // (take_woke)
+    uint32_t wk_n_ = 0;
     std::vector<uint32_t> pool_;
     std::vector<uint16_t> xb_;
     bool stale_ = false;

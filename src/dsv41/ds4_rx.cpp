@@ -458,6 +458,7 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
             return -1;
         }
         if (h.type == Stale) {   // (an expert mid-fill: no rows - the lane computes them; a late one's: dropped)
+            if (h.seq != seq && took_wake_(h)) continue;   // (DS4_RX_PREWAKE: a wake's, not a request's)
             ++stales;
             if (h.seq != seq) continue;
             stale_ = true;
@@ -465,6 +466,7 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
         }
         if (h.type != Resp) continue;
         if (h.seq != seq) {   // (an earlier request's, late: its picks were computed here; take_late has its arrival)
+            if (took_wake_(h)) continue;   // (DS4_RX_PREWAKE: a wake's reply - not late, nobody's picks)
             if (late_.size() < 256) late_.push_back({h.seq, c_.arrival_ms()});
             continue;
         }
@@ -507,6 +509,54 @@ bool Main::wake(std::string& err) {
     if (!c_.send(Wake, 0, 0, 0, 0, nullptr, 0, err)) return false;
     ++wakes;
     return true;
+}
+
+bool Main::prewake(int layer, const ReqRow& row, const float* x, std::string& err, uint32_t* seq_out) {
+    wk_n_ = wk_n_ >= ~kPrewakeSeq ? 1 : wk_n_ + 1;   // (1 .. 2^31 - 1: kPrewakeSeq itself never goes out)
+    const uint32_t seq = kPrewakeSeq | wk_n_;
+    const double t = now_ms();
+    if (!send_req(seq, layer, 1, &row, &x, err)) return false;
+    if (wk_out_.size() >= 64) wk_out_.erase(wk_out_.begin());   // (one never answered: its reply would be late's)
+    wk_out_.push_back({seq, t, layer, row.e[0]});
+    ++prewakes;
+    if (seq_out != nullptr) *seq_out = seq;
+    return true;
+}
+
+bool Main::took_wake_(const Hdr& h) {
+    if (wk_out_.empty() || (h.seq & kPrewakeSeq) == 0) return false;
+    for (size_t i = 0; i < wk_out_.size(); ++i) {
+        if (wk_out_[i].seq != h.seq) continue;
+        Woke w;
+        w.seq = h.seq;
+        w.sent = wk_out_[i].sent;
+        w.in = c_.arrival_ms();
+        w.read = now_ms();
+        w.srv_us = h.type == Resp ? h.c : -1;
+        w.layer = wk_out_[i].layer;
+        w.e = wk_out_[i].e;
+        if (woke_.size() < 64) woke_.push_back(w);
+        wk_out_.erase(wk_out_.begin() + (long) i);
+        return true;
+    }
+    return false;
+}
+
+int Main::poll_wake(std::string& err) {
+    while (!wk_out_.empty()) {
+        Hdr h;
+        const int got = c_.recv(h, rx_, 0.0, err);   // (deadline past: what is in, no wait)
+        if (got <= 0) return got;
+        if (h.type == Error) {   // (as wait_resp's)
+            err = "expert server: " + std::string(rx_.begin(), rx_.end());
+            c_.close();
+            return -1;
+        }
+        if ((h.type == Resp || h.type == Stale) && took_wake_(h)) continue;
+        if (h.type == Stale) ++stales;   // (no request waits now: any other is a late one's, as wait_resp skips it)
+        else if (h.type == Resp && late_.size() < 256) late_.push_back({h.seq, c_.arrival_ms()});
+    }
+    return 0;
 }
 
 int link_cpu() {

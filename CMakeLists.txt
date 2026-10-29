@@ -994,6 +994,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(WIN32)
         target_link_libraries(ds4_rx_link_test PRIVATE ws2_32)
       endif()
+      # DS4_RX_PREWAKE (rx::PreWake, rx::Main::prewake): when a prompt's wake request is due, and its reply kept out of
+      # the requests' (take_late, stales, a wait's result) against a stand-in server over loopback: no GPU
+      add_executable(ds4_rx_prewake_test tests/dsv41/rx_prewake_test.cpp src/dsv41/ds4_rx.cpp)
+      target_compile_features(ds4_rx_prewake_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rx_prewake_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_rx_prewake_test PRIVATE ws2_32)
+      endif()
       # the remote experts between two processes on 127.0.0.1 (ds4_rx.hpp): rx::Main against the CPU expert server
       # (--expert-server-cpu's, ds4_rx_cpu.cpp) - the sums, a late reply, a server killed, --expert-server-once, the Wake
       # and the spin budget, the link core's pin, the lane's nap rule, TCP_QUICKACK.  No GPU, no model

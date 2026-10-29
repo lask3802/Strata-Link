@@ -171,6 +171,11 @@ struct Stats {
     // the link's keep-awake (ds4_rx.hpp): Wakes sent at a window's start, and the CPU lane's requests that found
     // serve_lane napping (its 20 us sleeps: after 2 ms idle, kSpinMs while the link is up)
     int64_t rx_wakes = 0, lane_nap_reqs = 0;
+    // DS4_RX_PREWAKE (rx::Main::prewake): the wake requests sent near a prompt's end, their replies (Stale among them:
+    // no GPU work), their round trips and the server's times (ms in all), and from each wake to the lane's next request
+    // (ms in all, rx_prewake_led of them).  None of it in the requests' counts above
+    int64_t rx_prewakes = 0, rx_prewake_in = 0, rx_prewake_stale = 0, rx_prewake_led = 0;
+    double rx_prewake_ms = 0.0, rx_prewake_srv_ms = 0.0, rx_prewake_lead_ms = 0.0;
     // expert parallelism H' (DS4_EP_K): the slice picks the server's replies held ([k, nb)), the requests with them and
     // the server's CPU lane's time for them (its replies' b, ms in all), the slice picks whose [k, nb) the lane computed
     // after all (a reply late or lost)

@@ -1298,6 +1298,24 @@ struct Model::Impl {
     std::vector<int> ep_sibs;
     std::atomic<bool> rx_wake{false};
     bool ep_wake = true;
+    // DS4_RX_PREWAKE=1 (rx::PreWake, default off): a wake request near a prompt's end, so the server's GPU has woken
+    // when the decode's first requests come (DS4_RX_PREWAKE_MS: the lead, 1000; feeds of 16 tokens send about one a
+    // lead through the whole prompt, which keeps the server's GPU warm - accepted).  The prompt's thread arms pw at the
+    // feed and sets pw_go when it is due; serve_lane sends it, and again until its next request (prewake_lane; pw_li /
+    // pw_e: the hottest expert held at the load, else the first held one), and reads the replies apart from the
+    // requests'.  The rest the lane's: pw_ser (rx::WakeSeries: their spacing), the last one's seq, the lane's next
+    // request after it (steady ms, -1 none), its reply (pw_have), pw_since: the wakes since the last line
+    bool rx_prewake = false;
+    rx::PreWake pw;
+    std::atomic<bool> pw_go{false};
+    int pw_li = -1, pw_e = -1;
+    rx::WakeSeries pw_ser;
+    bool pw_have = false;
+    int pw_since = 0;
+    uint32_t pw_seq = 0;
+    double pw_next = -1.0;
+    rx::Main::Woke pw_last;
+    std::vector<float> pw_x;   // (its row's x)
     // remote experts (--remote-experts, ds4_rx.hpp): the link (the service thread's after the load), the experts the
     // server holds ([layer][n_exp]), the per-request times (ms) for the percentiles
     std::unique_ptr<rx::Main> rx_link;
@@ -3842,6 +3860,7 @@ struct Model::Impl {
         }
         if (!rx_slices_ok(err)) return false;
         rx_setup();   // (--remote-experts: the expert server's blobs, before the service thread takes the link)
+        prewake_setup();
         if (!rx_on && ep_cpu >= 0) {   // (no server after all: the link core and its sibling back to the CPU lane - the
                                        // pools are idle until the service thread starts, below)
             std::fprintf(stderr, "ds4: remote experts: none held - the link core (CPU %d) goes back to the CPU lane\n", ep_cpu);
@@ -8118,6 +8137,10 @@ struct Model::Impl {
             // ms in a slot), their median round trip (send to the kernel's arrival on Linux) seeds the estimate
             size_t hi = 0;
             while (hi < pick.size() && !ok[hi]) ++hi;
+            if (hi < pick.size()) {   // (DS4_RX_PREWAKE's expert: the same request's)
+                pw_li = pick[hi].li;
+                pw_e = pick[hi].e;
+            }
             std::vector<double> pr;
             std::vector<float> wx((size_t) g.dim, 0.01f);
             const float* wxs[1] = {wx.data()};
@@ -8357,6 +8380,117 @@ struct Model::Impl {
         if (!rx_on.exchange(false)) return;
         if (rx_link) rx_link->close();
         std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts from now on\n", why.c_str());
+    }
+    // DS4_RX_PREWAKE (after rx_setup): on, or why not - said once; unset or 0: nothing (no line, no request)
+    void prewake_setup() {
+        const char* v = std::getenv("DS4_RX_PREWAKE");
+        if (v == nullptr || std::atoi(v) == 0) return;
+        if (const char* m = std::getenv("DS4_RX_PREWAKE_MS"); m != nullptr && *m != '\0')
+            pw.lead_ms = std::min(60000.0, std::max(0.0, std::atof(m)));
+        const char* no = o.remote_experts.empty() ? "no expert server (--remote-experts)"
+                         : !rx_link || !rx_on    ? "no expert server's link"
+                         : pw_li < 0             ? "the server holds no expert whole"
+                                                 : nullptr;
+        if (no != nullptr) {
+            std::fprintf(stderr, "ds4: DS4_RX_PREWAKE: not taken - %s\n", no);
+            return;
+        }
+        rx_prewake = true;
+        pw_x.assign((size_t) g.dim, 0.01f);
+        pw_ser.gap_ms = std::max(250.0, pw.lead_ms);
+        std::fprintf(stderr, "ds4: DS4_RX_PREWAKE: taken - a request of 1 row (layer %d expert %d, the warm-up's) to the "
+                             "expert server when a feed's last layer, chunk or window starts or about %.0f ms of it are "
+                             "left (DS4_RX_PREWAKE_MS), again each %.0f ms until the lane's next request (%d at most); "
+                             "its reply dropped, not the gate's, the backoff's or the requests' stats\n",
+                     pw_li, pw_e, pw.lead_ms, pw_ser.gap_ms, rx::WakeSeries::kReps);
+    }
+    // (the prompt's thread) a feed's start, and its progress: `done` of `total` units, `last` the last one started
+    void pw_arm() {
+        if (rx_prewake) pw.arm(now_ms());
+    }
+    void pw_check(double done, double total, bool last) {
+        if (rx_prewake && pw.due(now_ms(), done, total, last)) pw_go.store(true, std::memory_order_release);
+    }
+    void pw_chunks(double done, double total) {   // (a chunked run's chunks: the pace alone)
+        if (rx_prewake && pw.chunk_due(now_ms(), done, total)) pw_go.store(true, std::memory_order_release);
+    }
+    // (serve_lane, no request in) the wakes pw_go asks for, as rx::WakeSeries spaces them - the expert of the
+    // warm-up's if still held, else the first held one, x 0.01 as the warm-up's; what came in for them
+    // (rx::Main::poll_wake), their stats, and the last one's line once the lane's next request came
+    void prewake_lane() {
+        if (!rx_on) return;
+        std::string e;
+        if (pw_go.load(std::memory_order_relaxed) && pw_go.exchange(false, std::memory_order_acquire)) pw_ser.go();
+        const double now = now_ms();
+        if (pw_ser.send_now(now)) {
+            const int NL = (int) (rx_has.size() / (size_t) g.n_exp);
+            int li = pw_li, ex = pw_e;
+            if (li < 0 || li >= NL || rx_has[(size_t) li * g.n_exp + ex] != rx::kHeld) {
+                li = -1;
+                for (int l = 0; l < NL && li < 0; ++l)
+                    for (int x = 0; x < g.n_exp && li < 0; ++x)
+                        if (rx_has[(size_t) l * g.n_exp + x] == rx::kHeld) {
+                            li = l;
+                            ex = x;
+                        }
+            }
+            if (li >= 0) {
+                rx::ReqRow wr;
+                wr.n = 1;
+                wr.e[0] = (int16_t) ex;
+                wr.w[0] = 1.0f;
+                if (!rx_link->prewake(li, wr, pw_x.data(), e, &pw_seq)) {
+                    rx_lost("a wake request did not go out (" + e + ")");
+                    return;
+                }
+                ++st.rx_prewakes;
+                ++pw_since;
+                pw_next = -1.0;
+                pw_have = false;   // (a reply in for an earlier one: not this one's line)
+                pw_ser.sent_at(now);
+            } else {
+                pw_ser.stop();
+            }
+        }
+        if (rx_link->prewake_out() && rx_link->poll_wake(e) < 0) {
+            rx_lost(e.empty() ? "the link failed" : e);
+            return;
+        }
+        for (const rx::Main::Woke& w : rx_link->take_woke()) {
+            ++st.rx_prewake_in;
+            if (w.srv_us < 0) {
+                ++st.rx_prewake_stale;
+            } else {
+                st.rx_prewake_ms += pw_rt(w);
+                st.rx_prewake_srv_ms += w.srv_us / 1000.0;
+            }
+            if (w.seq == pw_seq) {   // (the last one sent: its line)
+                pw_last = w;
+                pw_have = true;
+            }
+        }
+        if (!pw_have || pw_next < 0.0) return;
+        const rx::Main::Woke& w = pw_last;
+        const double rt = pw_rt(w), ld = pw_next - w.sent;
+        st.rx_prewake_lead_ms += ld;
+        ++st.rx_prewake_led;
+        char nx[160];
+        std::snprintf(nx, sizeof nx, "; it went out %.0f ms before the lane's next request%s (%d wakes since the last "
+                      "line)", ld, w.sent + rt > pw_next ? ", its reply after that request's send" : "", pw_since);
+        if (w.srv_us < 0)
+            std::fprintf(stderr, "ds4: DS4_RX_PREWAKE: the last wake request (layer %d expert %d): Stale - a fill had its "
+                                 "expert, no GPU work%s\n", w.layer, w.e, nx);
+        else
+            std::fprintf(stderr, "ds4: DS4_RX_PREWAKE: the last wake request (layer %d expert %d): %.2f ms there and back "
+                                 "(%s), %.2f ms of it the server's%s\n", w.layer, w.e, rt,
+                         w.in >= w.sent && w.in <= w.read ? "to the kernel's arrival" : "to its read",
+                         w.srv_us / 1000.0, nx);
+        pw_have = false;
+        pw_since = 0;
+    }
+    // (a wake's round trip: to the kernel's arrival, else to its read - an upper bound)
+    static double pw_rt(const rx::Main::Woke& w) {
+        return w.in >= w.sent && w.in <= w.read ? w.in - w.sent : w.read - w.sent;
     }
     // (the tokens with a remote pick: the server's whole ones, then its slice ones)
     static int rx_nrows(const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk = {}) {
@@ -8842,6 +8976,17 @@ struct Model::Impl {
                                                  : " (DS4_EP_CPU off: as without the link)", sibs.empty() ? " -" : sibs.c_str(),
               ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
               (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
+        if (rx_prewake) {   // (DS4_RX_PREWAKE: its requests, apart from the requests' counts - since the load: a
+                            //  prompt's are sent before the decode's stats start)
+            const int64_t in = st.rx_prewake_in, sv = in - st.rx_prewake_stale, led = st.rx_prewake_led;
+            add_f(b,
+                  "remote experts' wake requests (DS4_RX_PREWAKE, %.0f ms ahead) since the load: %lld sent, %lld replies "
+                  "(%lld Stale): %.2f ms there and back on average, %.2f ms of it the server's; the last one %.0f ms on "
+                  "average before the lane's next request (%lld times)\n",
+                  pw.lead_ms, (long long) st.rx_prewakes, (long long) in, (long long) st.rx_prewake_stale,
+                  sv > 0 ? st.rx_prewake_ms / (double) sv : 0.0, sv > 0 ? st.rx_prewake_srv_ms / (double) sv : 0.0,
+                  led > 0 ? st.rx_prewake_lead_ms / (double) led : 0.0, (long long) led);
+        }
         if (rx_k < rx_nb) {   // H' (DS4_EP_K)
             const double nr = (double) std::max<int64_t>(1, st.rx_split_reqs - s0.rx_split_reqs);
             add_f(b,
@@ -9244,6 +9389,7 @@ struct Model::Impl {
                     std::string e;
                     if (rx_link->wake(e)) ++st.rx_wakes;
                 }
+                if (rx_prewake) prewake_lane();   // (DS4_RX_PREWAKE: its request, its reply)
                 if (rx::lane_naps(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count(),
                                   rx_on && ep_wake)) {
                     napped = true;
@@ -9253,6 +9399,10 @@ struct Model::Impl {
             }
             if (napped) ++st.lane_nap_reqs;   // (a request that found the lane napping)
             napped = false;
+            if (rx_prewake) {   // (DS4_RX_PREWAKE: the last wake's lead; no more wakes until the next pw_go)
+                if (pw_ser.sent >= 0.0 && pw_next < 0.0) pw_next = now_ms();
+                pw_ser.stop();
+            }
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             const double lp_req = lane_prof ? now_ms() : 0.0;
@@ -11506,6 +11656,7 @@ struct Model::Impl {
             win_prompt = true;   // (its ticks as the chunked prompt's: for the decode that follows)
             for (int a = 0; a < n; a += kWin) {
                 const int T = std::min(kWin, n - a);
+                pw_check(a, n, a + T == n);   // (DS4_RX_PREWAKE: its last window, or the pace says so)
                 if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
             }
         }
@@ -11570,6 +11721,7 @@ struct Model::Impl {
                     return false;
                 }
                 const int T = std::min(small_t, n - a);
+                pw_check(a, n, a + T == n);   // (DS4_RX_PREWAKE: as feed_windows')
                 if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, true, err)) return false;
             }
         }
@@ -11969,7 +12121,7 @@ struct Model::Impl {
                 std::string e;
                 if (!run_dev_chunks((int) di, run, e)) errs[di] = e.empty() ? "a device's thread failed" : e;
             });
-        size_t reported = 0;
+        size_t reported = 0, pw_rep = 0;
         for (;;) {
             bool all = true;
             for (auto& w : workers) all = all && w->idle();
@@ -11993,9 +12145,27 @@ struct Model::Impl {
                 if (reported > 0 && reported < run.T.size())
                     progress(run.p0[reported - 1] + run.T[reported - 1] - run.p0[0]);
             }
+            if (rx_prewake) {   // (DS4_RX_PREWAKE, as the progress: a remote stage's chunks back, the layers every
+                                //  chunk went through - the last one started -, or the chunks through every layer;
+                                //  chunks by their pace alone, a chunk may take long)
+                const double nt = (double) run.T.size();
+                if (o.remote_stage) {
+                    pw_chunks(lrx.got.load(std::memory_order_acquire), nt);
+                } else if (lm) {
+                    const int nd = lm_layers.load(std::memory_order_acquire);
+                    pw_check(nd, g.nl, nd >= g.nl - 1);
+                } else {
+                    while (pw_rep < run.T.size() && chunk_rec[pw_rep].load(std::memory_order_acquire) &&
+                           cudaEventQuery(chunk_done[pw_rep]) == cudaSuccess)
+                        ++pw_rep;
+                    pw_chunks((double) pw_rep, nt);
+                }
+            }
             if (all) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        // (DS4_RX_PREWAKE: the run's end, due before or not - the lane's gap keeps it from doubling an earlier one)
+        if (!halting && rx_prewake && pw.run_end()) pw_go.store(true, std::memory_order_release);
         if (o.remote_stage) {   // every chunk sent (the last one out) and every reply in, or the link is shut (lrx)
             bool fine = true;
             for (const std::string& e : errs) fine = fine && e.empty();
@@ -13526,6 +13696,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     if (p.rewarm_on) p.rewarm.cancel();   // (DS4_REWARM: a prompt's start stops the last one's re-warm)
     p.pm.last = -1;
     p.halted = false;
+    p.pw_arm();   // (DS4_RX_PREWAKE: once a feed)
     if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT: before
         const double t0 = now_ms();   // pick_path and the windows of 16 below chunk_min; pm.last stays -1)
         const bool ok = p.feed_small(tokens, n, logits_rows, err);
@@ -13552,6 +13723,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     if (p.rewarm_on) p.rewarm.cancel();   // (DS4_REWARM, as feed's)
     p.pm.last = -1;
     p.halted = false;
+    p.pw_arm();   // (DS4_RX_PREWAKE: once a feed)
     const double t0 = now_ms();
     if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT, as feed's:
         // the run but its last token in small windows, the checkpoint, then the last token as a window of 1)
