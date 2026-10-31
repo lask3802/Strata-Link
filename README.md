@@ -1,9 +1,11 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata Link" width="340">
   </picture>
 </p>
+
+<h1 align="center">Strata Link</h1>
 
 <p align="center"><sub>Strata Link is a fork of Strata. Its mark uses a cyan middle bar so it is not mistaken for upstream Strata's.</sub></p>
 
@@ -130,7 +132,7 @@ What has been run, and what has not:
 | **Not supported** | Intel cards (the SYCL engine has no remote stage), a Mac (the Metal engine refuses it at start), DeepSeek V4.1-Flash (its engine, `strata-dsv41`, has no remote stage) |
 
 Setup, the earlier measurements and the limits: [docs/REMOTE_STAGE.md](docs/REMOTE_STAGE.md). Link's own releases:
-[lask3802/Strata](https://github.com/lask3802/Strata/releases).
+[lask3802/Strata-Link](https://github.com/lask3802/Strata-Link/releases).
 
 ## Install
 

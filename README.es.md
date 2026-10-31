@@ -1,9 +1,11 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata Link" width="340">
   </picture>
 </p>
+
+<h1 align="center">Strata Link</h1>
 
 <h3 align="center">IA potente en tu propio ordenador.</h3>
 <p align="center">Chatea, programa y trabaja con imágenes, en local.</p>

@@ -232,7 +232,7 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
-REPO = "lask3802/Strata"
+REPO = "lask3802/Strata-Link"
 PREBUILT_URL = f"https://github.com/{REPO}/releases/latest/download/"
 PREBUILT_TAG_URL = f"https://github.com/{REPO}/releases/download/v{{version}}/"
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
