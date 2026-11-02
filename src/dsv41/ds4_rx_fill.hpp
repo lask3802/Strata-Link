@@ -30,7 +30,8 @@ namespace strata::ds4::rx {
 constexpr uint8_t kHeld = 1;      // the server holds it: requests may name it
 constexpr uint8_t kFilling = 2;   // its fill is queued or under way: requests do not name it, no cache takes it
 
-/// Whether the main will send fills: --remote-experts with DS4_RX_FILL=1 (fill_env: its value, null when unset).
+/// Whether the main will send fills: --remote-experts with DS4_RX_FILL=1 (fill_env: its value, null when unset).  The one
+/// rule: rx_setup opens the fills by it (and with a blob held), and fill_view_refusal refuses by it.
 inline bool fill_wanted(bool remote_experts, const char* fill_env) {
     return remote_experts && fill_env != nullptr && *fill_env == '1';
 }

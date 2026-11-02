@@ -9492,7 +9492,7 @@ struct Model::Impl {
         st.rx_bytes_in = (int64_t) link->bytes_in();
         rx_link = std::move(link);
         rx_on = held > 0 || rx_k < rx_nb;   // (H': the slice picks need no blob held)
-        if (const char* fv = std::getenv("DS4_RX_FILL"); fv != nullptr && *fv == '1' && held > 0) rx_fill_open(token, gl);
+        if (rx::fill_wanted(true, std::getenv("DS4_RX_FILL")) && held > 0) rx_fill_open(token, gl);
         rx_rtt.reserve(1 << 20);
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
