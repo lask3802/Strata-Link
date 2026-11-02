@@ -1440,7 +1440,7 @@ struct Model::Impl {
     std::atomic<bool> quit{false};
     // the link core (--remote-experts, ds4_rx.hpp): the service thread's CPU (DS4_EP_CPU; -1: none) and that core's
     // logical CPUs, which the CPU lane's pools leave out; a window's start (forward), for serve_lane's Wake;
-    // DS4_EP_WAKE=0: no Wake and the lane's 2 ms naps as without the link (A/B)
+    // DS4_EP_WAKE=0: no Wake and the lane's naps after DS4_LANE_SPIN_MS, as without the link (A/B)
     int ep_cpu = -1;
     bool ep_freed = false;   // (no server held any expert: the link core went back to the CPU lane at the load)
     std::vector<int> ep_sibs;
@@ -8309,7 +8309,7 @@ struct Model::Impl {
             if (pf_all || iq_pf > 0) os::prefetch(want);
             else os::prefetch_cold(want);
 #else
-            if (pf_all) os::prefetch(want);
+            if (pf_all || iq_pf > 0) os::prefetch(want);
             else os::prefetch_cold(want);
 #endif
         }
@@ -14843,6 +14843,7 @@ struct Model::Impl {
                      d.f_pre, d.f_post, d.f_comb, sx);
 #endif
         if (hc2) CK(cudaEventRecord(d.ev_join, d.st2));
+        if (hc2 && dump_s_on(l.il)) CK(cudaStreamSynchronize(d.st2));   // (the dumps below read st2's results on st)
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         dump_sub(d, "f_pre", l.il, p0, T, d.f_pre, (size_t) T * 8 * 4);
         dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);

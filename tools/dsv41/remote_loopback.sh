@@ -86,7 +86,7 @@ chunk=${CHUNK:-1024}
 long_logits=${LONG_LOGITS:-1}
 py=${PYTHON:-python3}
 mkdir -p "$out"
-export STRATA_STAGE_TOKEN=${STRATA_STAGE_TOKEN:-loopback-$$-$RANDOM$RANDOM}
+: "${STRATA_STAGE_TLS:?the link is TLS: strata --stage-keygen DIR on this PC, then STRATA_STAGE_TLS=DIR}"
 export CUDA_VISIBLE_DEVICES=$gpu
 export DS4_ENGRAM_CACHE_MB=$eg_mb
 common=(--pack "$pack" --vram-experts "$vram" --mmap-experts on --ssd-cache 0 --no-expert-cache

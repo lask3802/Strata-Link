@@ -30,7 +30,7 @@ files under ds4.txt's model_dir.  A worker for layers LO-HI opens every file and
 those bytes are sent at their own offsets (the shards of other layers, the Engram and the drafter: empty sparse files of
 their sizes), and the pack folder whole; --model-dir names the weights' folder when ds4.txt's is not this PC's.
 
-    python3 tools/stage_ship.py --engine dsv41 --agent http://192.0.2.12:7840 --token-file /opt/strata/stage-token \\
+    python3 tools/stage_ship.py --engine dsv41 --agent https://192.0.2.12:7840 --tls-dir ~/.strata/stage-tls \\
         --pack-dir /data/packs/<pack> [--bin-dir /opt/strata/build/bin] --layers 20- [--data-dir <the node's data_dir>]
 
 --layers LO- runs to the trunk's last layer.  The node agent writes its own folder into the pack's ds4.txt when /start

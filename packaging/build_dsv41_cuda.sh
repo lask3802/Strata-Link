@@ -25,7 +25,8 @@ if [ ! -e "$SRC/.git" ] && [ ! -f "$SRC/BUILD_ID" ]; then
   printf '%s\n' "${COMMIT:0:9}" > "$SRC/BUILD_ID"
 fi
 rm -f "$B/CMakeCache.txt" "$B/strata-dsv41"
-# (STRATA_STAGE_TLS=OFF: this package has no strata, whose remote stage's TLS would want a static OpenSSL)
+# (STRATA_STAGE_TLS=OFF: no static OpenSSL here, so this package's --remote-stage and --stage-worker refuse to start; the
+# expert server's link does not use TLS)
 cmake -G Ninja -S "$SRC" -B "$B" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DSV41=ON \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_STAGE_TLS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$ARCH" -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" \
   -DCUDAToolkit_ROOT="$CUDA" -DSTRATA_GGML_DIR="$GG" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SKIP_BUILD_RPATH=OFF \

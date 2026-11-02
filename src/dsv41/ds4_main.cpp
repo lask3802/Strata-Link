@@ -1951,6 +1951,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-ds4: --encode-image reads no layers: not with --stage-begin / --stage-end\n");
         return 2;
     }
+    // (said before the model loads: a build without TLS or a PC without its keys need not wait minutes to hear it)
+    if ((o.stage_worker || o.remote_stage) && stage_cred() == nullptr) return 1;
     RemoteMain remote;   // (before the model: the model's hooks call it until the model is gone)
     strata::ds4::Model m;
     std::string err;

@@ -23,7 +23,7 @@
 // link has been quiet for kWakeQuietMs (the server's spin restarts before the window's first request), and serve_lane
 // does not nap while the link is up and its last request is under kSpinMs old.  Both ends' link threads run on the
 // link core (DS4_EP_CPU, 2), the main's CPU lane workers off it and its SMT sibling.  DS4_EP_WAKE=0: no Wake and the
-// lane's 2 ms naps (A/B).
+// lane's naps after DS4_LANE_SPIN_MS (A/B).
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
 //

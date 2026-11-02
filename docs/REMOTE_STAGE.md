@@ -554,7 +554,7 @@ asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two
 The tools:
 
 ```
-python3 tools/stage_ship.py --engine dsv41 --agent http://192.0.2.11:7840 --token-file /opt/strata/stage-token \
+python3 tools/stage_ship.py --engine dsv41 --agent https://192.0.2.11:7840 --tls-dir ~/.strata/stage-tls \
     --pack-dir /data/packs/<pack> [--bin-dir <folder with strata-dsv41>] --layers 20- --data-dir /data/stage
 # node.json: "dsv41_exe": "/data/stage/bin/strata-dsv41", "lib_dirs": [...], "dsv41_args": ["--max-context", "8192"]
 curl -H "X-Stage-Token: $T" -d '{"engine":"dsv41","begin":20,"model":{"dir":"<model dir>","pack":"<pack>"}}' \
@@ -571,7 +571,7 @@ curl -H "X-Stage-Token: $T" -d '{"engine":"dsv41","begin":20,"model":{"dir":"<mo
 - The flags a `/start` may add are the engine's own (`--max-context`, `--cpu-threads`, `--vram-experts`, ...; the Qwen
   engine's `--kv`, `--spec`, `--prefill` are refused). The main process: `--remote-stage HOST:PORT --stage-end K` in the
   config's `args`, or the Qwen spelling (`--layer-split K --split-device 0 --remote-stage HOST:PORT`) that the server turns
-  into it for DeepSeek. Put `STRATA_STAGE_TOKEN` in the config's `env`. The Workers card reads K from `--stage-end` (it
+  into it for DeepSeek. Both ends need their TLS keys (`strata --stage-keygen`, `STRATA_STAGE_TLS`), and an engine built with TLS: a package built with `-DSTRATA_STAGE_TLS=OFF` refuses `--remote-stage` and `--stage-worker` before it loads the model. The Workers card reads K from `--stage-end` (it
   wins over a `--layer-split`, which the engine ignores). Not yet measured on two PCs.
 - `STRATA_REMOTE_ROWS` has to be the same in the main process's environment and the worker's. The worker's comes from
   the `/start` request, `"env": {"STRATA_REMOTE_ROWS": "fp32"}` (the one variable an agent takes from it, and either

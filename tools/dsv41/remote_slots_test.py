@@ -114,8 +114,10 @@ def main() -> int:
     PIN = len(P["sys"])
     eng = shlex.split(a.engine_args)
     thr = str(max(1, (os.cpu_count() or 2) // 2))
-    base_env = {"CUDA_VISIBLE_DEVICES": a.gpu, "DS4_ENGRAM_CACHE_MB": os.environ.get("ENGRAM_MB", "64"),
-                "STRATA_STAGE_TOKEN": os.environ.get("STRATA_STAGE_TOKEN", f"slots-{os.getpid()}-{time.time_ns()}")}
+    if not os.environ.get("STRATA_STAGE_TLS"):   # (one folder for both ends: a PC accepts its own certificate)
+        print("the link is TLS: strata --stage-keygen DIR on this PC, then STRATA_STAGE_TLS=DIR", flush=True)
+        return 2
+    base_env = {"CUDA_VISIBLE_DEVICES": a.gpu, "DS4_ENGRAM_CACHE_MB": os.environ.get("ENGRAM_MB", "64")}
     os.environ.update(base_env)   # (SK.run() starts the main process with this environment)
     common = ["--cpu-threads", thr, *eng]
     split_args = [*common, "--max-context", str(a.ctx), "--remote-stage", f"127.0.0.1:{a.port}", "--stage-end", str(a.k)]

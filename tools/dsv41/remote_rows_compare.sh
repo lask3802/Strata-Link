@@ -53,7 +53,7 @@ for a in $arms; do
 done
 mkdir -p "$out"
 ids=$(cat "$ids_file")
-export STRATA_STAGE_TOKEN=${STRATA_STAGE_TOKEN:-loopback-$$-$RANDOM$RANDOM}
+: "${STRATA_STAGE_TLS:?the link is TLS: strata --stage-keygen DIR on this PC, then STRATA_STAGE_TLS=DIR}"
 export CUDA_VISIBLE_DEVICES=$gpu
 export DS4_ENGRAM_CACHE_MB=$eg_mb
 export STRATA_REMOTE_TIMING=1

@@ -274,7 +274,7 @@ private:
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
             bool ok = false;
-            const int sp = split_ && j.mem == nullptr && j.dfd != os::kBadFd && j.map != nullptr ? split_read(j, lead) : -1;
+            const int sp = split_ && !j.exact && j.mem == nullptr && j.dfd != os::kBadFd && j.map != nullptr ? split_read(j, lead) : -1;
             if (sp >= 0) {
                 ok = sp == 1;
             } else if (j.mem != nullptr) {

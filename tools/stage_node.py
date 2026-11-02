@@ -612,7 +612,8 @@ class Workers:
                      "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
             args += [str(a) for a in c.get("args", [])] + extra
         env = dict(os.environ)
-        env.pop("STRATA_STAGE_TOKEN", None)
+        if not dsv41:   # (a DeepSeek worker may run --remote-experts, whose own link takes this token)
+            env.pop("STRATA_STAGE_TOKEN", None)
         env["STRATA_STAGE_TLS"] = str(c["_tls"])
         env["STRATA_REMOTE_TIMING"] = "1"
         env.pop("STRATA_REMOTE_ROWS", None)   # (the rows' precision is the main process's: only /start says it)

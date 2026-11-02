@@ -161,6 +161,8 @@ float* xbuf(size_t n) {
 }
 
 // ---- item quant: gg::mv's int8 inputs
+// (Since 0.1.55 gg::mv's QuantItems rounds a GEMV input once whatever kQuant says: both arms take the same path, so this
+// checks that the switch moves nothing, not that QuantItems is right.)
 void test_quant(cudaStream_t s) {
     const int D = 4096, Q = 1024, HD = 512, HQ = 8 * 4096, OL = 1024, FF = 2048;
     M wq_a(gg::kFmtQ8_0, D, Q), wkv(gg::kFmtQ8_0, D, HD), cw(gg::kFmtBF16, D, HD);
