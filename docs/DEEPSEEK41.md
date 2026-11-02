@@ -201,6 +201,9 @@ second computer runs `strata-dsv41 --expert-server-connect HOST:PORT` (`--expert
 strangers out: the link is not encrypted, so never put it on a network you do not trust. `--remote-stage` is another thing: it splits the layers, and it uses
 the TLS keys of `strata --stage-keygen` (`STRATA_STAGE_TLS`).
 
+`DS4_RX_FILL=1` lets the server's set follow what the model uses. Its fills read the model's files through their mappings, so on the main computer set
+`DS4_NO_VIEW=0` beside it: the engine refuses `DS4_NO_VIEW=1` with `DS4_RX_FILL=1` before it loads the model.
+
 Both computers run the same commit, each built for its own card, for example a main computer with an RTX 2080 Ti (sm_75) and a server with an RTX 3080 (sm_86):
 
 ```

@@ -3037,6 +3037,11 @@ struct Model::Impl {
             if (!rewarm_on)
                 std::fprintf(stderr, "ds4: DS4_REWARM=1: nothing to read again (DS4_IQ_WARM is not split)\n");
         }
+        if (const char* why = rx::fill_view_refusal(!o.remote_experts.empty(), std::getenv("DS4_RX_FILL"),
+                                                    std::getenv("DS4_NO_VIEW"))) {
+            err = why;
+            return false;
+        }
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
         if (g.dim == 0 || g.nl == 0 || (int) g.ratios.size() < g.nl) {
@@ -4345,7 +4350,9 @@ struct Model::Impl {
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
         if (std::getenv("DS4_NO_VIEW") == nullptr && !devs.empty()) {
             cudaDeviceProp vp{};
-            no_view = cudaGetDeviceProperties(&vp, devs[0].id) == cudaSuccess && vp.integrated != 0;
+            // (not with fills: they read the mappings, rx::fill_view_refusal)
+            no_view = !rx::fill_wanted(!o.remote_experts.empty(), std::getenv("DS4_RX_FILL")) &&
+                      cudaGetDeviceProperties(&vp, devs[0].id) == cudaSuccess && vp.integrated != 0;
         }
 #endif
         if (no_view && store && pk.gguf) {

@@ -22,12 +22,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::ds4::rx {
 
 constexpr uint8_t kHeld = 1;      // the server holds it: requests may name it
 constexpr uint8_t kFilling = 2;   // its fill is queued or under way: requests do not name it, no cache takes it
+
+/// Whether the main will send fills: --remote-experts with DS4_RX_FILL=1 (fill_env: its value, null when unset).
+inline bool fill_wanted(bool remote_experts, const char* fill_env) {
+    return remote_experts && fill_env != nullptr && *fill_env == '1';
+}
+/// A fill reads in's bytes through the model's mappings (rx_fill_out's pk.at), and DS4_NO_VIEW drops them after the load:
+/// the fill would copy from null.  The pair is refused before the load.  Non-null: why (no_view_env: DS4_NO_VIEW's value)
+inline const char* fill_view_refusal(bool remote_experts, const char* fill_env, const char* no_view_env) {
+    if (!fill_wanted(remote_experts, fill_env) || no_view_env == nullptr || std::atoi(no_view_env) == 0) return nullptr;
+    return "DS4_NO_VIEW=1 with DS4_RX_FILL=1: an expert server's fills read the model's mappings, which DS4_NO_VIEW drops. "
+           "Set DS4_NO_VIEW=0 or leave DS4_RX_FILL off";
+}
 
 /// The RAM tier's next expert from a layer's CPU-lane hits: the hottest not in VRAM (slot < 0), not in RAM (ram < 0),
 /// not `vin` (the VRAM tier's pick this tick) and not one the expert server holds or is filling (remote[e] != 0;

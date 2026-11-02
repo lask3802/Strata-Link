@@ -38,6 +38,18 @@ static rx::Fill pick(const std::vector<int>& hits, const int* slot, const float*
 
 int main() {
     {
+        // DS4_NO_VIEW + DS4_RX_FILL: refused before the load (a fill reads the mappings DS4_NO_VIEW drops)
+        check(rx::fill_view_refusal(true, "1", "1") != nullptr, "--remote-experts, DS4_RX_FILL=1, DS4_NO_VIEW=1: refused");
+        check(rx::fill_view_refusal(true, "1", "2") != nullptr, "DS4_NO_VIEW=2 is on too (the load's atoi): refused");
+        check(rx::fill_view_refusal(true, "1", "0") == nullptr, "DS4_NO_VIEW=0: taken");
+        check(rx::fill_view_refusal(true, "1", nullptr) == nullptr, "DS4_NO_VIEW unset: taken");
+        check(rx::fill_view_refusal(true, "0", "1") == nullptr, "DS4_RX_FILL=0: no fills, taken");
+        check(rx::fill_view_refusal(true, nullptr, "1") == nullptr, "DS4_RX_FILL unset: no fills, taken");
+        check(rx::fill_view_refusal(false, "1", "1") == nullptr, "no --remote-experts: no fills, taken");
+        check(rx::fill_wanted(true, "1") && !rx::fill_wanted(true, "0") && !rx::fill_wanted(true, nullptr) &&
+                  !rx::fill_wanted(false, "1"), "fills only with --remote-experts and DS4_RX_FILL=1, as the link opens them");
+    }
+    {
         // the rule: in's heat past the coldest held one's x 1.25 + 1
         const int n = 6;
         std::vector<int> slot(n, -1);
