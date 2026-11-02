@@ -59,6 +59,9 @@ bool type_on_chunk(int type);
 
 /// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
 bool prepare(cudaStream_t s);
+/// Loads every kernel moe_gate_up / moe_down can launch (MXFP4 and each low-bit type, one entry a group: the expert
+/// server's), so that CUDA's lazy loading takes their memory now and not at the first request.  false: one failed (printed).
+bool load_moe_kernels();
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
@@ -74,6 +77,11 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 /// roles' types in lay.K, see expert_type).
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+/// moe_down in two halves (U9 tail): the device experts' down projections into the stream's scratch (they read only
+/// the plan, not the CPU lane's answer: false, not covered - printed), then the sum with the CPU part and the shared
+/// expert, after the wait.  The same kernels as moe_down, on the same stream.
+bool moe_down_experts(const x3::MoeArgs& a, const float* h, cudaStream_t s);
+void moe_down_combine(const x3::MoeArgs& a, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s);

@@ -989,7 +989,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
-                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp)
+                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
+                   src/net/stage_link.cpp src/net/stage_tls.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_server.cu
+                   src/dsv41/ds4_rx_cpu.cpp src/dsv41/ds4_rx_lane.cpp src/dsv41/ds4_rx_fill_link.cpp src/net/ep_link.cpp)
+    strata_stage_tls(strata-dsv41)
+    if(WIN32)
+      target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the remote stage's sockets (src/net/stage_link.cpp)
+    endif()
     # the commit the binary was built from, readable with --version (set -DSTRATA_BUILD_ID=... for a tree without .git)
     if(NOT STRATA_BUILD_ID AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID)   # (a git archive has no .git: the packer writes the commit here)
       file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
@@ -1067,6 +1073,145 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
+      # expert parallelism's n_ff slices on the CPU lane (gg::iq_cpu_slice, ds4_ffslice.hpp): the slices of an expert read
+      # in place sum to the whole one, in place == copied out, blob -> slices -> blob; no GPU (--pack: a pack's experts, read only)
+      add_executable(ds4_ep_slice_test tests/dsv41/ep_slice_test.cpp src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp
+                     src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_ep_slice_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_ep_slice_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_ep_slice_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      # the expert server's CPU lane over the parts pack's n_ff slices (rx::SliceLane, ds4_rx_lane.hpp): its sums against
+      # the slice computed in place on the whole expert, and with the main's [0, k) against the whole; no GPU
+      add_executable(ds4_rx_lane_test tests/dsv41/rx_lane_test.cpp src/dsv41/ds4_rx_lane.cpp src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_rx_lane_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_compile_features(ds4_rx_lane_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rx_lane_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_rx_lane_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      # which lane computes which n_ff blocks of a pick under H' (ds4_rx_split.hpp): each block added once; no GPU, no model
+      add_executable(ds4_rx_split_test tests/dsv41/rx_split_test.cpp)
+      target_compile_features(ds4_rx_split_test PRIVATE cxx_std_17)
+      # heavy-first deferral's pure logic (ds4_defer_split.hpp: DS4_EP_DEFER_BELOW / TOP, their CHECK, DS4_EP_DEFER_STAT):
+      # the values, the layers split, the heavy picks, each pick's blocks once into its part, the tally; rx_send's rows,
+      # the adds and the fallback by part (ds4_defer_rows.hpp), Pool::help_one (the speed path's poll); no GPU, no model
+      add_executable(ds4_defer_split_test tests/dsv41/defer_split_test.cpp)
+      target_compile_features(ds4_defer_split_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_defer_split_test PRIVATE Threads::Threads)
+      # DS4_IO_SPLIT (IoQueue's split read, ds4_pool.hpp): a read with a resident lead against a file of its own; Linux
+      add_executable(ds4_io_split_test tests/dsv41/io_split_test.cpp)
+      target_compile_features(ds4_io_split_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_io_split_test PRIVATE Threads::Threads)
+      if(STRATA_ENABLE_CUDA)
+        # the decode GPU-part changes (ds4_u9.hpp) against the path they replace, bit for bit; needs a GPU, no model
+        add_executable(ds4_u9_test tests/dsv41/u9_bits_test.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu
+                       src/dsv41/ds4_kernels.cu)
+        target_include_directories(ds4_u9_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+        target_link_libraries(ds4_u9_test PRIVATE ${_strata_gpu_runtime_target})
+        # the chunked prompt's dense dequant: the coalesced kernel against DS4_DQ_OLD's, and DS4_DQ_ONCE's GEMM order
+        # against gemm()'s (ds4_gemm16.cuh), bit for bit; needs a GPU, no model
+        add_executable(ds4_dq_test tests/dsv41/dq_test.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu
+                       src/dsv41/ds4_kernels.cu)
+        target_include_directories(ds4_dq_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+        target_link_libraries(ds4_dq_test PRIVATE strata_dsv41_kernels ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+        # DS4_EP_DEFER's late add (hc_late_add) against hc_post of the summed output, host and device; needs a GPU, no model
+        add_executable(ds4_defer_test tests/dsv41/defer_test.cu src/dsv41/ds4_kernels.cu)
+        target_include_directories(ds4_defer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+        target_link_libraries(ds4_defer_test PRIVATE ${_strata_gpu_runtime_target})
+        # DS4_BC_ONCE=3's pull (bc_pull): a layer's bounds from mapped host memory into the device table, against the
+        # host's, over a run of layers; needs a GPU, no model
+        add_executable(ds4_bc_pull_test tests/dsv41/bc_pull_test.cu)
+        target_include_directories(ds4_bc_pull_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+        target_link_libraries(ds4_bc_pull_test PRIVATE ${_strata_gpu_runtime_target})
+        # DS4_ATTN_TC (ds4_attn_tc.cuh): the prompt slab's tensor-core sparse attention against the packed rows' kernel
+        # and a double reference, --bench their times; needs a GPU, no model.  _k8: Turing's m16n8k8 path on any GPU
+        foreach(_t ds4_attn_tc_test ds4_attn_tc_test_k8)
+          add_executable(${_t} tests/dsv41/attn_tc_test.cu src/dsv41/ds4_kernels.cu)
+          target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+          target_link_libraries(${_t} PRIVATE ${_strata_gpu_runtime_target})
+          target_compile_definitions(${_t} PRIVATE DS4_ATTN_TC_TEST=1)   # (attn_tc mode 4: the test's)
+        endforeach()
+        target_compile_definitions(ds4_attn_tc_test_k8 PRIVATE DS4_ATTN_TC_K8=1)
+        # DS4_IQ_SET2 (ds4_iq.cu set2_tile_kernel): the prompt's expert sets against set_tc_kernel, bit for bit, --bench their
+        # times; needs a GPU, no model.  _k8: Turing's m16n8k8 path on any GPU; _none: an sm_60 / sm_70 build's stand-in
+        # (DS4_IQ_SET2_FORCE_NONE: the kernels trap, never taken)
+        foreach(_t ds4_iq_set2_test ds4_iq_set2_test_k8 ds4_iq_set2_test_none)
+          add_executable(${_t} tests/dsv41/iq_set2_test.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu src/dsv41/ds4_gguf.cu)
+          target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+          target_link_libraries(${_t} PRIVATE ${_strata_gpu_runtime_target})
+          target_compile_definitions(${_t} PRIVATE STRATA_DSV41_TQ_CPU=1)
+        endforeach()
+        target_compile_definitions(ds4_iq_set2_test_k8 PRIVATE DS4_IQ_SET2_K8=1)
+        target_compile_definitions(ds4_iq_set2_test_none PRIVATE DS4_IQ_SET2_FORCE_NONE=1)
+      endif()
+      # the remote experts (ds4_rx.hpp): this is the main process's end, an expert server (strata-dsv41
+      # --expert-server-connect, a GPU) the other; its replies against the CPU lane's sums of the same random experts
+      set_source_files_properties(tests/dsv41/rx_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
+      add_executable(ds4_rx_test tests/dsv41/rx_test.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_fill_link.cpp src/net/ep_link.cpp
+                     src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_rx_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_rx_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
+      target_compile_definitions(ds4_rx_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(WIN32)
+        target_link_libraries(ds4_rx_test PRIVATE ws2_32)
+      endif()
+      # the remote experts' send gate and reply deadline (rx::Gate, ds4_rx.hpp): no GPU, no socket
+      add_executable(ds4_rx_gate_test tests/dsv41/rx_gate_test.cpp)
+      target_compile_features(ds4_rx_gate_test PRIVATE cxx_std_17)
+      # the remote experts' fills (ds4_rx_fill.hpp, EP U5): the remote tier's choice, the fill budget, the RAM tier's
+      # rule; no GPU, no socket
+      add_executable(ds4_rx_fill_test tests/dsv41/rx_fill_test.cpp)
+      target_compile_features(ds4_rx_fill_test PRIVATE cxx_std_17)
+      # the link's arrival time in the kernel (rx::Conn, SO_TIMESTAMPNS on Linux) over loopback: no GPU
+      add_executable(ds4_rx_link_test tests/dsv41/rx_link_test.cpp src/dsv41/ds4_rx.cpp)
+      target_compile_features(ds4_rx_link_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rx_link_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_rx_link_test PRIVATE ws2_32)
+      endif()
+      # DS4_RX_PREWAKE (rx::PreWake, rx::Main::prewake): when a prompt's wake request is due, and its reply kept out of
+      # the requests' (take_late, stales, a wait's result) against a stand-in server over loopback: no GPU
+      add_executable(ds4_rx_prewake_test tests/dsv41/rx_prewake_test.cpp src/dsv41/ds4_rx.cpp)
+      target_compile_features(ds4_rx_prewake_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rx_prewake_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_rx_prewake_test PRIVATE ws2_32)
+      endif()
+      # the remote experts between two processes on 127.0.0.1 (ds4_rx.hpp): rx::Main against the CPU expert server
+      # (--expert-server-cpu's, ds4_rx_cpu.cpp) - the sums, a late reply, a server killed, --expert-server-once, the Wake
+      # and the spin budget, the link core's pin, the lane's nap rule, TCP_QUICKACK.  No GPU, no model
+      add_executable(ds4_rx_loop_test tests/dsv41/rx_loop_test.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_cpu.cpp src/dsv41/ds4_rx_lane.cpp
+                     src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_rx_loop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_rx_loop_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_rx_loop_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(WIN32)
+        target_link_libraries(ds4_rx_loop_test PRIVATE ws2_32)
+      endif()
+      # DS4_FORCE_TOKENS (ds4_force.hpp): the decode emits a file's ids, for speed A/Bs on one token path; no GPU
+      add_executable(ds4_force_test tests/dsv41/force_tokens_test.cpp)
+      target_compile_features(ds4_force_test PRIVATE cxx_std_17)
+      # DS4_STAGE_N (ds4_stage_slots.hpp): the flow's staging slots apart from the ring's; no GPU, no model
+      add_executable(ds4_stage_slots_test tests/dsv41/stage_slots_test.cpp)
+      target_compile_features(ds4_stage_slots_test PRIVATE cxx_std_17)
+      # DS4_SMALL_PROMPT / DS4_SMALL_WIN (ds4_small_prompt.hpp): which feeds take the decode's windows; no GPU, no model
+      add_executable(ds4_small_prompt_test tests/dsv41/small_prompt_test.cpp)
+      target_compile_features(ds4_small_prompt_test PRIVATE cxx_std_17)
+      # the flow's expert-stage batches and DS4_BC_ONCE's up-front bounds (ds4_flow_batches.hpp): the partition, the
+      # regions and their reuse; no GPU, no model
+      add_executable(ds4_flow_batches_test tests/dsv41/flow_batches_test.cpp)
+      target_compile_features(ds4_flow_batches_test PRIVATE cxx_std_17)
+      # DS4_REWARM's runner (ds4_rewarm.hpp): one at a time, a cancel stops and waits for it; no GPU, no model
+      add_executable(ds4_rewarm_test tests/dsv41/rewarm_test.cpp)
+      target_compile_features(ds4_rewarm_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rewarm_test PRIVATE Threads::Threads)
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
@@ -1077,6 +1222,40 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(ds4_pick_rule_test tests/dsv41/pick_rule_test.cpp)
       target_include_directories(ds4_pick_rule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_pick_rule_test PRIVATE cxx_std_17)
+      # the remote stage's pack fingerprint, both sides' hello checks, the reply's layout, the compact bf16 rows, the
+      # commits of draft checks, the prompt chunks and the worker's checkpoint / slot handlers over a loopback link
+      # (ds4_stage.hpp, ds4_partstore.hpp, src/net/stage_link.cpp): no GPU, no model
+      add_executable(ds4_stage_test tests/dsv41/stage_test.cpp src/net/stage_link.cpp src/net/stage_tls.cpp)
+      strata_stage_tls(ds4_stage_test)
+      target_include_directories(ds4_stage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_compile_features(ds4_stage_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_stage_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_stage_test PRIVATE ws2_32)
+      endif()
+      # the EP link (src/net/ep_link.{hpp,cpp}): the hellos and their refusals, the request rules, timeouts, a peer killed
+      # mid-frame, the spin budget and Wakes, fills and epochs - between two processes on 127.0.0.1; --serve / --probe:
+      # the token-shaped round trips between two PCs (its own libstdc++ inside, so it runs on the other PC's system too).
+      # No GPU, no model
+      add_executable(ds4_ep_link_test tests/dsv41/ep_link_test.cpp src/net/ep_link.cpp)
+      target_include_directories(ds4_ep_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
+      target_compile_features(ds4_ep_link_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_ep_link_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_ep_link_test PRIVATE ws2_32)
+      elseif(NOT APPLE)
+        target_link_options(ds4_ep_link_test PRIVATE -static-libstdc++ -static-libgcc)
+      endif()
+      # the EP parts pack's read side (ds4_epparts.hpp; tools/dsv41/ep_parts.py writes it): parts -> whole byte for byte,
+      # the slice views, the refusals; with PACK PARTS arguments the same against a real pack.  No GPU, no model
+      add_executable(ds4_epparts_test tests/dsv41/epparts_test.cpp src/net/stage_link.cpp src/net/stage_tls.cpp)
+      strata_stage_tls(ds4_epparts_test)
+      target_include_directories(ds4_epparts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_compile_features(ds4_epparts_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_epparts_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_epparts_test PRIVATE ws2_32)
+      endif()
     endif()
     if(STRATA_ENABLE_HIP)
       foreach(_t strata_dsv41_kernels strata-dsv41)

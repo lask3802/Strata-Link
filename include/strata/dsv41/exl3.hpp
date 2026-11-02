@@ -154,6 +154,8 @@ struct SetArgs {
     int max_rows = 0;   // the most rows one expert of the set has
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    int nrows = 0;               // the set's rows (bounds[n_exp] - row0; 0: not given)
+    uint16_t* xg = nullptr;      // (ds4's GGUF low-bit sets, DS4_IQ_SET2) room for their gate / up input as F16, nrows rows
     // gate / up: the caller's F16 copy of the activations (row_idx picks the rows).  The tiles round F32 to F16 for
     // their shared-memory tile anyway, so the same values come out; this only saves the F32 read of the same rows by
     // every column block of an expert (18-36 reads of 1.8-3.7 MB on a prompt) - MarLin's "small operand cheap".

@@ -12,6 +12,7 @@
 #include "ds4_gguf_cpu.hpp"   // gg_row_to_bf16 (the DS4_DBG_IQ check)
 #endif
 #include "ds4_numerics.cuh"
+#include "ds4_u9.hpp"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -23,8 +24,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace strata::ds4::gguf {
 namespace {
@@ -1073,6 +1076,26 @@ bool mx_geometry(const char* who, int k, int n_embd, int n_ff) {
 // ---------------------------------------------------------------- entry points
 bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
 
+bool load_moe_kernels() {
+#if !defined(STRATA_USE_HIP)
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, q8_quant_kernel) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_gate_up_kernel<1, true>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_gate_up_kernel<1, false>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_down_kernel<1, true>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_down_kernel<1, false>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_combine_kernel) != cudaSuccess) {
+        check("load_moe_kernels");
+        return false;
+    }
+#endif
+    if (!iq::load_moe_kernels()) {
+        fail("load_moe_kernels: a low-bit type's kernel did not load");
+        return false;
+    }
+    return true;
+}
+
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 size_t type_row_bytes(int type, int64_t k) {
@@ -1121,6 +1144,41 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
         return false;
     }
     return true;
+}
+// iq::gate_up / down refusing a token's or a window's experts (who 0: gate / up, 1: down): h / part not written, a
+// launch error each time, but every layer of the type fails every token - so the first of a (who, type) is printed,
+// with why, and the count at exit (MoeArgs carries no layer: the line is the first such layer's)
+struct NoToken {
+    std::mutex mu;
+    std::map<std::pair<int, int>, long> n;   // (who, type) -> refusals
+};
+NoToken& no_tokens() {   // (never destroyed: a launch on another thread at exit still finds it)
+    static NoToken* t = new NoToken;
+    return *t;
+}
+void no_token_counts() {   // (atexit)
+    NoToken& t = no_tokens();
+    std::lock_guard<std::mutex> lk(t.mu);
+    for (const auto& e : t.n)
+        if (e.second > 1)
+            std::fprintf(stderr, "ds4 gguf %s: %s experts refused %ld times (the first printed)\n",
+                         e.first.first == 0 ? "gate_up" : "down", type_name(e.first.second), e.second);
+}
+void no_token(int who, int type, int n_embd, int n_ff) {
+    g_errors.fetch_add(1, std::memory_order_relaxed);
+    {
+        NoToken& t = no_tokens();
+        std::lock_guard<std::mutex> lk(t.mu);
+        if (t.n.empty()) std::atexit(no_token_counts);
+        if (++t.n[{who, type}] > 1) return;
+    }
+    const char* w = who == 0 ? "gate_up" : "down";
+    if (!iq::token_kernel(type))   // (Q5_K / Q6_K: the device takes them for the dense GEMVs, not as token experts)
+        std::fprintf(stderr, "ds4 gguf %s: %s experts have no token kernel (%s not written; later ones counted)\n", w,
+                     type_name(type), who == 0 ? "h" : "part");
+    else
+        std::fprintf(stderr, "ds4 gguf %s: the %s token kernel does not cover n_embd %d, n_ff %d (later ones counted)\n",
+                     w, type_name(type), n_embd, n_ff);
 }
 template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
@@ -1394,7 +1452,10 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
         ia.xq = sc->xq;
         ia.xd = sc->xd;
         q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
-        iq::gate_up(ia, a.k, 1, s);
+        if (!iq::gate_up(ia, a.k, 1, s)) {   // (Q5_K / Q6_K: supported, but no token kernel; h was left as it was)
+            no_token(0, ia.tg, a.n_embd, a.n_ff);
+            return;
+        }
         check("moe_gate_up");
         return;
     }
@@ -1418,9 +1479,13 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
 }
 
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
-    if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
+    if (moe_down_experts(a, h, s)) moe_down_combine(a, sh_out, out, s);
+}
+
+bool moe_down_experts(const x3::MoeArgs& a, const float* h, cudaStream_t s) {
+    if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return false;
     Scratch* sc = scratch(s);
-    if (sc == nullptr) return;
+    if (sc == nullptr) return false;
     MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
     m.plan_ptr = a.plan_ptr;
     m.h = const_cast<float*>(h);
@@ -1430,12 +1495,15 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     q8_quant(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return false;
         ia.plan_ptr = a.plan_ptr;
         ia.part = sc->part;
         ia.hq = sc->hq;
         ia.hd = sc->hd;
-        iq::down(ia, a.k, 1, s);
+        if (!iq::down(ia, a.k, 1, s)) {
+            no_token(1, ia.td, a.n_embd, a.n_ff);
+            return false;
+        }
     } else {
 #if defined(STRATA_METAL)
         // mx_down_kernel on the Metal dispatch; the launch below is the fallback
@@ -1444,6 +1512,12 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
 #endif
             launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
+    return true;
+}
+
+void moe_down_combine(const x3::MoeArgs& a, const float* sh_out, float* out, cudaStream_t s) {
+    Scratch* sc = scratch(s);
+    if (sc == nullptr) return;
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
@@ -1509,8 +1583,8 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
                                                 a.lay.trellis, a.n_embd, a.n_ff, a.limit, sc->xq, sc->xd, a.h, groups))
 #endif
             launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
-    } else {
-        iq::gate_up(ia, groups, a.T, s);
+    } else if (!iq::gate_up(ia, groups, a.T, s)) {
+        no_token(0, ia.tg, a.n_embd, a.n_ff);
     }
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) {
@@ -1520,8 +1594,8 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
                                                 a.lay.trellis, a.n_embd, a.n_ff, sc->hq, sc->hd, a.part, groups))
 #endif
             launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
-    } else {
-        iq::down(ia, groups, a.T, s);
+    } else if (!iq::down(ia, groups, a.T, s)) {
+        no_token(1, ia.td, a.n_embd, a.n_ff);
     }
 #if !defined(STRATA_METAL)
     // (this port's dispatches are synchronous and nothing is published to wait for: ds4_kernels.cu's wait_seq)
@@ -1587,7 +1661,8 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         q.ldo = ldh;
         q.tg = ia.tg;
         q.td = ia.td;
-        if (!iq::set_gate_up(q, s)) fail("set_gate_up: not covered");
+        const iq::Set2Room room{sa.xg, sa.nrows};   // (DS4_IQ_SET2: the engine's room, when it gives one)
+        if (!iq::set_gate_up(q, s, &room)) fail("set_gate_up: not covered");
         check("set_gate_up");
         return;
     }

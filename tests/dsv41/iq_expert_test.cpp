@@ -328,7 +328,7 @@ static void bench_light(int type, int nexp, int rows, bool tiles = false) {
 }
 
 int main(int argc, char** argv) {
-    std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
+    std::vector<int> types = {16, 17, 22, 18, 21, 23, 19, 29};
     std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--bench-tiles") {   // [types] [n_exp] [rows list]: the prompt sets' tensor-core tiles

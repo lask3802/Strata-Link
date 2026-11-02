@@ -11,9 +11,11 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -365,6 +367,25 @@ inline void prefetch(const std::vector<std::pair<const void*, size_t>>& ranges) 
 #endif
 }
 
+/// [p, p + n) of a file's mapping read in and mapped now (Linux 5.14+ madvise MADV_POPULATE_READ: the page cache
+/// filled from the file where it has not the pages and this process's page tables set, so the first read of each page
+/// is no fault): 1 done, 0 not had here (EINVAL: a kernel without it; Windows), -1 failed otherwise (errno: a part of
+/// the range not mapped, an I/O error) - the caller reads it then (pread: the page cache, not the page tables)
+inline int populate(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    int r;
+    while ((r = madvise((void*) b, n + (a - b), MADV_POPULATE_READ)) != 0 && errno == EINTR) {}
+    return r == 0 ? 1 : errno == EINVAL ? 0 : -1;
+#endif
+}
+
 /// Whether every page of [p, p + n) of a file's mapping is in the page cache (Linux mincore; elsewhere false: the
 /// caller reads buffered anyway, which the cache serves)
 inline bool resident(const void* p, size_t n) {
@@ -380,6 +401,40 @@ inline bool resident(const void* p, size_t n) {
     for (size_t i = 0; i < np; ++i)
         if ((v[i] & 1) == 0) return false;
     return true;
+#endif
+}
+/// The bytes of [p, p + n) of a file's mapping not in the page cache, by whole 4 KiB pages (Linux mincore; elsewhere
+/// or on an error 0: not known)
+inline size_t cold_bytes(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    const size_t len = n + (a - b), np = (len + pg - 1) / pg;
+    thread_local std::vector<unsigned char> v;
+    if (v.size() < np) v.resize(np);
+    if (mincore((void*) b, len, v.data()) != 0) return 0;
+    size_t cold = 0;
+    for (size_t i = 0; i < np; ++i) cold += (v[i] & 1) == 0 ? 1 : 0;
+    return cold * pg;
+#endif
+}
+/// The bytes of [p, p + n) of a file's mapping before its first page not in the page cache: n when every page is in, 0
+/// when p's own page is not, else up to that page's start (Linux mincore; elsewhere or on an error 0: not known)
+inline size_t resident_lead(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    const size_t len = n + (a - b), np = (len + pg - 1) / pg;
+    thread_local std::vector<unsigned char> v;
+    if (v.size() < np) v.resize(np);
+    if (mincore((void*) b, len, v.data()) != 0) return 0;
+    size_t i = 0;
+    while (i < np && (v[i] & 1) != 0) ++i;
+    return i == np ? n : i == 0 ? 0 : (size_t) (b + i * pg - a);
 #endif
 }
 
@@ -425,6 +480,27 @@ inline void prefetch_cold(const std::vector<std::pair<const void*, size_t>>& ran
     prefetch(cold);
 #else
     prefetch(ranges);
+#endif
+}
+
+/// [p, p + n) of a file's mapping kept in RAM (Linux mlock: every page read in and pinned until unmapped); false where
+/// it was not (RLIMIT_MEMLOCK, Windows: the caller touches the pages instead, and the page cache may drop them)
+inline bool lock_range(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return false;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    return mlock((const void*) b, n + (a - b)) == 0;
+#endif
+}
+/// lock_range's range let go (the page cache may drop it again)
+inline void unlock_range(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    munlock((const void*) b, n + (a - b));
 #endif
 }
 
@@ -478,9 +554,11 @@ inline void* huge_alloc(size_t bytes, size_t* got = nullptr) {
 }
 
 /// Anonymous memory on NUMA node `node` of `nodes` (node < 0 or nodes < 2: wherever the first touch puts it), on huge
-/// pages where the OS gives them; nullptr if it cannot be had.
-inline void* anon_alloc(size_t bytes, int node, int nodes) {
+/// pages where the OS gives them (huge false: MADV_NOHUGEPAGE - 4 KiB pages, THP's enabled=always included, so a fault
+/// never compacts memory for one); nullptr if it cannot be had.
+inline void* anon_alloc(size_t bytes, int node, int nodes, bool huge = true) {
 #if defined(_WIN32)
+    (void) huge;
     if (node >= 0 && nodes > 1)
         return VirtualAllocExNuma(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
                                   (DWORD) node);
@@ -488,7 +566,7 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
-    madvise(m, bytes, MADV_HUGEPAGE);
+    madvise(m, bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
@@ -496,6 +574,25 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
     }
     return m;
 #endif
+}
+/// [p, p + n) of new anonymous memory faulted in now, for writing (Linux 5.14+ madvise MADV_POPULATE_WRITE; without it,
+/// and on Windows, a zero written to every 4 KiB page - new memory reads as zeros either way), so no later write to it
+/// faults; what did it
+inline const char* populate_write(void* p, size_t n) {
+    if (n == 0) return "nothing";
+#if !defined(_WIN32)
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    int r;
+    while ((r = madvise((void*) b, n + (a - b), MADV_POPULATE_WRITE)) != 0 && errno == EINTR) {}
+    if (r == 0) return "MADV_POPULATE_WRITE";
+#endif
+    volatile uint8_t* q = (volatile uint8_t*) p;
+    for (size_t i = 0; i < n; i += 4096) q[i] = 0;
+    q[n - 1] = 0;
+    return "a zero written to every 4 KiB page";
 }
 /// An address range of `bytes` reserved (no memory behind it yet), and pieces of it made real: the store's arena is one range so a
 /// kernel can tell its pointers by [lo, hi).  nullptr: it could not be had.
@@ -542,16 +639,139 @@ inline void anon_free(void* p, size_t bytes) {
 #endif
 }
 
-/// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).
+#if !defined(_WIN32)
+/// The calling thread's mask from before its first pin_self (saved: it pinned itself and has not gone back since)
+struct PinSaved {
+    bool saved = false;
+    cpu_set_t before;
+};
+inline PinSaved& pin_saved() {
+    thread_local PinSaved s;
+    return s;
+}
+#endif
+/// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).  pin_self(-1):
+/// the calling thread's mask from before its first pin_self again (nothing if it was not pinned since).
 inline void pin_self(int cpu) {
 #if defined(_WIN32)
-    if (cpu >= 0 && cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
+    thread_local DWORD_PTR before = 0;
+    if (cpu >= 0 && cpu < 64) {
+        const DWORD_PTR was = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
+        if (before == 0) before = was;
+    } else if (cpu < 0 && before != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), before);
+        before = 0;
+    }
 #else
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    sched_setaffinity(0, sizeof set, &set);
+    bool& saved = pin_saved().saved;
+    cpu_set_t& before = pin_saved().before;
+    if (cpu >= 0) {
+        if (!saved) saved = sched_getaffinity(0, sizeof before, &before) == 0;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        sched_setaffinity(0, sizeof set, &set);
+    } else if (saved) {
+        sched_setaffinity(0, sizeof before, &before);
+        saved = false;
+    }
 #endif
+}
+/// Whether the calling thread may run on `cpu` (Linux: its mask - a container's cpuset is in it -, from before its
+/// pin_self if it pinned itself, so a pinned thread still sees the others; Windows: the process's)
+inline bool cpu_allowed(int cpu) {
+#if defined(_WIN32)
+    DWORD_PTR proc = 0, sys = 0;
+    return cpu >= 0 && cpu < 64 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && ((proc >> cpu) & 1);
+#else
+    if (pin_saved().saved) return cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &pin_saved().before);
+    cpu_set_t s;
+    return cpu >= 0 && cpu < CPU_SETSIZE && sched_getaffinity(0, sizeof s, &s) == 0 && CPU_ISSET(cpu, &s);
+#endif
+}
+/// The one logical CPU the calling thread may run on (-1: more than one, or not known)
+inline int pinned_cpu() {
+    int one = -1;
+#if defined(_WIN32)
+    GROUP_AFFINITY ga{};
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &ga) || ga.Group != 0) return -1;
+    for (int c = 0; c < 64; ++c)
+        if ((ga.Mask >> c) & 1) {
+            if (one >= 0) return -1;
+            one = c;
+        }
+#else
+    cpu_set_t s;
+    if (sched_getaffinity(0, sizeof s, &s) != 0 || CPU_COUNT(&s) != 1) return -1;
+    for (int c = 0; c < CPU_SETSIZE && one < 0; ++c)
+        if (CPU_ISSET(c, &s)) one = c;
+#endif
+    return one;
+}
+/// The logical CPU the calling thread runs on now (-1: not known)
+inline int cpu_now() {
+#if defined(_WIN32)
+    PROCESSOR_NUMBER pn{};
+    GetCurrentProcessorNumberEx(&pn);
+    return pn.Group == 0 ? (int) pn.Number : -1;
+#else
+    return sched_getcpu();
+#endif
+}
+/// The calling thread's CPU time, ms (Linux: CLOCK_THREAD_CPUTIME_ID; Windows: its cycles at the base clock are not
+/// time - -1)
+inline double thread_cpu_ms() {
+#if defined(_WIN32)
+    return -1.0;
+#else
+    timespec t{};
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) == 0 ? (double) t.tv_sec * 1e3 + (double) t.tv_nsec / 1e6 : -1.0;
+#endif
+}
+/// A kernel CPU list ("3,19", "3-4", "0-1,8-9") as its CPUs, in its order; it ends at anything else
+inline std::vector<int> cpu_list(const char* s) {
+    std::vector<int> v;
+    for (const char* p = s; *p >= '0' && *p <= '9';) {
+        char* q = nullptr;
+        const int lo = (int) std::strtol(p, &q, 10);
+        int hi = lo;
+        if (*q == '-') hi = (int) std::strtol(q + 1, &q, 10);
+        for (int c = lo; c <= hi && c - lo < 1024; ++c) v.push_back(c);
+        p = *q == ',' ? q + 1 : q;
+    }
+    return v;
+}
+/// The logical CPUs of `cpu`'s physical core, `cpu` among them, ascending ({cpu} where the OS does not say)
+inline std::vector<int> cpu_siblings(int cpu) {
+    std::vector<int> v;
+#if defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    std::vector<uint8_t> b(len);
+    if (cpu >= 0 && cpu < 64 && len > 0 &&
+        GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) b.data(), &len))
+        for (size_t o = 0; o < (size_t) len && v.empty();) {
+            auto* e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (b.data() + o);
+            const KAFFINITY m = e->Processor.GroupCount > 0 && e->Processor.GroupMask[0].Group == 0
+                                    ? e->Processor.GroupMask[0].Mask : 0;
+            if ((m >> cpu) & 1)
+                for (int c = 0; c < 64; ++c)
+                    if ((m >> c) & 1) v.push_back(c);
+            o += e->Size;
+        }
+#else
+    FILE* f = cpu >= 0 ? std::fopen(("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list").c_str(), "r")
+                       : nullptr;
+    char s[256] = {};
+    if (f != nullptr) {
+        if (std::fgets(s, sizeof s, f) == nullptr) s[0] = '\0';
+        std::fclose(f);
+    }
+    v = cpu_list(s);   // "3,19" or "3-4"
+#endif
+    if (std::find(v.begin(), v.end(), cpu) == v.end()) v.assign(1, cpu);
+    std::sort(v.begin(), v.end());
+    return v;
 }
 inline void pin_thread(std::thread& t, int cpu) {
 #if defined(_WIN32)

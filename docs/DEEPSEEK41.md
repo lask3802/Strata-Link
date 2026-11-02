@@ -117,6 +117,12 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   back when the next prompt continues it, also after a restart. Slots live in `ds4-slots` next to the run log, are capped at 2 GB
   (`STRATA_DS4_SLOT_GB`) and are removed after a week. The system prompt and tools shared by an agent
   and its sub-agents are kept as a checkpoint too. `STRATA_DS4_SLOT_KEEP=0` and `STRATA_DS4_AUTO_PIN=0` turn this off.
+  With a remote stage (`--remote-stage`) the switch works across the split: the worker keeps its part of each set-aside conversation under the
+  main process's slot id (in RAM up to `STRATA_DS4_SLOT_CAP` parts, 4 by default, then in `STRATA_DS4_SLOT_DIR` or `<pack>/slots-stage` up to
+  `STRATA_DS4_SLOT_GB`, 16 by default) and a conversation is taken back only when both processes hold it; when the worker does not (it was
+  restarted, or its cap let the part go) the prompt goes on from the model's own checkpoint (the shared start) or from the start; the
+  main process keeps 32 such slots at most. The worker's parts end with its link to the main process, so slots
+  do not survive a restart of either side. Both processes must run this version.
 
 Pictures are on by default: the engine reads them with its own vision tower (319 MiB of graphics memory, loaded with the model; no separate
 picture reader). The server decodes each picture, brings it to a size the tower takes (both sides a multiple of 42, at most 1024 image
@@ -185,6 +191,22 @@ python setup.py --family deepseek41 --model IST-DAS-2.00bpw
 
 `strata-dsv41 --version` prints the commit it was built from. A build you made yourself is not signed by Strata, which is fine for your own computer.
 Please tell us how it runs on your card (the speed, and the card and RAM): we only list a card as tested after someone has run it.
+
+### Two computers: an expert server
+
+An expert server is a second computer with a graphics card that holds some of the experts and computes them for the main computer, over its own plain TCP
+link. It is for testing, needs a fast private cable, and is off unless you ask for it. The main computer runs `--remote-experts [BIND:]PORT` and waits; the
+second computer runs `strata-dsv41 --expert-server-connect HOST:PORT` (`--expert-server-parts DIR` for the slices of a parts pack, made by
+`tools/dsv41/ep_parts.py`; `--expert-server-reserve-mib N` for the VRAM it leaves free). Both read the same `STRATA_STAGE_TOKEN`. The token only keeps
+strangers out: the link is not encrypted, so never put it on a network you do not trust. `--remote-stage` is another thing: it splits the layers, and it uses
+the TLS keys of `strata --stage-keygen` (`STRATA_STAGE_TLS`).
+
+Both computers run the same commit, each built for its own card, for example a main computer with an RTX 2080 Ti (sm_75) and a server with an RTX 3080 (sm_86):
+
+```
+SRC=. B=build CUDA=/usr/local/cuda-13.0 GG=third_party/llama.cpp ARCH=75-real packaging/build_dsv41_cuda.sh        # the main computer
+SRC=. B=build-sm86 CUDA=/usr/local/cuda-13.0 GG=third_party/llama.cpp ARCH=86-real packaging/build_dsv41_cuda.sh   # the expert server
+```
 
 ## Compressed experts (trellis), for testing
 

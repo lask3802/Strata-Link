@@ -5,6 +5,18 @@
 //   maya-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
 //   maya-ds4 --pack ... --ids ... --dump-logits out.f32                every position's logits (the oracle's check)
 //   maya-ds4 --pack ... --serve                                       Maya's engine protocol on stdin / stdout
+//   maya-ds4 --pack ... --stage-begin K --stage-end E ...             only layers [K, E): the embedding into K, the head
+//                                                                     after E - 1 (a split's memory plan, by itself)
+//   maya-ds4 --pack ... --stage-worker PORT --stage-begin K           a remote stage's worker: layers K to the last for
+//                                                                     the main process below, on PORT (no head)
+//   maya-ds4 --pack ... --remote-stage HOST:PORT --stage-end K ...    layers 0 to K - 1 and the head here, the rest on
+//                                                                     the worker (docs/REMOTE_STAGE.md; any mode above)
+//   maya-ds4 --pack ... --remote-experts [BIND:]PORT ...              (a proof of concept, ds4_rx.hpp) some of the CPU
+//                                                                     lane's experts on an expert server's GPU
+//   maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]
+//            [--expert-server-cpu]                                     (tests: the CPU lane's arithmetic, no GPU)
+//            [--expert-server-parts DIR]                               (H': slice picks from U3's parts pack)
+//                                                                     that server: no pack, it dials the main process
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
@@ -14,7 +26,11 @@
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
 // STRATA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in STRATA_DS4_SLOT_DIR - so a request that does not continue the state but
-// does continue a kept conversation reads only its new tokens.
+// does continue a kept conversation reads only its new tokens.  With --remote-stage the same switch keeps the checkpoints
+// and the slots across the link: the worker takes its layers' part of each under the main process's id (CkptSave /
+// CkptRestore, ds4_stage.hpp), a slot or checkpoint is used only where both sides hold it, and one the worker does not
+// hold (restarted, dropped for its own bounds STRATA_DS4_SLOT_CAP / _GB / _DIR, set at the worker too) is read from token 0;
+// the main process's folder is then <STRATA_DS4_SLOT_DIR or <pack>/slots>/split-K and holds nothing across runs.
 // `pin=N` on a GEN marks the first N prompt tokens as a start other requests share (a system prompt and its tools): the
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
@@ -25,11 +41,15 @@
 #include <libproc.h>   // proc_pid_rusage: the bytes this process had the storage read (io_read_bytes)
 #endif
 #include "ds4_launch.h"   // ds4_dbg
+#include "ds4_force.hpp"
 #include "ds4_model.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
+#include "ds4_partstore.hpp"
+#include "ds4_rx.hpp"
 #include "ds4_slotmeta.hpp"
+#include "ds4_stage.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -43,6 +63,7 @@
 #include <memory>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <cstdlib>
 #include <cstring>
@@ -103,10 +124,14 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--stage-begin K] [--stage-end E]\n"
+                 "           [--remote-stage HOST:PORT --stage-end K] [--remote-experts [BIND:]PORT]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
+                 "           | --stage-worker PORT [--stage-bind ADDR] --stage-begin K\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
-                 "           | --pack-info)\n");
+                 "           | --pack-info)\n"
+                 "maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]\n"
+                 "           [--expert-server-cpu (tests: no GPU)] [--expert-server-parts DIR]\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes
@@ -385,6 +410,314 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
+// ---- the remote stage (docs/REMOTE_STAGE.md, ds4_stage.hpp): this PC runs layers 0 to K - 1 and the head, a worker
+// PC the rest - each window's rows, and each prompt chunk's, go there after layer K - 1 and come back before the head
+// This side's hello: the trunk, the layers where the link cuts it, the windows, the prompt chunks (the most rows this
+// side sends, or takes: its chunked path's chunk; 0 windows only), the compact bf16 rows (kRowsBf16Cap and their
+// narrower hand-off row; STRATA_REMOTE_ROWS=fp32: fp32 rows), no K/V type to compare (the hand-off carries no attention
+// K/V), the reply's layout (kRowsNormed), the checkpoints the main process has the worker keep (slots: ckpt,
+// STRATA_DS4_SLOT_KEEP=1), the pack's fingerprint
+strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker, bool ckpt = false) {
+    const strata::ds4::Model::StageGeo sg = m.stage_geo();
+    strata::net::StageHello me;
+    me.n_embd = sg.dim;
+    me.hc = sg.hc;
+    me.n_layers = sg.n_layers;
+    me.n_expert = sg.n_expert;
+    me.layer_begin = worker ? sg.layer_begin : sg.layer_end;
+    me.max_t = sg.max_t;
+    me.kv_type = -1;
+    // (the link's format is fp32 either way; the compact rows are the engine's own and say so in a capability bit)
+    me.row_formats = strata::ds4::stage::hello_rows(sg.rows_bf16);
+    me.max_context = m.max_context();
+    me.chunk = sg.chunk;
+    me.handoff_floats = sg.handoff_floats;
+    me.ckpt_max = !worker && ckpt ? strata::ds4::stage::kMainSlotsMax + 1 : 0;
+    me.pack_hash = strata::ds4::stage::pack_hash(pack);
+    std::snprintf(me.build, sizeof me.build, "strata-dsv41 remote-stage %s", worker ? "worker" : "main");
+    return me;
+}
+
+// STRATA_REMOTE_TIMING=1 (read as the Qwen engine reads it): the per-stage timing lines of docs/REMOTE_STAGE.md - the
+// link's own ("strata remote: 64 windows: mean ... = worker ... + link ...", from stage_link.cpp), the main process's
+// time between windows and the worker's own layers' time, every 64 windows, in the same words the tuner reads
+bool remote_timing() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_REMOTE_TIMING");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+// STRATA_STAGE_TOKEN (the expert server's shared secret, ds4_rx.hpp); false: too long
+bool stage_token(std::string& tok) {
+    const char* v = std::getenv("STRATA_STAGE_TOKEN");
+    tok = v != nullptr ? v : "";
+    if (tok.size() < sizeof(strata::ds4::rx::HelloMsg::token)) return true;
+    std::fprintf(stderr, "maya-ds4: STRATA_STAGE_TOKEN is longer than %zu characters\n",
+                 sizeof(strata::ds4::rx::HelloMsg::token) - 1);
+    return false;
+}
+
+// A remote stage's link is TLS 1.3 with both ends' certificates, as the Qwen engine's (stage_tls.hpp): this PC's key
+// folder, STRATA_STAGE_TLS (strata --stage-keygen writes it).  Null: said on stderr, no stage
+std::shared_ptr<strata::net::TlsCredentials> stage_cred() {
+    std::string err;
+    std::shared_ptr<strata::net::TlsCredentials> c = strata::net::TlsCredentials::load(strata::net::stage_tls_dir(), err);
+    if (c == nullptr) std::fprintf(stderr, "maya-ds4: remote stage: %s\n", err.c_str());
+    return c;
+}
+
+// The main process's end: one link, made at the start and again when a reset finds it lost (the worker or its PC
+// started again, the network went away while idle), with the same hello.  A worker that does not listen yet, a
+// network that does not reach it or a name that does not resolve yet is tried every 2 s until STRATA_REMOTE_CONNECT_S
+// (180 s; 0: one try) have passed; a refusal (certificate, model, layers, context, chunks) does not change by waiting.  While
+// a request waits (serve), `INFO remote_stage_wait=S` every 10 s tells the server the engine is not frozen, and a STOP
+// ends the wait.  Every new connection starts with a Reset: the worker's session from position 0.  Prompt chunks
+// (me.chunk > 0) go through `chunks`, one send in flight on its own thread.
+struct RemoteMain {
+    std::string at;
+    strata::net::StageClient link;
+    strata::net::StageHello me, peer;
+    const std::atomic<bool>* stop = nullptr;   // (serve: its STOP flag - a request's wait ends on it)
+    const strata::ds4::Model* model = nullptr;   // (the timing lines: the compact rows' conversions)
+    // (remote_timing) this process's share of a window: from one window's rows coming back to the next one's send
+    double last_end = 0, gap_ms = 0;
+    strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
+    int64_t gaps = 0;
+    std::unique_ptr<strata::ds4::stage::ChunkLink> chunks;
+    // the prompt chunks' rows over this link (stage::chunk_sent: me.chunk, or the worker's when smaller), told to the
+    // model at each link made (chunk_to: Model::set_stage_chunk)
+    int64_t sent_chunk = 0;
+    std::function<void(int64_t)> chunk_to;
+    // (slots: STRATA_DS4_SLOT_KEEP=1) the slot ids this side holds, which the worker keeps its parts of and no others;
+    // serve keeps it current.  epoch: the links made so far - a worker connected to again (restarted, or taken over
+    // by another main process) holds none of them
+    std::vector<int64_t> keep;
+    uint64_t epoch = 0;
+
+    // a chunk's send still on its way finishes (or fails) before the link is used again or closed; what it failed of
+    // was that run's (its model run is gone)
+    void chunks_done() {
+        std::string ignored;
+        if (chunks) (void) chunks->wait(ignored);
+    }
+    bool connect(std::string& e) {
+        chunks_done();
+        static const int wait_s = [] {
+            const char* v = std::getenv("STRATA_REMOTE_CONNECT_S");
+            return v != nullptr && *v != '\0' ? std::max(0, std::atoi(v)) : 180;
+        }();
+        const double t0 = now_ms();
+        auto spent = [&] { return (now_ms() - t0) / 1000.0; };
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        std::thread beat;
+        if (stop != nullptr)   // (in a request: the heartbeat)
+            beat = std::thread([&] {
+                std::unique_lock<std::mutex> lk(mu);
+                while (!cv.wait_for(lk, std::chrono::seconds(10), [&] { return done; })) {
+                    std::printf("INFO remote_stage_wait=%lld\n", (long long) spent());
+                    std::fflush(stdout);
+                }
+            });
+        bool said = false, ok = false;
+        for (;;) {
+            link.close();
+            const int left = wait_s > 0 ? std::min(strata::net::io_timeout_s(), std::max(1, (int) std::ceil(wait_s - spent()))) : 0;
+            if (link.connect(at, me, peer, e, left, stop)) {
+                ++epoch;   // (the worker holds no part of anything from before, whether or not this reset comes through)
+                if (!strata::ds4::stage::main_accepts(peer, me, e)) {   // (a refusal: no waiting mends it, and no
+                    link.close();                                        // link a later reset could take as up)
+                    break;
+                }
+                sent_chunk = strata::ds4::stage::chunk_sent(me.chunk, peer.chunk);
+                if (me.chunk > 0) {
+                    if (sent_chunk < me.chunk)
+                        std::fprintf(stderr, "maya ds4: remote stage: prompt chunks of %lld rows: the worker takes %lld "
+                                             "at most (this process's own: %lld)\n", (long long) sent_chunk,
+                                     (long long) peer.chunk, (long long) me.chunk);
+                    if (chunk_to) chunk_to(sent_chunk);
+                }
+                ok = link.reset({}, e);
+                break;
+            }
+            const bool cancelled = strata::net::stage_wait_cancelled(e) || (stop != nullptr && stop->load());
+            if (cancelled || !strata::net::stage_link_lost(e) || spent() + 2 > (double) wait_s) break;
+            if (!said) {
+                std::fprintf(stderr, "maya ds4: remote stage: waiting for the worker at %s (%s), up to %d s "
+                                     "(STRATA_REMOTE_CONNECT_S)\n", at.c_str(), e.c_str(), wait_s);
+                said = true;
+            }
+            for (int i = 0; i < 8 && !(stop != nullptr && stop->load()); ++i)   // 2 s, or until a STOP
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        if (beat.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                done = true;
+            }
+            cv.notify_all();
+            beat.join();
+        }
+        return ok;
+    }
+    // the worker's session from position 0 (Model::reset): connecting again when the link is lost
+    bool reset(std::string& e) {
+        chunks_done();
+        if (link.connected() && link.reset(keep, e)) return true;
+        if (link.connected() && !strata::net::stage_link_lost(e)) return false;   // (the worker's own error)
+        const std::string lost = e.empty() ? "remote stage: the link is down" : e;
+        if (!connect(e)) {
+            e = lost + "; connecting again: " + e;
+            return false;
+        }
+        std::fprintf(stderr, "maya ds4: remote stage: the link to %s was lost (%s): connected again\n", at.c_str(),
+                     lost.c_str());
+        return true;
+    }
+    // the worker's checkpoint of a role, the pin, a slot's part (CkptSave: ids as ds4_stage.hpp has them) at position L;
+    // `stored` false: it did not keep it.  A slot's id is in keep[] by now, as the main process holds it
+    bool ck_save(int64_t id, int64_t L, bool& stored, std::string& e) {
+        std::vector<int64_t> k = keep;
+        if (id >= strata::ds4::stage::kSlotId0 && std::find(k.begin(), k.end(), id) == k.end()) k.push_back(id);
+        return link.ckpt_save(id, L, k, stored, e);
+    }
+    // the worker back at a checkpoint (CkptRestore) or with a slot's part; `missing`: it does not hold it, nothing changed
+    bool ck_restore(int64_t id, int64_t L, bool& missing, std::string& e) {
+        return link.ckpt_restore(id, L, keep, missing, e);
+    }
+    // a window: its rows there and back (the model commits it: Model::set_stage_link)
+    bool run(int T, const int32_t* tokens, int64_t p0, const float* out, float* in, std::string& e) {
+        const bool timing = remote_timing();
+        if (timing && last_end != 0) {
+            const double d = now_ms() - last_end;
+            if (d < 1000.0) gap_ms += d;   // (the same request: a gap of a second is the next prompt)
+            if (d < 1000.0 && ++gaps % 64 == 0) {
+                std::fprintf(stderr, "strata remote: main process between windows %.2f ms each (64 windows: head, "
+                                     "layers 0-K)\n", gap_ms / 64);
+                if (model != nullptr && model->stage_geo().rows_bf16) {
+                    // (each mean over the windows it converted since the last line: a window's pack and its reply's
+                    // unpack are not the same count at a line, and a prompt's first window has no gap)
+                    const strata::ds4::Model::StageConv c = model->stage_conv();
+                    const int64_t no = std::max<int64_t>(1, c.out_n - conv0.out_n), ni = std::max<int64_t>(1, c.in_n - conv0.in_n);
+                    std::fprintf(stderr, "strata remote: rows bf16: %lld bytes a row each way; pack %.3f ms (%lld windows) + "
+                                         "unpack %.3f ms (%lld windows) a window (part of the time between windows)\n",
+                                 (long long) (me.handoff_floats * 4), (c.out_ms - conv0.out_ms) / (double) no, (long long) no,
+                                 (c.in_ms - conv0.in_ms) / (double) ni, (long long) ni);
+                    conv0 = c;
+                }
+                gap_ms = 0;
+            }
+        }
+        const size_t n = (size_t) T * (size_t) me.handoff_floats;
+        const bool ok = link.run(T, tokens, p0, out, n, in, n, e);
+        last_end = timing ? now_ms() : 0;
+        return ok;
+    }
+    // the last window's first n_keep rows kept there (all of a window kept whole; a draft's check: what it accepted)
+    bool commit(int n_keep, std::string& e) { return link.commit(n_keep, e); }
+};
+RemoteMain* g_remote = nullptr;
+
+// The worker's end (--stage-worker PORT): serves one main process at a time on the port instead of stdin.  A
+// conversation starts with a Reset; its windows and prompt chunks arrive in order and run here one at a time, each at
+// the position this worker is at (a chunk on the chunked prompt path, while the link reads the next one into the
+// other of its two buffers).  Each window's Commit keeps all its rows or (a draft's check) the first n_keep - the rest
+// undone from the backups a window of 2 or more rows keeps (ds4_stage.hpp's commit_kind); a chunk is kept whole, with
+// no Commit and no backups.  Returns when listening fails.
+int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::string& bind, int port) {
+    const std::shared_ptr<strata::net::TlsCredentials> cred = stage_cred();
+    if (cred == nullptr) return 1;
+    const strata::net::StageHello me = stage_hello(m, pack, true);
+    const strata::ds4::Model::StageGeo sg = m.stage_geo();
+    int last_t = 0;   // (the last window's rows, until its Commit)
+    // the worker's parts of the main process's slots (ds4_stage.hpp, ds4_partstore.hpp), bounded as the main process
+    // bounds its own: STRATA_DS4_SLOT_CAP (4) parts in RAM, the rest in STRATA_DS4_SLOT_DIR (default <pack>/slots-stage),
+    // STRATA_DS4_SLOT_GB (16) of them at most.  CAP and GB both 0: this worker keeps no slots (the main process then
+    // reads a conversation that left the model from its first token)
+    const auto env_number = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
+    strata::ds4::stage::PartStore parts(
+        std::getenv("STRATA_DS4_SLOT_DIR") != nullptr ? std::string(std::getenv("STRATA_DS4_SLOT_DIR")) : pack + "/slots-stage",
+        (size_t) std::max(0.0, env_number("STRATA_DS4_SLOT_CAP", 4)),
+        (uint64_t) (std::max(0.0, env_number("STRATA_DS4_SLOT_GB", 16)) * 1073741824.0));
+    strata::net::StageHandlers hs;
+    hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
+        mine = me;
+        if (theirs.protocol != strata::net::kStageProtocol) return true;   // (the link refuses it for its number)
+        return strata::ds4::stage::worker_accepts(theirs, me, m.max_context(), e);
+    };
+    // (remote_timing) every 64 windows: this worker's own time for a window - its rows unpacked, its layers, its rows
+    // packed - and the conversions' share of it
+    double own_ms = 0;
+    strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
+    int64_t windows = 0;
+    // (--remote-experts) the expert server's share of this worker's CPU lane, printed when a main process leaves: its
+    // windows since it came ("a token" in those lines is a window here)
+    strata::ds4::Stats rx0 = m.stats();
+    int64_t rx_windows = 0;
+    hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
+        const double t0 = now_ms();
+        if (!strata::ds4::stage::worker_run(m, tokens, T, p0, last_t, e)) return false;
+        ++rx_windows;
+        if (remote_timing()) {
+            own_ms += now_ms() - t0;
+            if (++windows % 64 == 0) {
+                const strata::ds4::Model::StageConv c = m.stage_conv();
+                const int64_t no = std::max<int64_t>(1, c.out_n - conv0.out_n), ni = std::max<int64_t>(1, c.in_n - conv0.in_n);
+                std::fprintf(stderr, "strata stage worker: windows: own layers %.2f ms each (64 windows; rows in %.2f, "
+                                     "rows out %.2f)\n", own_ms / 64, (c.in_ms - conv0.in_ms) / (double) ni,
+                             (c.out_ms - conv0.out_ms) / (double) no);
+                own_ms = 0;
+                conv0 = c;
+            }
+        }
+        return true;
+    };
+    hs.commit = [&](int n_keep, std::string& e) { return strata::ds4::stage::worker_commit(m, n_keep, last_t, e); };
+    hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, int64_t skip, const float* in,
+                     float* out, std::string& e) {
+        return strata::ds4::stage::worker_prefill(m, tokens, (int) T, p0, (flags & strata::ds4::stage::kChunkLast) != 0,
+                                                  (int) skip, in, out, last_t, e);
+    };
+    hs.reset = [&](const std::vector<int64_t>& keep, std::string&) {
+        strata::ds4::stage::worker_reset(m, parts, keep);
+        m.save_profile();
+        last_t = 0;
+        return true;
+    };
+    hs.disconnected = [&] {
+        if (rx_windows > 0) {
+            const std::string rl = m.rx_lines(rx0, (double) rx_windows);
+            if (!rl.empty()) std::fprintf(stderr, "strata stage worker: %lld windows; a window each below:\n%s",
+                                          (long long) rx_windows, rl.c_str());
+        }
+        rx0 = m.stats();
+        rx_windows = 0;
+        strata::ds4::stage::worker_disconnected(m, parts);   // (a new main process is a new id space)
+        m.save_profile();
+        last_t = 0;
+    };
+    // the main process's checkpoints and slots (CkptSave / CkptRestore, ids as ds4_stage.hpp has them).  serve_stage has
+    // checked the position of a save and tracks it across a restore; a restore forgets the last window (last_t)
+    strata::ds4::stage::worker_ckpt_handlers(m, parts, last_t, hs, [](const std::string& note) {
+        std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
+    });
+    float* const pf[4] = {m.stage_chunk_rows(0), m.stage_chunk_rows(1), m.stage_chunk_rows(2), m.stage_chunk_rows(3)};
+    strata::net::StageBuffers bufs = strata::ds4::stage::worker_buffers(m.stage_rows_in(), m.stage_rows_out(), sg.max_t,
+                                                                       pf, sg.chunk, sg.handoff_floats);
+    // (the link's framing is fp32: the engine packs its rows itself - the hello's log line says which)
+    bufs.engine_rows = sg.rows_bf16 ? "engine-packed bf16" : "engine rows fp32";
+    strata::net::StageStats wst;
+    std::fprintf(stderr, "maya ds4: remote stage worker: layers %d-%d, no head, windows of %d, prompt chunks of %d at most%s, "
+                 "rows %s, port %d\n", sg.layer_begin, sg.layer_end - 1, sg.max_t, sg.chunk,
+                 sg.chunk > 0 ? "" : " (none: windows only)",
+                 sg.rows_bf16 ? "bf16 (the streams; the picks exact)" : "fp32 (STRATA_REMOTE_ROWS=fp32)", port);
+    std::fflush(stderr);
+    return strata::net::serve_stage(bind, port, cred, hs, bufs, wst, nullptr);
+}
+
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
@@ -393,6 +726,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
     Lines in;
     in.start();
+    if (g_remote != nullptr) g_remote->stop = &in.stop;   // (a request's wait for the worker ends on a STOP)
     std::string line;
     unsigned long long counter = 0;
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
@@ -418,6 +752,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
+    if (slot_max > 0 && m.ranged() && !m.stage_ckpt_on()) {   // (a slot holds every layer's state; the folder's are left as they are)
+        std::fprintf(stderr, "ds4 slots: off - this process holds only some of the layers (STRATA_DS4_SLOT_KEEP ignored)\n");
+        slot_max = 0;
+    }
+    // a remote stage's main process (Options::stage_ckpt): a slot is this process's layers' part and the worker's, kept
+    // there under an id of its own (ds4_stage.hpp; the worker's parts end with its link, so a slot is used only where
+    // both sides hold it, and the folder is this mode's own, emptied at the start and at the end)
+    const bool rslots = slot_max > 0 && g_remote != nullptr && m.stage_ckpt_on();
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
@@ -429,9 +771,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
+        int64_t id = 0;                               // a remote stage: the worker's part of it (0: none)
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
+    int64_t remote_slot_seq = strata::ds4::stage::kSlotId0 - 1;
+    uint64_t slots_epoch = rslots ? g_remote->epoch : 0;
     const std::string slot_identity = m.slot_identity();
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
@@ -459,6 +804,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (ec) return 1e9;
         return std::chrono::duration<double>(fs::file_time_type::clock::now() - t).count() / 86400.0;
     };
+    // (a remote stage) the ids the worker keeps its parts of: the slots held
+    const auto sync_keep = [&]() {
+        if (!rslots) return;
+        g_remote->keep.clear();
+        for (const Slot& s : slots)
+            if (s.id != 0) g_remote->keep.push_back(s.id);
+    };
     const auto slot_drop = [&](size_t i) {
         if (slots[i].data)   // a RAM slot: its buffer simply dies
             slots[i].data.reset();
@@ -468,6 +820,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::filesystem::remove(meta_of(slots[i].path), ec);
         }
         slots.erase(slots.begin() + (long) i);
+        sync_keep();
+    };
+    // (a remote stage) a worker connected to again - restarted, or taken over by another main process - holds none of
+    // the parts: the slots go (their prompts are read from token 0, as without them)
+    const auto slots_stale = [&]() {
+        if (!rslots || g_remote->epoch == slots_epoch) return;
+        slots_epoch = g_remote->epoch;
+        if (slots.empty()) return;
+        const size_t n = slots.size();
+        while (!slots.empty()) slot_drop(slots.size() - 1);
+        note("the worker was connected again and holds no part of the " + std::to_string(n) +
+             " kept conversation(s): they are removed");
     };
     const auto slot_count = [&](int& ram, int& disk) {
         ram = disk = 0;
@@ -549,10 +913,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (slot_max <= 0) return;
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
+        slots_stale();
         const auto t0 = std::chrono::steady_clock::now();
         auto buf = std::make_shared<std::vector<uint8_t>>();
         std::string e;
-        const uint64_t bytes = m.slot_save(*buf, e);   // (a state unchanged since it was taken refuses here: nothing
+        const int64_t rid = rslots ? ++remote_slot_seq : 0;
+        const uint64_t bytes = m.slot_save(*buf, e, rid);   // (a state unchanged since it was taken refuses here: nothing
         if (bytes == 0) {                             // changes, its slot stays)
             if (e != "it is already set aside")
                 std::fprintf(stderr, "ds4 slots: setting the conversation aside failed (%s) - it is read from token 0 "
@@ -562,8 +928,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), rid});
         slots.back().data = buf;
+        if (rslots) {   // the worker's parts are the link's to carry: only so many slots in all, the least recently used goes
+            while (slots.size() > (size_t) strata::ds4::stage::kMainSlotsMax) {
+                size_t lru = 0;
+                for (size_t i = 1; i < slots.size(); ++i)
+                    if (slots[i].used < slots[lru].used) lru = i;
+                slot_drop(lru);
+            }
+            sync_keep();
+        }
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
             slot_count(ram, disk);
@@ -591,6 +966,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto slot_take = [&](const std::vector<int>& prompt, size_t floor, bool& whole) -> size_t {
         whole = false;
         if (slot_max <= 0 || prompt.size() < 2) return 0;
+        slots_stale();
         std::vector<strata::ds4::slotmeta::Cand> cands;
         for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks});
         size_t len = 0;
@@ -601,7 +977,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const bool ram = slots[best].data != nullptr;
         std::string e;
         bool back = false;
-        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) whole_len, e);
+        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) whole_len, e, slots[best].id);
         else {
             std::ifstream f(slots[best].path, std::ios::binary);
             std::vector<uint8_t> file;
@@ -612,7 +988,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (n > 0) {
                     file.resize((size_t) n);
                     if (f.read((char*) file.data(), n))
-                        back = m.slot_load(file.data(), file.size(), (int64_t) whole_len, e);
+                        back = m.slot_load(file.data(), file.size(), (int64_t) whole_len, e, slots[best].id);
                     else e = "reading " + slots[best].path + " failed";
                 } else e = slots[best].path + " is empty";
             } else e = "cannot read " + slots[best].path;
@@ -647,12 +1023,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     if (slot_max > 0) {
         slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
                                                       : std::filesystem::path(pack) / "slots";
+        if (rslots)   // (this mode's own folder: its .meta files carry the layers' range, no single process's slot is one)
+            slot_dir /= "split-" + std::to_string(m.stage_geo().layer_end);
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
         if (!std::filesystem::is_directory(slot_dir, ec)) {
             std::fprintf(stderr, "ds4 slots: %s is not writable - conversations are not set aside\n",
                          slot_dir.string().c_str());
             slot_max = 0;
+        } else if (rslots) {   // (the worker's parts ended with the link they were made on: nothing here can be taken back)
+            size_t gone = 0;
+            for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec))
+                if (de.path().filename().string().rfind("slot-", 0) == 0 && std::filesystem::remove(de.path(), ec)) ++gone;
+            if (gone > 0) note("folder " + slot_dir.string() + ": " + std::to_string(gone) + " file(s) of an earlier run removed");
         } else {
             struct Found {
                 std::string bin;
@@ -770,6 +1153,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!reuse) {   // (STRATA_DS4_REUSE=0, for A/Bs and tests: every request is a fresh read of its whole prompt)
             m.reset();
             held.clear();
+        }
+        if (g_remote != nullptr) {   // (a remote stage whose link went down while idle: its worker holds nothing of the
+            std::string e;           // conversation - read it again from token 0, connecting again at the reset)
+            if (!g_remote->link.alive(e)) {
+                std::fprintf(stderr, "maya ds4: remote stage: %s\n", e.empty() ? "the link is down" : e.c_str());
+                m.reset();
+                held.clear();
+            }
+            slots_stale();
         }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
@@ -916,11 +1308,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
+            if (g_remote != nullptr) {   // (a remote stage: the worker again within the request - its wait's heartbeat
+                m.reset();               // and its STOP are this request's)
+                held.clear();
+            }
             std::printf("ERR %s\n", err.c_str());
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
-            m.reset();
-            held.clear();
+            if (g_remote == nullptr) {
+                m.reset();
+                held.clear();
+            }
             continue;
         }
         held = std::move(pics);
@@ -993,6 +1391,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                            off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
+                    if (g_remote != nullptr) {   // (a remote stage: the worker's state is unknown - the next request
+                        m.reset();               // reads from token 0)
+                        held.clear();
+                    }
                     break;
                 }
                 d_off += off;
@@ -1020,11 +1422,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        std::fprintf(stderr, "%s", m.defer_lines(s_dec).c_str());   // (DS4_EP_DEFER_STAT, the split: this answer's)
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
-    if (slot_max > 0) {
+    if (rslots) {   // (the worker's parts end with its link: nothing here would be taken back by the next run)
+        while (!slots.empty()) slot_drop(slots.size() - 1);
+    } else if (slot_max > 0) {
         if (held.empty()) slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
@@ -1052,6 +1457,52 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     return 0;
 }
 
+// DS4_EP_DEFER_VERIFY's line since s0 (nothing when no check was counted): the decode's stats and a score's end
+static void print_ep_verify(const strata::ds4::Stats& s, const strata::ds4::Stats& s0) {
+    if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
+        // |d| / S, S the magnitude of every term the two sides summed since they forked (ds4_kernels.cuh hc_mag): each
+        // side's value has at most 18 (deferred: the combine's add, the FFN hc_post's 5, add_diff's 2, the attention
+        // hc_post's 5, the late add's 4 + 1) or 13 (exact: the combine's 2, 5, the split's in-place add 1, 5) roundings
+        // on any path, so |fl(x) - x| <= gamma_n * S each (Higham, Accuracy and Stability, 3.1) and |d| <= (gamma_18 +
+        // gamma_13) S = 1.9e-6 S (u = 2^-24) however much the terms cancel.  The bound, 1e-5, leaves 5x for S's own
+        // rounding and the count; a layer above it is a wiring bug or a non-finite value (inf) - and under VERIFY=2 (the
+        // wrong comb) the check must see layers above it.  (|d| / (1 + |exact|), the line's before, is no bound: a
+        // residual stream of 1e3-1e4 that a layer's output cancels to ~1 puts it at 1e-4 - printed for reference)
+        const float bound = 1e-5f;
+        int last = -1, worst = -1, above = 0, seen = 0, wr = -1;
+        for (int i = 0; i < 64; ++i) {
+            if (s.ep_verify[i] != 0.0f && (wr < 0 || s.ep_verify[i] > s.ep_verify[wr])) wr = i;
+            if (s.ep_verify_s[i] != 0.0f) {
+                last = i;
+                ++seen;
+                if (worst < 0 || s.ep_verify_s[i] > s.ep_verify_s[worst]) worst = i;
+                if (!(s.ep_verify_s[i] <= bound)) ++above;
+            }
+        }
+        // (VERIFY=2: every layer's add but the head's takes the wrong comb, so all of them but the last must be above)
+        const char* verdict = s.ep_verify_wrong ? (above > 0 && above + 1 >= seen ? "the wrong comb seen: the check works"
+                                                   : above > 0 ? "the wrong comb seen in some layers only: partly blind, "
+                                                                 "unless the others had no CPU-lane part in the run"
+                                                               : "the wrong comb NOT seen: the check is blind")
+                              : above  ? "MISMATCH (wiring, or inf)"
+                              : seen   ? "ok"
+                                       : "ok (no layer differed at all: exact, or not checked)";
+        std::string ln;
+        for (int i = 0; i <= last; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, " %d:%.1e", i, s.ep_verify_s[i]);
+            ln += b;
+        }
+        std::fprintf(stderr, "ep defer verify: %lld checks of the deferred streams against the exact ones (the same "
+                             "attention: float order only); the largest |d| / S, S the magnitude of the terms both sides "
+                             "summed (float order: <= 1.9e-6), by the layer whose part it was (the last: before the head; "
+                             "since the load):%s; worst %.2e at layer %d (|d| / (1 + |exact|): worst %.2e at layer %d); "
+                             "bound %.0e: %d of the %d layers that differed above it - %s%s\n",
+                     (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify_s[worst] : 0.0f,
+                     worst, wr >= 0 ? s.ep_verify[wr] : 0.0f, wr, (double) bound, above, seen,
+                     s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
+    }
+}
 
 // ---- Strata addition: teacher-forced scoring (the quality gate) -------------------------------------------------
 // --score IDS.json --score-out RUN.tsv: every segment of a tools/quant_quality.py ids file (name + ids) is read through
@@ -1107,7 +1558,17 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     // DS4_SCORE_PREFIX=N (a test of the long-prompt layer skip): the segments are joined into one stream, its first N
     // tokens are read as one prompt (logits of the last row only: the path a long prompt takes, where the skip applies)
     // and only the positions after them are scored, in windows
+    // DS4_SCORE_STEP=1 (unset or 0: as above): every scored position goes through Model::step - the decode's own path,
+    // forward(.., ep true): the expert server's split of the layer, the n_ff slices, and DS4_EP_DEFER's deferral at one
+    // row - and Model::logits (one row), the window forced to 1; Model::feed, which the windows above go through, runs
+    // the prompt paths (ep false), so a score never exercised those.  DS4_SCORE_PREFIX's prefix stays a feed.  The rows
+    // and the .seg.json have the same format; one position a step is slow, a window of 16 is not.
     const long long prefix_n = std::getenv("DS4_SCORE_PREFIX") ? std::atoll(std::getenv("DS4_SCORE_PREFIX")) : 0;
+    const char* step_env = std::getenv("DS4_SCORE_STEP");
+    const bool step_mode = step_env != nullptr && std::atoi(step_env) != 0;
+    if (step_mode)
+        std::fprintf(stderr, "strata-dsv41: DS4_SCORE_STEP=1: every position through Model::step (the decode path), window 1%s\n",
+                     prefix_n > 0 ? ", the DS4_SCORE_PREFIX prefix as a feed" : "");
     if (prefix_n > 0 && segs.size() > 1) {
         ScoreSeg all;
         all.name = "concat";
@@ -1126,6 +1587,7 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::vector<float> lg;
     std::vector<int> order;
     const double t0 = now_ms();
+    const strata::ds4::Stats s0 = m.stats();   // (the heavy-first deferral's lines at the end: DS4_EP_DEFER_STAT's)
     for (size_t si = 0; si < segs.size(); ++si) {
         const std::vector<int>& ids = segs[si].ids;
         m.reset();
@@ -1141,8 +1603,9 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
             }
         }
         for (size_t a = a0; a + 1 < ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
-            if (!m.feed(ids.data() + a, T, T, err) || !m.logits(lg) || lg.size() < (size_t) T * (size_t) V) {
+            const int T = step_mode ? 1 : (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
+            if (!(step_mode ? m.step(ids[a], true, err) : m.feed(ids.data() + a, T, T, err)) || !m.logits(lg) ||
+                lg.size() < (size_t) T * (size_t) V) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.empty() ? "no logits" : err.c_str());
                 return 1;
             }
@@ -1186,6 +1649,10 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::fprintf(sj, "]}\n");
     std::fclose(sj);
     std::fclose(out);
+    // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK, DS4_EP_DEFER_VERIFY's: a score prints no decode stats
+    // but these - so the window's short score arms are the wiring checks)
+    std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());
+    print_ep_verify(m.stats(), s0);
     return 0;
 }
 // ---- Strata H100 addition: profile run -------------------------------------------------------------------------
@@ -1206,6 +1673,7 @@ int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) 
         m.reset();
         for (size_t a = 0; a < ids.size();) {
             const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+            // (no logits: with --remote-experts its windows never settle the cache - offline, run without a server)
             if (!m.feed(ids.data() + a, T, 0, err)) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
                 return 1;
@@ -1303,6 +1771,15 @@ int main(int argc, char** argv) {
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
+    std::string remote_at, stage_bind;   // (a remote stage: the worker's HOST:PORT; a worker's address to listen on)
+    int worker_port = 0;
+    bool worker_mode = false;
+    std::string rx_at;          // (--expert-server-connect: the main process's HOST:PORT)
+    int64_t rx_reserve = 512;   // (its VRAM left free, MiB: the arena slot's 512 held 1106 blobs on the 3080)
+    const char* rx_flag = nullptr;   // (an expert server's flag given: it needs --expert-server-connect)
+    bool rx_once = false;
+    bool rx_cpu = false;        // (--expert-server-cpu, tests: the CPU lane's arithmetic, no GPU)
+    std::string rx_parts;       // (--expert-server-parts: the parts pack of H' slice picks, their n_ff blocks [k, nb))
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1376,7 +1853,29 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
-        else if (a == "--help" || a == "-h") {
+        else if (a == "--stage-begin") o.stage_begin = std::atoi(val("--stage-begin").c_str());
+        else if (a == "--stage-end") o.stage_end = std::atoi(val("--stage-end").c_str());
+        else if (a == "--remote-stage") remote_at = val("--remote-stage");
+        else if (a == "--stage-worker") {
+            worker_mode = true;
+            worker_port = std::atoi(val("--stage-worker").c_str());
+        }
+        else if (a == "--stage-bind") stage_bind = val("--stage-bind");
+        else if (a == "--remote-experts") o.remote_experts = val("--remote-experts");
+        else if (a == "--expert-server-connect") rx_at = val("--expert-server-connect");
+        else if (a == "--expert-server-reserve-mib") {
+            rx_reserve = std::atoll(val("--expert-server-reserve-mib").c_str());
+            rx_flag = "--expert-server-reserve-mib";
+        } else if (a == "--expert-server-once") {
+            rx_once = true;
+            rx_flag = "--expert-server-once";
+        } else if (a == "--expert-server-cpu") {
+            rx_cpu = true;
+            rx_flag = "--expert-server-cpu";
+        } else if (a == "--expert-server-parts") {
+            rx_parts = val("--expert-server-parts");
+            rx_flag = "--expert-server-parts";
+        } else if (a == "--help" || a == "-h") {
             usage();
             return 0;
         } else {
@@ -1385,6 +1884,17 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (rx_flag != nullptr && rx_at.empty()) {   // (not silently a main process: a server's flag, its address left out)
+        std::fprintf(stderr, "%s is an expert server's flag: it needs --expert-server-connect HOST:PORT\n", rx_flag);
+        usage();
+        return 2;
+    }
+    if (!rx_at.empty()) {   // the expert server (ds4_rx.hpp): no pack, the main process sends what it computes
+        std::string token;
+        if (!stage_token(token)) return 1;
+        if (rx_cpu) return strata::ds4::rx::serve_cpu(rx_at, token, rx_once, rx_parts);
+        return strata::ds4::rx::serve(rx_at, token, rx_reserve, o.gpus.empty() ? 0 : o.gpus[0], rx_once, rx_parts);
+    }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
         if (o.pack.empty()) {
             usage();
@@ -1392,13 +1902,56 @@ int main(int argc, char** argv) {
         }
         return strata::ds4::pack_info(o.pack, stdout);
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
+    // a remote stage (ds4_stage.hpp): the worker (--stage-worker PORT --stage-begin K) serves its main process instead
+    // of a mode of its own; the main process (--remote-stage HOST:PORT --stage-end K) runs any mode
+    {
+        std::string why;
+        if (worker_mode && !remote_at.empty()) why = "--stage-worker or --remote-stage, not both";
+        else if (worker_mode && (worker_port < 1 || worker_port > 65535)) why = "--stage-worker PORT: 1 to 65535";
+        else if (worker_mode && (o.stage_begin < 1 || o.stage_end >= 0))
+            why = "--stage-worker needs --stage-begin K (1 or more) and runs to the last layer (no --stage-end: no relay)";
+        else if (worker_mode && (!ids_s.empty() || !score_ids.empty() || !prof_ids.empty() || !spec_ids.empty()))
+            why = "--stage-worker serves its main process only (not with --ids, --score, --profile-run or --spec-eval)";
+        else if (!remote_at.empty() && (o.stage_end < 1 || o.stage_begin != 0))
+            why = "--remote-stage needs --stage-end K: this PC runs layers 0 to K - 1 and the head, the worker the rest";
+        else if ((worker_mode || !remote_at.empty()) && !enc_rgb.empty()) why = "--encode-image: not with a remote stage";
+        else if (!stage_bind.empty() && !worker_mode) why = "--stage-bind is a worker's (--stage-worker)";
+        if (!why.empty()) {
+            std::fprintf(stderr, "maya-ds4: %s\n", why.c_str());
+            return 2;
+        }
+        o.stage_worker = worker_mode;
+        o.remote_stage = !remote_at.empty();
+        // a remote stage's rows, either side: the compact ones (ds4_stage.hpp rows_pack) unless STRATA_REMOTE_ROWS=fp32
+        // (debugging; both sides alike).  The link's own bf16 would round the int32 picks each row carries, so the
+        // engine packs the rows itself and the hello says so
+        o.stage_bf16 = worker_mode || o.remote_stage;
+        if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); (worker_mode || o.remote_stage) && v != nullptr && *v != '\0') {
+            strata::net::StageRows f = strata::net::StageRows::F32;
+            if (!strata::net::stage_rows_parse(v, f)) {
+                std::fprintf(stderr, "maya-ds4: STRATA_REMOTE_ROWS=%s: expected fp32 or bf16\n", v);
+                return 2;
+            }
+            o.stage_bf16 = f == strata::net::StageRows::BF16;
+        }
+        // the kept conversations (STRATA_DS4_SLOT_KEEP=1; STRATA_DS4_REUSE=0 turns every reuse off) across the link
+        const char* keep_env = std::getenv("STRATA_DS4_SLOT_KEEP");
+        const char* reuse_env = std::getenv("STRATA_DS4_REUSE");
+        o.stage_ckpt = o.remote_stage && serve_mode && keep_env != nullptr && std::atoi(keep_env) != 0 &&
+                       (reuse_env == nullptr || std::atoi(reuse_env) != 0);
+    }
+    if (o.pack.empty() || (!serve_mode && !worker_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
         return 2;
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    if (o.vision_only && (o.stage_begin != 0 || o.stage_end >= 0)) {
+        std::fprintf(stderr, "maya-ds4: --encode-image reads no layers: not with --stage-begin / --stage-end\n");
+        return 2;
+    }
+    RemoteMain remote;   // (before the model: the model's hooks call it until the model is gone)
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -1407,6 +1960,59 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
+    if (o.stage_worker) return stage_worker(m, o.pack, stage_bind, worker_port);
+    if (o.remote_stage) {
+        const std::shared_ptr<strata::net::TlsCredentials> cred = stage_cred();
+        if (cred == nullptr) return 1;
+        remote.link.set_credentials(cred);
+        remote.at = remote_at;
+        remote.me = stage_hello(m, o.pack, false, o.stage_ckpt);
+        remote.chunk_to = [&m](int64_t c) { m.set_stage_chunk((int) c); };
+        if (!remote.connect(err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "maya ds4: remote stage %s: layers %d-%d there (context %lld, rows %s, prompt chunks of %lld "
+                             "here, %lld at most there)\n", remote_at.c_str(),
+                     remote.peer.layer_begin, remote.peer.n_layers - 1, (long long) remote.peer.max_context,
+                     m.stage_geo().rows_bf16 ? "bf16 (the streams; the picks exact)" : "fp32", (long long) remote.sent_chunk,
+                     (long long) remote.peer.chunk);
+        remote.model = &m;
+        g_remote = &remote;
+        if (o.stage_ckpt)
+            m.set_stage_ckpt({[&remote](int64_t id, int64_t L, bool& stored, std::string& e) { return remote.ck_save(id, L, stored, e); },
+                              [&remote](int64_t id, int64_t L, bool& missing, std::string& e) {
+                                  return remote.ck_restore(id, L, missing, e);
+                              }});
+        m.set_stage_link([&remote](int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
+                                   std::string& e) { return remote.run(T, tokens, p0, out, in, e); },
+                         [&remote](int n_keep, std::string& e) { return remote.commit(n_keep, e); },
+                         [&remote](std::string& e) { return remote.reset(e); });
+        if (remote.me.chunk > 0) {   // (the chunked prompt path's chunks: over the link as they leave layer K - 1)
+            const strata::ds4::Model::StageGeo sg = m.stage_geo();
+            strata::ds4::stage::RowGeo rg;   // (the hand-off row: the compact one on the link with bf16 rows)
+            rg.h = (int64_t) sg.hc * sg.dim;
+            rg.topk = sg.topk;
+            rg.cand = sg.cand;
+            remote.chunks = std::make_unique<strata::ds4::stage::ChunkLink>(remote.link, rg, sg.rows_bf16);
+            strata::ds4::Model::StageChunks sc;
+            sc.send = [&remote](const int32_t* tokens, int T, int64_t p0, bool last, const float* rows, int skip,
+                                std::string& e) {
+                return remote.chunks->send(tokens, T, p0, last ? strata::ds4::stage::kChunkLast : 0, rows, skip, e);
+            };
+            sc.recv = [&remote](float* rows, int T, int skip, std::string& e) { return remote.chunks->recv(rows, T, skip, e); };
+            sc.wait = [&remote](std::string& e) { return remote.chunks->wait(e); };
+            sc.abort = [&remote] {   // (the link shut: a send or a reply on its way fails now; the next reset connects)
+                remote.link.abort();
+                remote.chunks_done();
+            };
+            m.set_stage_chunks(std::move(sc));
+        }
+    }
+    if (const char* ff = std::getenv("DS4_FORCE_TOKENS");
+        ff != nullptr && *ff != 0 && (serve_mode || !prof_ids.empty() || !spec_ids.empty() || !score_ids.empty()))
+        std::fprintf(stderr, "maya-ds4: DS4_FORCE_TOKENS is the CLI decode's (--ids ... --n N): not this mode's, left "
+                             "out\n");
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
@@ -1447,6 +2053,15 @@ int main(int argc, char** argv) {
         ids_s = ss.str();
     }
     const std::vector<int> ids = parse_ids(ids_s);
+    strata::ds4::ForcedTokens forced;   // (DS4_FORCE_TOKENS: the decode emits a file's ids - ds4_force.hpp)
+    if (const char* ff = std::getenv("DS4_FORCE_TOKENS"); ff != nullptr && *ff != 0 && n > 0) {
+        if (!forced.load(ff, n, err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "forced tokens: the decode emits the first %d of the %zu ids in %s (plain decode, no "
+                             "drafts)\n", n, forced.ids.size(), ff);
+    }
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
         if (!read_pics(images, pics, err)) {
@@ -1502,8 +2117,43 @@ int main(int argc, char** argv) {
     unsigned long long counter = 0;
     long long d_off = 0, d_acc = 0, rounds = 0;
     bool cool = false;
+    // DS4_WIN_STATS=N (--verbose: 64; 0 none): a line every N decode tokens - the window's tok/s, the expert server's
+    // share of the CPU lane's picks, the lane's own picks and ms a token, the fills loaded and sent (the server's set
+    // converging against the text's own routing). DS4_RX_HELD_SAVE=FILE: the server's held set into FILE at the
+    // decode's end, and every DS4_RX_HELD_EVERY tokens (0: the end alone), for a later run's DS4_RX_HELD_LOAD
+    const char* wv = std::getenv("DS4_WIN_STATS");
+    const int win = wv != nullptr && *wv != '\0' ? std::max(0, std::atoi(wv)) : o.verbose ? 64 : 0;
+    const char* hsv = std::getenv("DS4_RX_HELD_SAVE");
+    const std::string held_save = hsv != nullptr ? hsv : "";
+    const char* hev = std::getenv("DS4_RX_HELD_EVERY");
+    const int held_every = held_save.empty() || hev == nullptr ? 0 : std::max(0, std::atoi(hev));
+    strata::ds4::Stats sw = s0;
+    double tw = t1;
+    size_t w_from = 1;
+    auto window_line = [&]() {
+        const strata::ds4::Stats s1 = m.stats();
+        const double tn = now_ms(), k = (double) std::max<int64_t>(1, s1.tokens - sw.tokens);
+        const double served = (double) (s1.rx_picks - sw.rx_picks), local = (double) (s1.cpu_experts - sw.cpu_experts);
+        std::fprintf(stderr, "decode window %zu-%zu: %.2f tok/s (%lld tokens); the expert server %.1f%% of the CPU lane's "
+                             "picks (%.1f a token), the lane's own %.1f a token, %.2f ms a token; fills %lld loaded, %.1f "
+                             "MB sent\n",
+                     w_from, out.size(), tn > tw ? 1000.0 * (double) (s1.tokens - sw.tokens) / (tn - tw) : 0.0,
+                     (long long) (s1.tokens - sw.tokens), local + served > 0 ? 100.0 * served / (local + served) : 0.0,
+                     served / k, local / k, (s1.cpu_ms - sw.cpu_ms) / k, (long long) (s1.rx_fill_ok - sw.rx_fill_ok),
+                     (double) (s1.rx_fill_bytes - sw.rx_fill_bytes) / 1e6);
+        sw = s1;
+        tw = tn;
+        w_from = out.size() + 1;
+    };
+    auto save_held = [&](const char* when) {
+        std::string note;
+        const bool ok = m.rx_held_save(held_save, note);
+        std::fprintf(stderr, "ds4: DS4_RX_HELD_SAVE=%s %s: %s\n", held_save.c_str(), when,
+                     ok ? (note + " written").c_str() : ("not written - " + note).c_str());
+    };
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        if (forced.on()) tok = forced.take(0, tok);
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
@@ -1522,10 +2172,12 @@ int main(int argc, char** argv) {
                 tp = tn;
                 np = out.size();
             }
+            if (win > 0 && out.size() % (size_t) win == 0) window_line();
+            if (held_every > 0 && out.size() % (size_t) held_every == 0) save_held(("at token " + std::to_string(out.size())).c_str());
             if ((tok == 1 && std::getenv("DS4_NO_EOS") == nullptr) || (int) out.size() >= n) break;   // (DS4_NO_EOS: decode n tokens whatever)
             if (got.empty()) {
                 int off = 0, acc = 0;
-                const bool try_spec = spec && !cool;
+                const bool try_spec = spec && !cool && !forced.on();
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
                            cli_seed, counter, got, off, acc, err)) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
@@ -1539,8 +2191,13 @@ int main(int argc, char** argv) {
             }
             tok = got.back();
             got.pop_back();
+            if (forced.on()) tok = forced.take(out.size(), tok);
         }
         std::printf("\n");
+        if (win > 0 && out.size() >= w_from) window_line();   // (the last window's rest)
+        if (forced.on())
+            std::fprintf(stderr, "forced tokens: %lld of the decode's %zu own picks were not the file's (the first at "
+                                 "position %lld)\n", forced.differed, out.size(), forced.first);
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
     if (spec && rounds > 0) {
@@ -1571,6 +2228,56 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    // the lane's effective rate (H' reads [0, k) of each split pick's rows in place): with --remote-experts, DS4_EP_K or
+    // DS4_LANE_BYTES (a slot's base arm) only, so the default path's stderr stays the int build's
+    const bool lane_line = !o.remote_experts.empty() || std::getenv("DS4_EP_K") != nullptr ||
+                           std::getenv("DS4_LANE_BYTES") != nullptr;
+    if (lane_line && s.lane_bytes > s0.lane_bytes)
+        std::fprintf(stderr, "decode CPU lane reads: %.1f MB a token of its experts' bytes, %.1f GB/s over its %.2f ms\n",
+                     (s.lane_bytes - s0.lane_bytes) / nt / 1e6,
+                     (s.lane_bytes - s0.lane_bytes) / 1e6 / std::max(1e-3, s.cpu_ms - s0.cpu_ms), (s.cpu_ms - s0.cpu_ms) / nt);
+    // the head's wait (DS4_CUDA_SYNC): its thread's CPU time over its wall time (about 100%: it spins) and the CPUs it
+    // waited on, the most first - with the lane's line, or DS4_CUDA_SYNC set
+    const char* sync_env = std::getenv("DS4_CUDA_SYNC");
+    if ((lane_line || sync_env != nullptr) && s.head_waits > s0.head_waits) {
+        std::vector<std::pair<int64_t, int>> on;
+        for (int c = 0; c < 129; ++c)
+            if (s.head_on[c] > s0.head_on[c]) on.push_back({s.head_on[c] - s0.head_on[c], c});
+        std::sort(on.begin(), on.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+        std::string cpus;
+        for (size_t i = 0; i < on.size() && i < 6; ++i)
+            cpus += (i ? ", " : "") + (on[i].second < 128 ? "CPU " + std::to_string(on[i].second) : std::string("not known")) +
+                    " " + std::to_string(on[i].first);
+        if (on.size() > 6) cpus += ", " + std::to_string(on.size() - 6) + " more";
+        const double wall = s.head_ms - s0.head_ms, cpu = s.head_cpu_ms - s0.head_cpu_ms;
+        const std::string share = strata::ds4::os::thread_cpu_ms() < 0
+                                      ? std::string("not known")
+                                      : std::to_string((int) std::lround(100.0 * cpu / std::max(1e-9, wall))) + "% of it";
+        std::fprintf(stderr, "decode head wait (DS4_CUDA_SYNC=%s): %.2f ms a token, its thread's CPU time %s; %lld waits on %s\n",
+                     sync_env != nullptr ? sync_env : "unset, the driver's auto", wall / nt, share.c_str(),
+                     (long long) (s.head_waits - s0.head_waits), cpus.c_str());
+    }
+    if (s.lp_calls > s0.lp_calls) {   // (DS4_LANE_PROF=1 only) the lane's phases, ms a token; use: busy / (threads x wall)
+        auto pt = [&](double a, double b) { return (a - b) / nt; };
+        auto use = [&](double busy, double busy0, double wall, double wall0) {
+            return 100.0 * (busy - busy0) / std::max(1e-9, (double) std::max(1, s.lp_threads) * (wall - wall0));
+        };
+        std::fprintf(stderr,
+                     "decode lane phases (DS4_LANE_PROF), ms a token: the request's wait (since the layer before's answer) "
+                     "%.2f, between tokens %.2f; plan %.2f; prefetch + x quant %.2f; gate / up %.2f (tail %.2f, use %.0f%%); "
+                     "h quant %.2f; down %.2f (tail %.2f, use %.0f%%); add %.2f; the remote "
+                     "reply %.2f; %.1f calls a token, %d threads\n",
+                     pt(s.lp_wait_ms, s0.lp_wait_ms), pt(s.lp_gap_ms, s0.lp_gap_ms), pt(s.lp_plan_ms, s0.lp_plan_ms),
+                     pt(s.lp_prep_ms, s0.lp_prep_ms), pt(s.lp_gu_ms, s0.lp_gu_ms), pt(s.lp_gu_tail_ms, s0.lp_gu_tail_ms),
+                     use(s.lp_gu_busy_ms, s0.lp_gu_busy_ms, s.lp_gu_ms, s0.lp_gu_ms), pt(s.lp_hq_ms, s0.lp_hq_ms),
+                     pt(s.lp_dn_ms, s0.lp_dn_ms), pt(s.lp_dn_tail_ms, s0.lp_dn_tail_ms),
+                     use(s.lp_dn_busy_ms, s0.lp_dn_busy_ms, s.lp_dn_ms, s0.lp_dn_ms),
+                     pt(s.lp_add_ms, s0.lp_add_ms), pt(s.lp_rx_ms, s0.lp_rx_ms),
+                     (double) (s.lp_calls - s0.lp_calls) / nt, s.lp_threads);
+    }
+    std::fprintf(stderr, "%s", m.rx_lines(s0, nt).c_str());   // (--remote-experts)
+    if (!held_save.empty()) save_held("at the decode's end");
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);
         std::fprintf(stderr, "Engram per token: %.0f rows, %.1f%% without a read (the row cache holds %lld of %lld), "
@@ -1582,6 +2289,19 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
+#if defined(__linux__)
+    if (io0 >= 0 && io1 >= 0 && s.rx_held > 0) {   // (--remote-experts: the server's experts the lane read, the rest)
+        const double eb = (double) s.rx_upload_bytes / (double) s.rx_held / 1e6, all = (double) (io1 - io0) / 1e6 / nt,
+                     here = (double) (s.rx_here_cold - s0.rx_here_cold) * eb / nt,
+                     ahead = (double) (s.rx_ahead_cold - s0.rx_ahead_cold) * eb / nt;
+        std::fprintf(stderr, "decode reads from the disk, split (estimates: a whole %.1f MB expert each one sampled out of "
+                             "the page cache): the server's experts the lane computed after all %.1f MB a token, the "
+                             "server's experts the lookahead asked for early %.1f MB a token (%.1f asked a token), all the "
+                             "others %.1f MB a token\n",
+                     eb, here, ahead, (double) (s.rx_ahead - s0.rx_ahead) / nt,
+                     all > here + ahead ? all - here - ahead : 0.0);
+    }
+#endif
     if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,
@@ -1619,6 +2339,48 @@ int main(int argc, char** argv) {
             rk += b;
         }
         std::fprintf(stderr, "%s\n", rk.c_str());
+    }
+    if (s.ep_late > s0.ep_late)   // DS4_EP_DEFER
+        std::fprintf(stderr, "ep defer: %lld layers' CPU-lane parts added a layer late (%.1f a token; DS4_PROF's wait for "
+                             "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
+                     (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
+    if (s.ep_late_split > s0.ep_late_split)   // DS4_EP_DEFER_BELOW / TOP
+        std::fprintf(stderr, "ep defer: %lld split layers' light parts added a layer late, their heavy parts in the layer "
+                             "(%.1f a token)\n", (long long) (s.ep_late_split - s0.ep_late_split),
+                     (double) (s.ep_late_split - s0.ep_late_split) / (double) std::max<size_t>(1, out.size()));
+    std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());   // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK)
+    print_ep_verify(s, s0);   // DS4_EP_DEFER_VERIFY
+    if (s.rx_split_n > s0.rx_split_n) {   // DS4_EP_SPLIT_VERIFY
+        // the server's slice sums in bf16 against this lane's for the same x in bf16: the bf16 rounding of a sum (~4e-3);
+        // a layer above it is the server's share wired wrong (its blocks, its picks, its parts) - and under =2 (the
+        // server's slice from k - 1, or twice) every layer checked must be above it.  This end's own [0, k) and the
+        // fallback's [k, nb) are not in it: the slot's quality checks (KL, bytecheck) are theirs
+        const float bound = 1e-2f;
+        int last = -1, worst = -1, above = 0, seen = 0;
+        for (int i = 0; i < 64; ++i)
+            if (s.rx_split_err[i] != 0.0f) {
+                last = i;
+                ++seen;
+                if (worst < 0 || !(s.rx_split_err[i] <= s.rx_split_err[worst])) worst = i;
+                if (!(s.rx_split_err[i] <= bound)) ++above;
+            }
+        const char* verdict = s.rx_split_wrong ? (seen > 0 && above == seen ? "the wrong slice seen: the check works"
+                                                  : above > 0 ? "the wrong slice seen in some layers only: partly blind"
+                                                              : "the wrong slice NOT seen: the check is blind")
+                              : above ? "MISMATCH (wiring, or inf)"
+                              : seen  ? "ok"
+                                      : "ok (no layer differed at all)";
+        std::string ln;
+        for (int i = 0; i <= last; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, " %d:%.1e", i, s.rx_split_err[i]);
+            ln += b;
+        }
+        std::fprintf(stderr, "ep split verify: %lld rows of the server's slice sums checked against this lane's [k, nb) of "
+                             "the same picks (x in bf16 both); the largest |d| / |ref| by layer (since the load):%s; worst "
+                             "%.2e at layer %d; bound %.0e: %d of the %d layers above it - %s%s\n",
+                     (long long) (s.rx_split_n - s0.rx_split_n), ln.c_str(), worst >= 0 ? s.rx_split_err[worst] : 0.0f, worst,
+                     (double) bound, above, seen, s.rx_split_wrong ? "DS4_EP_SPLIT_VERIFY=2: " : "", verdict);
     }
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);

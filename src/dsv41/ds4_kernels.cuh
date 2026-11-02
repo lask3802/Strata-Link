@@ -81,6 +81,29 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// DS4_EP_DEFER (n+1 deferral): a layer's part y that came a layer late (rows part_stride floats apart; token t only
+/// where flag[t] != 0) into the streams: h[t][k][e] += c[t][k] y[t][e], c[t][k] = sum_j comb[t][j][k] post[t][j] - the
+/// term hc_post(y, post) leaves out, carried through the hc_post (comb: the next layer's attention's) that ran since;
+/// comb null: c = post (nothing ran since: the head).
+void hc_late_add(float* h, const float* part, size_t part_stride, const int* flag, const float* post, const float* comb,
+                 int dim, int hc, int T, cudaStream_t s);
+/// *out = max(*out, max_i |a[i] - b[i]| / (1 + |a[i]|)) (a NaN counts as inf; *out, device memory, starts at 0 or a
+/// value it wrote).
+void max_rel_diff(const float* a, const float* b, size_t n, float* out, cudaStream_t s);
+/// y[i] += a[i] - b[i] (DS4_EP_DEFER_VERIFY: an in-place change of the exact streams, e.g. Engram's, onto the deferred).
+void add_diff(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
+/// DS4_EP_DEFER_VERIFY's scale - the magnitude of every term the two sides sum, so a float-order difference is bounded
+/// by it however much the terms cancel (|fl(x) - x| <= gamma_n * x evaluated in absolute values, n the roundings on a
+/// path).  out[t][k][e] = |post[t][k]| (|ya| + |yb| + |yc| + |part| where flag[t]) + sum_j |comb[t][j][k]| res[t][j][e]
+/// (yb, yc, part: null for none; res: the streams, their |.| taken; out must not alias res).
+void hc_mag(const float* ya, const float* yb, const float* yc, const float* part, size_t part_stride, const int* flag,
+            const float* res, const float* post, const float* comb, int dim, int hc, int T, float* out, cudaStream_t s);
+/// y[i] += |a[i]| + |b[i]| (the scale through add_diff's two roundings).
+void add_abs2(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
+/// *out = max(*out, max |a - b| / S) (a NaN, or a difference where S is 0, counts as inf): S = mag (comb null: the head)
+/// or the next attention's hc_post on it in absolute values, |post[t][k]| |y[t][e]| + sum_j |comb[t][j][k]| mag[t][j][e].
+void max_mag_diff(const float* a, const float* b, const float* mag, const float* y, const float* post, const float* comb,
+                  int dim, int hc, int T, float* out, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
@@ -162,6 +185,16 @@ struct AttnRows {
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0;
 };
+/// Whether sparse_attn takes the split-KV kernel for a decode step / short verify window (DS4_ATTN_SPLIT, unset: the U9
+/// defaults); the first call prints it.  A test may set it; attn_split_runs counts the split kernel's launches.
+bool& attn_split();
+unsigned long long attn_split_runs();
+/// DS4_ATTN_TC: sparse_attn takes the tensor-core kernel (ds4_attn_tc.cuh: FP16 mma, F32 softmax and sums) for a
+/// prompt chunk's slab - gen 1, packed rows, more than kAttnScratchT queries, heads_per_block 0, heads a multiple of
+/// 32 - in mode 1 (q and P as FP16 hi + lo pairs: F32-like), 2 (q hi + lo, P FP16) or 3 (plain FP16); 0 off (unset,
+/// empty or 0: the packed kernel, as before; any other number: 1).  The first such slab reads it and prints it when
+/// on.  A test may set it.  CUDA only (HIP: 0).
+int& attn_tc();
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
@@ -229,10 +262,15 @@ struct Req {
 };
 struct Resp {
     unsigned seq;
-    int pad[3];
+    // DS4_EP_DEFER_BELOW / DS4_EP_DEFER_TOP (a split request, T 1): part[0] / cpu[0] (the heavy picks') final - written
+    // before seq on every path; seq: part[1] / cpu[1] (the light ones') too.  Unused otherwise
+    unsigned hseq;
+    int pad[2];
     int cpu[kWin];   // 1: part[t] is the CPU lane's weighted sum for token t
     float part[kWin][kMaxDim];
 };
+static_assert(offsetof(Resp, cpu) == 16 && sizeof(Resp) == 16 + sizeof(int) * kWin + sizeof(float) * kWin * kMaxDim,
+              "Resp's layout as before hseq took a pad word");
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
@@ -242,6 +280,25 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// U9 route: gemv_f32 for up to 3 matrices of BF16 rows (w[i]: n[i] x k) on the same x in one launch, into y[i] (rows ldy
+/// apart).  The F32 widening of the rows is exact, so each output is gemv_f32's of the widened matrix bit for bit.
+struct GemvBf16 {
+    const uint16_t* w[3];
+    float* y[3];
+    int n[3];
+};
+void gemv_bf16(const GemvBf16& g, int nm, const float* x, int k, int T, int ldy, cudaStream_t s);
+/// U9 route: route_ahead for each lookahead layer (na of them) and route_publish in one launch, the last block to finish
+/// publishing the request: the same picks, weights, request and seq as those calls (and publish_kernel's order).
+struct RouteAhead {
+    const float* logits[2];   // (rows 1024 apart)
+    const float* bias[2];
+    int n[2], m[2], off[2];
+};
+void route_fused(const float* logits, const float* bias, int n, int k, int T, float route_scale,
+                 const unsigned long long* vram, const float* x, int dim, int* idx, float* w, unsigned long long* plan_ptr,
+                 Req* req, unsigned seq, cudaStream_t s, const float* bias_vl, unsigned vl, int na0, int na1,
+                 const RouteAhead& ah, int na);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

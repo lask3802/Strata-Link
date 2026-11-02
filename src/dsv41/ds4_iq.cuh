@@ -69,6 +69,12 @@ struct Args {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// grid (n_embd / 8, groups): part of every entry.
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
+/// Whether gate_up / down have a kernel for the type (false: Q5_K / Q6_K, supported() for the dense GEMVs only); a type
+/// they take refuses only a geometry its kernels do not cover.
+bool token_kernel(int type);
+/// Loads gate_up's and down's kernels of every type for ne_max 1 (cudaFuncGetAttributes: CUDA's lazy loading takes
+/// their memory now).  false: one failed.
+bool load_moe_kernels();
 
 /// The prompt path's expert sets (ds4_gguf.cu's SetK): expert i's blob at wbase + i stride owns the sorted rows
 /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
@@ -101,7 +107,15 @@ struct SetArgs {
     int total_rows = 0;             // the set's rows in all
 #endif
 };
-bool set_gate_up(const SetArgs& a, cudaStream_t s);
+/// (DS4_IQ_SET2, gate / up) the caller's room for a set's gathered F16 input rows: xg, nrows x n_embd halves (nrows: the
+/// set's rows, bounds[n_exp] - row0 - no fewer: the tiles would read the rows past it as 0; xg 16-byte aligned, else
+/// set_tc_kernel's).  Not given (or xg null): set2's own scratch, up to 64 MB (set2_gathers says when the engine gives it).
+/// Apart from SetArgs: the kernels' argument as before
+struct Set2Room {
+    uint16_t* xg = nullptr;
+    int nrows = 0;
+};
+bool set_gate_up(const SetArgs& a, cudaStream_t s, const Set2Room* room = nullptr);
 bool set_down(const SetArgs& a, cudaStream_t s);
 /// Test hooks for the matrix-core (HIP gfx11 / gfx12) prompt tiles: hipk_force(-1 default rules, 0 scalar tiles, 1 matrix-core tiles) and the
 /// count of matrix-core launches so far (both do nothing / return -1 where there are no such tiles; hipk_force returns whether this device has them)
@@ -137,16 +151,33 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// U9 q5k: the staged Q5_K kernel's launches so far (0 under HIP), for a test to tell it ran.
+unsigned long long q5k_staged_runs();
 
 /// n rows of k values of a matrix of the type (ld bytes a row) as BF16 (bf16) or F16 bits, dst[n][k]: the chunked prompt path's
 /// dense GEMM operand.  false: a type not covered.
 bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s);
+/// DS4_IQ_SET2 (read once): the prompt sets' tiles (set_gate_up / set_down, CUDA's tensor-core case) of IQ1_M, IQ2_XXS and
+/// IQ2_XS in set2_tile_kernel instead of set_tc_kernel - the same products in the same order (the same bits), pipelined, each
+/// weight decoded once a row block (IQ1_M without a conversion a weight).  Unset, "" or 0: off; 1 or 64: row blocks of 64 (the
+/// faster on a 3070); 128: of 128; anything else: off, said in one line.  The value is the row block (0: off).  Taken where the
+/// device and its kernels are sm_75+ (an sm_60 / sm_70 build, or a GPU below 7.5, keeps set_tc_kernel, said in one line);
+/// the other types, the light kernels' experts (<= 16 rows) and HIP are as before.  (a test sets it: both in one process)
+int& set2_kernel();
+/// set2_tile_kernel's launches so far at row blocks of bm (64 or 128; 0 under HIP), for a test to tell which ran.
+unsigned long long set2_runs(int bm);
+/// Whether the current device's gate / up sets of type t (gate's) take set2_tile_kernel (DS4_IQ_SET2 on, a pack type, the
+/// tensor-core sets, sm_75 code; said in one line when set and not taken): the engine then gives them a Set2Room
+/// (x3::SetArgs::xg: C rows of n_embd halves a device, in its VRAM plan) - without it set2 gathers into a scratch of its
+/// own, up to 64 MB.
+bool set2_gathers(int t);
 
 /// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
 /// (ds4_tq_cpu.cpp: int8 activations with an F32 scale a 32, exact weights), on the tensor cores of gfx12 (WMMA) or in FMAs.
 namespace tq {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
+bool load_moe_kernels();
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
 bool mv(const MvJob* jobs, int n, cudaStream_t s);

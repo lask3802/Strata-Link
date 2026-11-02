@@ -1,0 +1,632 @@
+// src/dsv41/ds4_rx.hpp - remote VRAM experts (a proof of concept): another PC's GPU holds some of the routed experts
+// the main process's CPU lane would compute, and computes them for it while the lane computes the rest.
+//
+//   expert server:  strata-dsv41 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--gpus I]
+//   main process:   strata-dsv41 --pack ... --remote-experts [BIND:]PORT ...
+//
+// The server needs no pack and dials out to the main process (no inbound port on the server's PC).  The main process
+// listens at its load, after its own placement, for at most DS4_RX_WAIT_S seconds (120): no server, it runs as it
+// would without.  Both sides send STRATA_STAGE_TOKEN in their hello and refuse a different one.  The server says how
+// much VRAM it has (free less the reserve); the main process sends the geometry, then the blobs of the hottest experts
+// by its profile that are neither in its own VRAM nor on a CPU-only layer, as many as fit, once.  In decode, per layer
+// request of the CPU lane (serve_lane): the picks the server holds go out as soon as the routing is known (T rows of
+// x in bf16, up to 8 picks and weights each), the lane computes the others, then waits for the reply (T rows of
+// sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply not in once the lane's
+// own picks are done and as long again as the lane would take for the server's picks (0.1 ms at least; 2 ms until the
+// lane's time a pick is known, or always DS4_RX_TIMEOUT_MS when it is set): those picks are computed on the lane (the
+// late reply is skipped when it comes, its round trip still taken; without the kernel's arrival times, Windows: the 2
+// ms always); 8 of the last 64 replies past the link's bound (that fixed wait's deadline, not the lane's): the lane
+// computes everything for the next DS4_RX_BACKOFF (256) requests, then the link is tried again with a clean count; a
+// lost link, or no reply at all from one such idle spell to the next: the lane computes everything from then on.
+// Never a hang.
+// Keep-awake: each end's receive spins while bytes came in the last kSpinMs; a window's start sends a Wake when the
+// link has been quiet for kWakeQuietMs (the server's spin restarts before the window's first request), and serve_lane
+// does not nap while the link is up and its last request is under kSpinMs old.  Both ends' link threads run on the
+// link core (DS4_EP_CPU, 2), the main's CPU lane workers off it and its SMT sibling.  DS4_EP_WAKE=0: no Wake and the
+// lane's 2 ms naps (A/B).
+//
+// The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
+//
+// Expert parallelism H' (protocol 2, ep-u6-plan.md): a server given the parts pack (--expert-server-parts DIR, U3's
+// ep_parts.py) also takes slice picks - a pick of the main's CPU lane whose n_ff blocks [k, nb) its own CPU lane computes
+// from the parts in place while the main's computes [0, k) (DS4_EP_K).  Its hello says the lowest k its parts take (lo),
+// the Geo carries the main's pack_hash (another pack: refused at the Geo, the main runs alone), a request's row marks its
+// slice picks (ReqRow::slice) and the header's c their k; the reply is the same one sum a row (whole + slice picks).
+//
+// Fills (protocol 3, EP U5b, DS4_RX_FILL=1 on the main; ds4_rx_fill_link.hpp): the server's set follows the main's heat.
+// The main sends BulkHello (a = the port of a second, paced socket it listens on, payload the session); the server dials
+// it (ep::Conn), and Fills come on it - an expert's bytes into the slot of one the server holds, FillOk back.  A request
+// that names an expert whose slot is being filled (a late one: the main stops naming `out` before the Fill leaves) gets
+// Stale, not an Error: the main computes its picks on the lane, as for a late reply.
+//
+// The hybrid (protocol 4, EP U5c, DS4_RX_POOL=DIR on the server): a second parts index of the hottest experts' [0, k)
+// (ep_parts.py --pool-only), of which the server keeps W in RAM (DS4_RX_POOL_GB, the hottest it does not hold in VRAM)
+// and names them after its BlobsOk's ok[] (uint32 layer << 16 | expert each).  A slice pick of W the main tags pool too
+// (ReqRow::slice's high byte): the server's CPU lane computes it whole ([0, k) from the pool, [k, nb) from the parts)
+// and the main's lane skips it; a late reply: the main computes it whole.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace strata::ds4::rx {
+
+constexpr uint32_t kMagic = 0x58524453u;   // "SDRX"
+constexpr uint32_t kProto = 5;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks; 3: fills; 4: W;
+                                           //  5: the W picks' cut, kReqCut)
+constexpr int kMaxRows = 16;               // a request's rows at most (kWin)
+constexpr int kMaxPicks = 8;               // picks a row at most (kPicks)
+// a Req's c: the slice picks' first n_ff block k (0: none), and flags
+constexpr int32_t kReqK = 0xff;
+constexpr int32_t kReqSets = 1 << 8;    // (DS4_EP_SPLIT_VERIFY) the reply's rows twice: the whole picks' sums, then the slice's
+constexpr int32_t kReqWrong = 1 << 9;   // (DS4_EP_SPLIT_VERIFY=2, the check's own check) the slice from k - 1 on purpose
+// (protocol 5) the W picks' first n_ff block on the server, 0 .. k - 1 (0: whole there; the main computes [0, cut))
+constexpr int kReqCutShift = 16;
+constexpr int32_t kReqCut = 0xff << kReqCutShift;
+
+enum Msg : uint32_t {
+    Hello = 1,      // payload HelloMsg (each side sends one; the server first)
+    Geo = 2,        // main -> server: payload GeoMsg, then n_layers x GeoLayer
+    Blob = 3,       // main -> server: a = layer, b = expert; payload the blob (GeoLayer's layout)
+    BlobsEnd = 4,   // main -> server: a = the blobs sent; payload uint32 (protocol 4): the experts the main's own GPU
+                    // computes (layer << 16 | expert), never a CPU-lane pick: not for W
+    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM), then uint32 W (protocol 4: the pool's
+                    // experts in its RAM, layer << 16 | expert; none without a pool); or an Error (its warm-up requests
+                    // failed) and the main drops the server.  A refusal known at the Geo (the geometry, the room's VRAM
+                    // in one piece) is an Error right after it: the main reads it before each blob and stops
+    Req = 6,        // main -> server: seq, a = layer, b = rows, c = k | flags (kReqK); payload rows x (ReqRow, then bf16
+                    // x[n_embd])
+    Resp = 7,       // server -> main: seq, a = rows, b = its CPU lane's time (us; the slice picks), c = the server's
+                    // time (us); payload rows x bf16 y[n_embd] (kReqSets: twice as many, the whole sums then the slice's)
+    Error = 9,      // either way: payload the message
+    Ping = 10,      // main -> server (tests: the link alone): seq; the server answers Pong with the same payload at once
+    Pong = 11,      // (a = the Wakes the server took, b = its waits in poll (the low 31 bits), c = the one CPU its
+                    // serve loop may run on, -1: not pinned)
+    Wake = 12,      // main -> server: no payload, no reply; a window starts (its bytes restart the server's spin)
+    BulkHello = 13, // main -> server: a = the fills' port (the main's host), payload uint64 session; the server dials it
+    Stale = 14,     // server -> main: seq; the request named an expert whose slot a fill is taking (no reply rows)
+};
+
+constexpr double kSpinMs = 200.0;      // a receive spins while bytes came or went this recently, then waits in poll
+constexpr double kWakeQuietMs = 100.0; // a Wake goes out only when the main sent nothing for this long (half the spin)
+// DS4_RX_PREWAKE: a wake request's seq (Main::prewake): this bit and a count from 1 - serve_lane's own seqs count from
+// 1 and reach it only after 2^31 requests (weeks of decode); a reply matches only a wake still out (Main::took_wake_)
+constexpr uint32_t kPrewakeSeq = 0x80000000u;
+
+/// The link core (DS4_EP_CPU, 2 by default; -1, "off" or not a number: none): the logical CPU the thread that drives
+/// the link runs on, on either PC - the main's service thread, the server's serve loop.  -1 also where this PC has no
+/// such CPU, or this process may not run on it (a container's cpuset)
+int link_cpu();
+/// `cores` less the link CPU's core (`link`: its SMT siblings, os::cpu_siblings), in their order: the CPU lane's
+/// workers stay off the core the link thread spins on
+std::vector<int> off_link(const std::vector<int>& cores, const std::vector<int>& link);
+/// serve_lane, with no request in: may it nap (20 us sleeps) after idle_ms without one - after spin_ms (DS4_LANE_SPIN_MS),
+/// but while the link is up not before kSpinMs (the server spins as long: a window's first request is not held up by the lane)
+inline bool lane_naps(double idle_ms, bool link_up, double spin_ms = 2.0) {
+    return idle_ms > (link_up && kSpinMs > spin_ms ? kSpinMs : spin_ms);
+}
+
+#pragma pack(push, 1)
+struct Hdr {
+    uint32_t magic = kMagic, type = 0, seq = 0;
+    int32_t a = 0, b = 0, c = 0;
+    uint64_t bytes = 0;
+};
+struct HelloMsg {
+    uint32_t proto = kProto;
+    char token[64] = {};
+    uint64_t room = 0;    // (the server) bytes of VRAM it can give the blobs
+    int32_t lo = 0;       // (the server) the lowest k its parts take for slice picks (0: no parts, no slice picks)
+    int32_t lane_threads = 0;   // (the server) its CPU lane's workers (informational)
+    char name[44] = {};   // the GPU's / the host's name (informational)
+};
+struct GeoMsg {
+    int32_t n_embd = 0, n_ff = 0, n_layers = 0;
+    float limit = 0.0f;   // the swiglu's clamp (0: none)
+    uint64_t pack_hash = 0;   // the main's pack (ds4_stage.hpp pack_hash): a server's parts must be cut from it
+    int32_t k = 0;   // the main's DS4_EP_K: 1 .. nb - 1 it splits (parts that do not serve it: refused at the Geo); else
+                     // (DS4_EP_K unset, nb) whole picks only: a parts problem is the server's warning, and it serves as U4
+};
+struct GeoLayer {         // a layer's experts: the roles' ggml types (0: the layer is not served), each role's offset in
+    int32_t K[3] = {0, 0, 0};   // a blob (gate | up | down, 256-aligned) and the blob's bytes
+    uint64_t off[3] = {0, 0, 0};
+    uint64_t blob = 0;
+};
+struct ReqRow {           // a request's row: the window's token t, n picks (expert ids, route weights)
+    uint8_t t = 0, n = 0;
+    uint16_t slice = 0;   // bit i: pick i is a slice pick (its n_ff blocks [k, nb) from the parts), else a blob's whole;
+                          // bit kPoolBit + i (a slice pick's): its [0, k) from the pool too (W: the pick whole there)
+    int16_t e[kMaxPicks] = {};
+    float w[kMaxPicks] = {};
+};
+#pragma pack(pop)
+static_assert(sizeof(Hdr) == 32, "the header's size");
+static_assert(sizeof(HelloMsg) == 128, "the hello's size");
+static_assert(sizeof(GeoMsg) == 28 && sizeof(ReqRow) == 52, "the geometry's and a row's sizes");
+
+constexpr int kPoolBit = 8;   // (ReqRow::slice: the pool bits' first; kMaxPicks of each)
+static_assert(kPoolBit >= kMaxPicks && kPoolBit + kMaxPicks <= 16, "a row's slice and pool bits in its uint16");
+
+/// A server's check of a request row: 1..kMaxPicks picks, slice bits only on them, slice picks only with a k (c's
+/// kReqK) and parts here (has_parts), pool bits only on slice picks and with a W here (has_pool).  "" or why.
+inline std::string row_refusal(const ReqRow& rw, int32_t c, bool has_parts, bool has_pool = false) {
+    if (rw.n < 1 || rw.n > kMaxPicks) return "a request row with " + std::to_string(rw.n) + " picks";
+    const unsigned sl = rw.slice & ((1u << kPoolBit) - 1), po = (unsigned) rw.slice >> kPoolBit;
+    if ((sl >> rw.n) != 0) return "a request row's slice bits past its " + std::to_string(rw.n) + " picks";
+    if ((po & ~sl) != 0) return "a request row's pool bits on picks that are not slice picks";
+    if (sl != 0 && (c & kReqK) == 0) return "slice picks without a k";
+    if (sl != 0 && !has_parts) return "slice picks, and no parts here (--expert-server-parts)";
+    if (po != 0 && !has_pool) return "pool picks, and no W here (DS4_RX_POOL)";
+    return "";
+}
+
+/// The main's send gate and a reply's deadline, from EWMAs (0: none yet) of the round trip at a request's rows and of
+/// the CPU lane's time a pick at the window's T.  A window's remote picks go out only when the round trip is expected
+/// to end no later than the lane computing them with its own (none learned yet: out; every 32nd window kept in a row
+/// at a T: out anyway, a probe that keeps the estimate current).  The deadline: after the lane's own part, as long as
+/// the lane would take to compute the remote picks itself (n x its time a pick at T, kMinWaitMs at least; fixed_ms
+/// until that is learned, or always when fixed_ms is forced: the regret of a wait is at most 2 x the local cost), but
+/// not before 1.5 x the round trip expected at those rows.
+struct Gate {
+    double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
+    int run[kMaxRows + 1] = {}, seen[kMaxRows + 1] = {}, over[kMaxRows + 1] = {};
+    double run_lo[kMaxRows + 1] = {}, run_hi[kMaxRows + 1] = {};   // (the clamped run's first and last send, ms)
+    static constexpr double kSlowerMs = 50.0, kMinWaitMs = 0.1;
+    static constexpr int kClampAfter = 4;   // (samples before the clamp applies; a seed counts as that many)
+    static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
+    /// the round trip at `rows` measured before decode (the load's warm-up requests): the estimate, and the clamp
+    /// from the first sample against it (a cold server's first reply, 178 ms in a slot, moves it by 20% only)
+    void seed(int rows, double ms) {
+        if (ms <= 0.0) return;
+        rtt[rows] = ms;
+        seen[rows] = kClampAfter;
+        over[rows] = 0;
+    }
+    // a reply's round trip: from the kernel's arrival time where there is one (Linux; a late reply's too, when it
+    // comes), else a reply the lane waited for (a late one: the time waited, a lower bound).  Without it, one already
+    // there when the lane finished its own part says only that the round trip was at most that long - the time is the
+    // lane's, not the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the
+    // estimate at most (one spike moves it by 20%; the late count is the reply's own time), but not after 4 in a row
+    // were and their sends span kSlowerMs or more: then the link did get slower, and the sample counts as it is (with
+    // sends sparser than that, 8 of 64 late may idle the link first; the run spans it after).  A stall bunches its
+    // replies within a few ms: those stay clamped.  sent < 0 (no send time): the count alone
+    void rtt_seen(int rows, double ms, bool waited = true, double sent = -1.0) {
+        if (!waited && rtt[rows] > 0.0 && ms >= rtt[rows]) return;
+        if (seen[rows] >= kClampAfter && ms > 3.0 * rtt[rows]) {
+            if (over[rows] == 0) {
+                run_lo[rows] = run_hi[rows] = sent;
+            } else if (sent >= 0.0) {
+                run_lo[rows] = run_lo[rows] < 0.0 || sent < run_lo[rows] ? sent : run_lo[rows];
+                run_hi[rows] = sent > run_hi[rows] ? sent : run_hi[rows];
+            }
+            const bool spans = sent < 0.0 || run_hi[rows] - run_lo[rows] >= kSlowerMs;
+            if (over[rows] < 4 || !spans) {
+                ms = 3.0 * rtt[rows];
+                ++over[rows];
+            } else {
+                over[rows] = 0;
+            }
+        } else {
+            over[rows] = 0;
+        }
+        ew(rtt[rows], ms);
+        ++seen[rows];
+    }
+    void pick_seen(int T, double ms_a_pick) { ew(pick[T], ms_a_pick); }
+    bool send(int T, int rows, size_t n_remote, size_t n_local) {
+        const double rt = rtt[rows], c = pick[T];
+        if (rt <= 0.0 || c <= 0.0 || rt <= c * (double) (n_remote + n_local) || ++run[T] >= 32) {
+            run[T] = 0;
+            return true;
+        }
+        return false;
+    }
+    /// the wait after the lane's own part for n_remote picks at T (see the struct)
+    double wait_ms(int T, size_t n_remote, double fixed_ms, bool forced) const {
+        if (forced || pick[T] <= 0.0) return fixed_ms;
+        const double w = (double) n_remote * pick[T];
+        return w > kMinWaitMs ? w : kMinWaitMs;
+    }
+    double deadline(double sent, double lane_done, double wait, int rows) const {
+        const double a = lane_done + wait, b = sent + 1.5 * rtt[rows];
+        return a > b ? a : b;
+    }
+    /// a request's two deadlines: the lane's (the wait for its n_remote picks at T) and the link's bound (the fixed
+    /// wait's, what rx::Backoff counts against).  kts = false (no kernel arrival times: a late reply's time is its read,
+    /// in the next request's wait, past any bound): the fixed wait, the bound is the deadline
+    std::pair<double, double> deadlines(int T, size_t n_remote, int rows, double sent, double lane_done, double fixed_ms,
+                                        bool forced, bool kts) const {
+        const double bound = deadline(sent, lane_done, fixed_ms, rows);
+        if (!kts) return {bound, bound};
+        return {deadline(sent, lane_done, wait_ms(T, n_remote, fixed_ms, forced), rows), bound};
+    }
+};
+
+/// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the
+/// gate the round trip it had.  Late here is past the lane's wait (the policy's deadline); whether the link was late
+/// (rx::Backoff's count) is decided against the link's bound `bound` (the fixed wait's deadline): by the reply's
+/// arrival when it comes (take: open), or as late once the bound has passed without it (expire)
+struct LateBook {
+    struct E {
+        uint32_t seq = 0;
+        double sent = -1, bound = -1;
+        int rows = 0, layer = -1;
+        bool open = false;   // (the link's lateness not decided yet)
+    };
+    E e[64];
+    void add(uint32_t seq, double sent, int rows, int layer = -1, double bound = -1) {
+        e[seq % 64] = {seq, sent, bound, rows, layer, bound >= 0};
+    }
+    /// a request late for the lane's `deadline` in: open against its bound, or decided late at once when the deadline
+    /// was the bound already.  Its slot's entry still open (64 lane requests on, no reply, the bound not passed: a bound
+    /// far out): decided late.  The count decided late here
+    int add_late(uint32_t seq, double sent, int rows, int layer, double deadline, double bound) {
+        const int n = e[seq % 64].open ? 1 : 0;
+        const bool now = deadline >= bound;
+        add(seq, sent, rows, layer, now ? -1.0 : bound);
+        return n + (now ? 1 : 0);
+    }
+    /// a late reply's lateness for the link: its kernel arrival (within its send and the read), else the time it was
+    /// read.  A shared stamp (the read's last reply's: the next reply came in the same read) is an upper bound only:
+    /// not late - a reply past the short wait sits in the socket until the next request's wait reads it with that
+    /// one's, and a slow link's replies come apart (the next not in yet), or not at all (expire)
+    static bool past(double arrival, double sent, double read, double bound, bool shared = false) {
+        if (arrival < sent || arrival > read) return read > bound;
+        return !shared && arrival > bound;
+    }
+    /// a reply in time for the lane's deadline: late for the link only when that wait went past the bound (large T)
+    /// and it came after it
+    static bool in_time_past(double deadline, double bound, double arrival, double sent, double read) {
+        return deadline > bound && past(arrival, sent, read, bound);
+    }
+    /// seq's send time, rows and layer (false: not a late request here, or taken already); *open: its link lateness
+    /// still to decide (against *bound)
+    bool take(uint32_t seq, double& sent, int& rows, int* layer = nullptr, bool* open = nullptr, double* bound = nullptr) {
+        E& x = e[seq % 64];
+        if (x.sent < 0 || x.seq != seq) return false;
+        sent = x.sent;
+        rows = x.rows;
+        if (layer != nullptr) *layer = x.layer;
+        if (open != nullptr) *open = x.open;
+        if (bound != nullptr) *bound = x.bound;
+        x.sent = -1;
+        x.open = false;
+        return true;
+    }
+    /// the open ones whose bound is before now: decided late (their count); their replies may still come (take)
+    int expire(double now) {
+        int n = 0;
+        for (E& x : e)
+            if (x.open && x.bound < now) {
+                x.open = false;
+                ++n;
+            }
+        return n;
+    }
+};
+
+/// Whether a window of T rows has its remote picks served (the expert server is reached only from serve_lane, the
+/// async windows': plan_window's rule - threads mode, or no DS4_SYNC and T <= async_max_t).  T 0: the settle after a
+/// prompt and the tick after a chunked one, for the decode that follows (T 1).  Where not, the CPU lane computes the server's experts as its own, and the
+/// expert cache takes them as any (cache_in's remote: null).
+inline bool lane_serves(int T, bool par, bool sync_decode, int async_max_t) {
+    return par || (!sync_decode && (T == 0 ? 1 : T) <= async_max_t);
+}
+
+/// The expert cache's next expert into VRAM from a layer's CPU-lane hits: the hottest not in VRAM (slot < 0) and not one
+/// the expert server holds (remote[e] != 0; null: none) - those cost the CPU lane nothing, so a VRAM slot there would
+/// save no lane work - except a zero-copy one of the RAM store (zc[e] != 0; null: none), which the decode computes on this
+/// GPU over the bus and never sends.  -1: none.
+inline int cache_in(const std::vector<int>& hits, const int* slot, const float* heat, const uint8_t* remote,
+                    const uint8_t* zc) {
+    int best = -1;
+    for (int e : hits)
+        if (slot[e] < 0 && (remote == nullptr || remote[e] == 0 || (zc != nullptr && zc[e] != 0)) &&
+            (best < 0 || heat[e] > heat[best]))
+            best = e;
+    return best;
+}
+
+/// The remote experts beside expert parallelism's n_ff slice [ff0, ff0 + ffn) of a layer (Layer::ep_ff0 / ep_ffn; ffn -1:
+/// the whole n_ff): refused - the server computes each expert whole, an EP window's lane a slice of it, and the other
+/// PC's part would add the rest a second time - unless tagged (H', DS4_EP_K): the lane then computes the slice only of
+/// a pick sent tagged slice in the same request, whose rest the server computes (ds4_rx_split.hpp).  The reason, or nullptr
+inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff, bool tagged = false) {
+    if (!remote || tagged || ffn < 0 || (ff0 == 0 && ffn == n_ff)) return nullptr;
+    return "the remote experts (--remote-experts) compute each expert whole";
+}
+
+/// A served layer's blob layout from the geometry, checked by a server at the Geo (before any blob): each role r
+/// (gate, up, down) of bytes[r] (its rows' bytes there: 0 = a type it has no layout for, or rows not whole blocks of
+/// it) at off[r], 256-aligned,
+/// inside the blob and over no other role.  An overrun would read past the blob (the GPU server's arena: the next
+/// one's).  "" or why not.
+inline std::string blob_refusal(int li, const GeoLayer& g, const uint64_t bytes[3]) {
+    static const char* const role[3] = {"gate", "up", "down"};
+    const std::string at = "layer " + std::to_string(li) + "'s ";
+    for (int r = 0; r < 3; ++r) {
+        if (bytes[r] == 0)
+            return at + role[r] + ": type " + std::to_string(g.K[r]) +
+                   " has no layout here, or its rows are not whole blocks of it (no row bytes)";
+        if (g.off[r] % 256 != 0) return at + role[r] + ": its offset " + std::to_string(g.off[r]) + " not 256-aligned";
+        if (g.off[r] > g.blob || bytes[r] > g.blob - g.off[r])
+            return at + role[r] + ": " + std::to_string(bytes[r]) + " bytes at " + std::to_string(g.off[r]) +
+                   " past the blob's " + std::to_string(g.blob);
+        for (int q = 0; q < r; ++q)
+            if (g.off[r] < g.off[q] + bytes[q] && g.off[q] < g.off[r] + bytes[r])
+                return at + role[r] + " over its " + role[q];
+    }
+    return "";
+}
+
+/// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
+/// computes their picks), then it is tried again with a clean count.  Given up for good only when no reply at all
+/// (late or not) came from one idle spell to the next: a server that stopped answering on a link still open
+struct Backoff {
+    enum { On = 0, Idle = 1, Silent = 2 };
+    uint64_t bits = 0;
+    int hold = 256, left = 0;
+    bool spell = false, heard = false;   // (an idle spell before, a reply read since it)
+    /// once a request that has remote picks: true = keep them here (the link idle)
+    bool idle() {
+        if (left <= 0) return false;
+        --left;
+        return true;
+    }
+    void reply() { heard = true; }   // (a reply read: on time, or a late one that came after all)
+    /// a sent request's reply on time or late: Idle = this late one began an idle spell, Silent = and none came since
+    /// the last one (give the link up)
+    int seen(bool late) {
+        bits = bits << 1 | (late ? 1u : 0u);
+        int n = 0;
+        for (uint64_t b = bits; b != 0; b &= b - 1) ++n;
+        if (n < 8) return On;
+        const bool silent = spell && !heard;
+        bits = 0;
+        left = hold;
+        spell = true;
+        heard = false;
+        return silent ? Silent : Idle;
+    }
+};
+
+/// DS4_RX_PREWAKE: when a prompt's wake request is due (serve_lane sends it, Main::prewake).  A GPU that idled through
+/// a long prompt is slow to wake (the 3080: ~22 ms on its first request after ~20 s) and that stall made the decode's
+/// first replies late, 8 of 64 - rx::Backoff idled the link for the next `hold` requests.  The wake's own request
+/// takes the stall shortly before the decode.  Once a feed (arm at its start): when its last unit starts (a
+/// layer-major run's last layer, a window prompt's last window - units short against the lead), or the last step's
+/// pace leaves lead_ms or less (a chunked run's chunks: the pace alone, a chunk may take long); and at a chunked run's
+/// end whether due before or not (run_end).  The lane sends them as WakeSeries spaces them
+struct PreWake {
+    double lead_ms = 1000.0;
+    bool armed = false;
+    double t_step = 0.0, d_step = 0.0, ms_unit = -1.0;   // (the last step: when, the units done then; ms a unit, -1 none)
+    void arm(double now) {
+        armed = true;
+        t_step = now;
+        d_step = 0.0;
+        ms_unit = -1.0;
+    }
+    /// `done` of `total` units at `now` (`last`: the last unit has started): true once an arm, when the wake is due
+    bool due(double now, double done, double total, bool last) {
+        if (!armed) return false;
+        if (done > d_step) {   // (a step: its pace, ms a unit)
+            ms_unit = (now - t_step) / (done - d_step);
+            t_step = now;
+            d_step = done;
+        }
+        const bool soon = ms_unit >= 0.0 && ms_unit * (total - done) - (now - t_step) <= lead_ms;
+        if (!last && done < total && !soon) return false;
+        armed = false;
+        return true;
+    }
+    /// a chunked run's chunks: the pace alone decides (its last chunk may take longer than the series lasts)
+    bool chunk_due(double now, double done, double total) { return due(now, done, total, false); }
+    /// a chunked run's end: due, armed or not - a wake sent earlier in the run may be the series' last long before it
+    /// (WakeSeries keeps the two apart by its gap)
+    bool run_end() {
+        armed = false;
+        return true;
+    }
+};
+
+/// DS4_RX_PREWAKE, serve_lane's side: a due wake goes out at once unless one went out less than gap_ms ago, then again
+/// each gap_ms until the lane's next request, kReps a go() at most - the settle after a run does not use the lead
+/// up, and a feed's wake that comes sooner waits for the gap.  Feeds of 16 tokens (--prefill-chunk 0), whose windows
+/// send the server nothing, keep it warm with about one wake a gap through the whole prompt: the point, at one 1-row
+/// request a gap
+struct WakeSeries {
+    static constexpr int kReps = 8;
+    double gap_ms = 1000.0;
+    bool on = false;
+    int reps = 0;
+    double sent = -1.0;   // (the last wake's send, steady ms; -1 none)
+    void go() {
+        on = true;
+        reps = 0;
+    }
+    /// a wake to send now
+    bool send_now(double now) const { return on && (sent < 0.0 || now - sent >= gap_ms); }
+    /// it went out at now (or there was none to send: stop)
+    void sent_at(double now) {
+        sent = now;
+        if (++reps >= kReps) on = false;
+    }
+    void stop() { on = false; }   // (the lane's next request, or no expert to name)
+};
+
+uint16_t f2bf(float f);   // round to nearest even (NaN kept a NaN)
+float bf2f(uint16_t h);
+double now_ms();          // steady clock
+void relax();             // a spin-wait's pause
+
+/// One TCP connection, either end.  Sends block (a full socket buffer waits for room); receives poll the socket
+/// (non-blocking) until a whole message is in, spinning while bytes came or went in the last kSpinMs (a link that has
+/// gone quiet waits in poll, so an idle server does not burn a core), until a deadline.
+class Conn {
+public:
+    Conn() = default;
+    ~Conn();
+    Conn(const Conn&) = delete;
+    Conn& operator=(const Conn&) = delete;
+    /// HOST:PORT; false (err) when it does not connect within timeout_s
+    bool dial(const std::string& host_port, int timeout_s, std::string& err);
+    /// [BIND:]PORT: listen, take the first connection within wait_s, stop listening
+    bool listen_accept(const std::string& at, int wait_s, std::string& err);
+    void close();
+    bool ok() const { return fd_ >= 0; }
+    bool send(uint32_t type, uint32_t seq, int32_t a, int32_t b, int32_t c, const void* p, size_t n, std::string& err,
+              const void* p2 = nullptr, size_t n2 = 0);
+    /// 1: a whole message in h / payload; 0: none by deadline (steady ms; < 0: no deadline); -1: the link failed (err)
+    int recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::string& err);
+    std::string peer() const { return peer_; }
+    /// the last message recv gave: when the kernel took in the read that completed it (steady ms; SO_TIMESTAMPNS,
+    /// Linux), -1 where the kernel says nothing (Windows)
+    double arrival_ms() const { return arrival_; }
+    /// when a message last went out (steady ms; 0: none yet)
+    double last_out_ms() const { return last_out_; }
+    uint64_t bytes_out = 0, bytes_in = 0;
+    uint64_t polls = 0;       // receives' waits in poll (quiet past kSpinMs)
+    uint64_t quickacks = 0;   // reads followed by TCP_QUICKACK (Linux: the peer's next send is not held for our ACK)
+
+private:
+    bool send_raw_(const void* p, size_t n, std::string& err);
+    std::intptr_t fd_ = -1;
+    std::string peer_;
+    std::vector<uint8_t> rb_;   // bytes read, not yet a whole message
+    double last_in_ = 0;        // when bytes last came in (steady ms)
+    double last_out_ = 0;       // when a message last went out
+    double in_at_ = -1, arrival_ = -1;   // the kernel's time of the last read; of the last message's
+};
+
+/// The main process's end: the server's hello, the geometry and blobs, then requests and their replies.
+class Main {
+public:
+    /// listen at `at` ([BIND:]PORT) for wait_s seconds; check the server's hello, send ours
+    bool accept(const std::string& at, const std::string& token, int wait_s, std::string& err);
+    uint64_t room() const { return peer_hello_.room; }
+    int lo() const { return peer_hello_.lo; }   // (the lowest k of the server's slice picks; 0: it has no parts)
+    int lane_threads() const { return peer_hello_.lane_threads; }
+    std::string name() const { return std::string(peer_hello_.name, strnlen_(peer_hello_.name, sizeof peer_hello_.name)); }
+    std::string peer() const { return c_.peer(); }
+    bool send_geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& err);
+    /// false (err) also when the server refused at the Geo: its Error, looked for before each blob ("expert server:
+    /// " and the reason), or the link it closed then - the blobs stop there, not after all of them
+    bool send_blob(int layer, int e, const void* blob, size_t bytes, std::string& err);
+    /// the end of the blobs (`gpu`: the experts this end's GPU computes, layer << 16 | expert - none of W): the server's
+    /// ok[] (one a blob sent, in order); its W after them in pool()
+    bool end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err,
+                   const std::vector<uint32_t>& gpu = {});
+    /// the server's W (layer << 16 | expert: the pool's experts it computes whole on its CPU lane; empty: none)
+    const std::vector<uint32_t>& pool() const { return pool_; }
+    /// rows[j] and its x (n_embd floats, sent as bf16); c: the slice picks' k and flags (kReqK)
+    bool send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, const float* const* x, std::string& err,
+                  int32_t c = 0);
+    /// request seq's reply: 1 and its rows (sets x nrows x n_embd bf16, valid until the next call; sets 2: a kReqSets
+    /// request's) in *y, the server's time in srv_us (its CPU lane's in *lane_us); 0: not in by the deadline (steady
+    /// ms; it is skipped when it comes); -1: the link failed (err)
+    int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err,
+                  int sets = 1, int* lane_us = nullptr);
+    /// the last wait_resp's 0 was the server's Stale for it (an expert mid-fill), not a deadline
+    bool last_stale() const { return stale_; }
+    uint64_t stales = 0;   // Stale replies seen (the awaited request's and late ones')
+    /// fills (protocol 3): the server is to dial `port` on this end's host with `session`
+    bool bulk_hello(int port, uint64_t session, std::string& err);
+    /// the last reply's arrival in the kernel (Conn::arrival_ms: steady ms, -1 unknown)
+    double arrival_ms() const { return c_.arrival_ms(); }
+    /// the replies wait_resp skipped since the last call (late ones, their picks computed here): seq and the kernel's
+    /// arrival time (steady ms, -1 unknown), for the round trip they had
+    std::vector<std::pair<uint32_t, double>> take_late() {
+        std::vector<std::pair<uint32_t, double>> v;
+        v.swap(late_);
+        return v;
+    }
+    /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed); the Pong's a, b, c
+    /// in pong[0..2] (the server's Wakes taken, waits in poll, pinned CPU) when given
+    int ping(uint32_t seq, size_t bytes, double deadline, std::string& err, int32_t* pong = nullptr);
+    /// a window starts: a Wake when nothing went out for kWakeQuietMs (the server's spin may have run out); true if sent
+    bool wake(std::string& err);
+    uint64_t wakes = 0;   // Wakes sent
+    /// DS4_RX_PREWAKE: a request of one row (row and its x: a held expert) under a seq of its own (kPrewakeSeq; in
+    /// *seq): its reply - or its Stale - never reaches a wait's result, take_late or stales; take_woke has it.  (Only
+    /// the last 64 wakes out are matched: an older one's reply, never seen with a server that answers in order, would
+    /// be a late one's)
+    bool prewake(int layer, const ReqRow& row, const float* x, std::string& err, uint32_t* seq = nullptr);
+    /// a wake's reply read: its seq, when it went out and came in, the server's time
+    struct Woke {
+        uint32_t seq = 0;
+        double sent = 0.0, in = -1.0, read = 0.0;   // (steady ms: the send; the kernel's arrival, -1 unknown; the read)
+        int srv_us = -1;                            // (the server's time; -1: its Stale - no GPU work)
+        int layer = 0, e = 0;
+    };
+    /// the wakes' replies read since the last call
+    std::vector<Woke> take_woke() {
+        std::vector<Woke> v;
+        v.swap(woke_);
+        return v;
+    }
+    /// a wake's reply still to come
+    bool prewake_out() const { return !wk_out_.empty(); }
+    /// while a wake is out: what is in already, without a wait (the wakes' into take_woke, a late request's into
+    /// take_late, a Stale counted - as wait_resp takes them); 0, or -1: the link failed (err)
+    int poll_wake(std::string& err);
+    uint64_t prewakes = 0;   // wake requests sent
+    void close() { c_.close(); }
+    bool ok() const { return c_.ok(); }
+    uint64_t bytes_out() const { return c_.bytes_out; }
+    uint64_t bytes_in() const { return c_.bytes_in; }
+    uint64_t polls() const { return c_.polls; }   // (this end's receives' waits in poll)
+
+private:
+    static size_t strnlen_(const char* s, size_t n) {
+        size_t i = 0;
+        while (i < n && s[i] != '\0') ++i;
+        return i;
+    }
+    bool took_wake_(const Hdr& h);   // (a Resp or Stale for a wake still out: into woke_)
+    Conn c_;
+    HelloMsg peer_hello_;
+    int n_embd_ = 0;
+    std::vector<uint8_t> tx_, rx_;
+    std::vector<std::pair<uint32_t, double>> late_;   // (take_late)
+    struct WakeOut {
+        uint32_t seq;
+        double sent;
+        int layer, e;
+    };
+    std::vector<WakeOut> wk_out_;   // (the wakes out, oldest first: 64 at most)
+    std::vector<Woke> woke_;        // (take_woke)
+    uint32_t wk_n_ = 0;
+    std::vector<uint32_t> pool_;
+    std::vector<uint16_t> xb_;
+    bool stale_ = false;
+};
+
+/// The expert server (--expert-server-connect): dials `host_port` (again each second until a main process takes it),
+/// serves it until it goes away, frees the blobs, dials again (once: return after one main process).  GPU `dev`, VRAM
+/// free less reserve_mib for blobs.  parts_dir (--expert-server-parts; empty: none): the parts pack its CPU lane takes
+/// slice picks from (ds4_rx_lane.hpp SliceServer).  Returns nonzero on a CUDA error, or parts it cannot open.
+int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once,
+          const std::string& parts_dir = "");
+/// tests (--expert-server-cpu): the same server with the CPU lane's arithmetic (ds4_iq_cpu.cpp, the i-quant types) in
+/// place of a GPU, the blobs in RAM (room: DS4_RX_CPU_ROOM_MIB, 2048)
+int serve_cpu(const std::string& host_port, const std::string& token, bool once, const std::string& parts_dir = "");
+
+/// Either server's parts.  serve_loop: dial `host_port` (again each second until a main process takes it), run
+/// `session` on the connection (0: the main went away; < 0: an error, returned as 1), again unless `once`; the calling
+/// thread on link_cpu() meanwhile (its mask restored at the return).  serve_next: the next request (1, in h / p),
+/// answering Pings and taking Wakes on the way (the counts in *wakes); -1: the link went (err).  bulk: a BulkHello is
+/// returned too (a server that takes fills), else dropped (the main's wait for the fills' socket times out)
+int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg);
+int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err,
+               bool bulk = false);
+/// A server's refusal at the Geo: the Error with `why`, then whatever the main still sends read and dropped until it
+/// closes the link (it stops at the Error: Main::send_blob), sends its BlobsEnd (a main that does not look: the Error is
+/// its answer), or is silent for 30 s - closed at once, the unread blobs would reset the link and the main's send
+/// would lose the reason.
+void refuse_at_geo(Conn& c, const std::string& why);
+
+}  // namespace strata::ds4::rx

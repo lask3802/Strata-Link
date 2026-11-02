@@ -1731,9 +1731,15 @@ int serve_stage(const std::string& bind_addr, int port, std::shared_ptr<TlsCrede
                     }
                     cv.notify_all();
                 }
-                std::fprintf(stderr, "strata stage worker: main process %s (%s): layers %d.. here, context %lld, chunk %lld, "
-                             "rows %s\n", host.c_str(), link.tls->peer().c_str(), in.hello.layer_begin,
-                             (long long) in.hello.max_context, (long long) in.hello.chunk, stage_rows_name(fmt));
+                if (buf.engine_rows != nullptr)
+                    std::fprintf(stderr, "strata stage worker: main process %s (%s): layers %d.. here, context %lld, chunk "
+                                 "%lld, link rows %s (%s)\n", host.c_str(), link.tls->peer().c_str(), in.hello.layer_begin,
+                                 (long long) in.hello.max_context, (long long) in.hello.chunk, stage_rows_name(fmt),
+                                 buf.engine_rows);
+                else
+                    std::fprintf(stderr, "strata stage worker: main process %s (%s): layers %d.. here, context %lld, chunk "
+                                 "%lld, rows %s\n", host.c_str(), link.tls->peer().c_str(), in.hello.layer_begin,
+                                 (long long) in.hello.max_context, (long long) in.hello.chunk, stage_rows_name(fmt));
                 if ((in.hello.row_formats & kStageCapKvElem) == 0 && (mine.row_formats & kStageCapKvElem) != 0)
                     std::fprintf(stderr, "strata stage worker: main process %s: its hello predates the K/V element "
                                  "check: --kv must match by hand\n", host.c_str());
