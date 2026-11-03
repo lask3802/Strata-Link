@@ -146,6 +146,8 @@ class Decisions(unittest.TestCase):
         self.assertFalse(drafting.blocked_by([], split=True), "a layer split over several cards runs DFlash2 (owner 2026-11-02; the 0.1.56 engine does)")
         self.assertFalse(drafting.blocked_by(["--layer-split", "auto"]))
         self.assertFalse(drafting.blocked_by(["--spec", "4"], slots=1))
+        # Strata Link: a remote stage keeps the MTP (the worker's layers have no DFlash2 taps in this process)
+        self.assertTrue(drafting.blocked_by(["--layer-split", "20", "--split-device", "0", "--remote-stage", "10.10.10.2:7841"]))
 
     def test_dflash2_is_for_qwen38_flash_next_only(self):
         self.ready()

@@ -536,9 +536,11 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0) -> bool:
     default only for a layer split whose slots run as one group and are opt-in on one card, so the MTP's ``--batch-mtp`` is the measured choice there) or
     ``--pipeline-windows``. A layer split over several cards is NOT in the list any more (owner, 2026-11-02: the 0.1.56 engine runs ``--draft dflash2
     --draft-fallback none`` on a layer split, one request at a time; paired decode 1.014 against the MTP, CI 0.994-1.033, 2 x RTX PRO 6000, RESULTS-DF2MGPU.md):
-    ``split`` and a ``--layer-split`` argument are accepted and ignored so the callers keep working. The caller says what it adds later (``slots``); the arguments are looked at too."""
+    ``split`` and a ``--layer-split`` argument are accepted and ignored so the callers keep working. The caller says what it adds later (``slots``); the arguments are looked at too.
+    Strata Link: a remote stage (``--remote-stage``, layers on another PC) is in the list: DFlash2 drafts from taps on every stage, and the worker's layers have
+    none in this process, so the engine would end after the whole load (``--draft-fallback none``) and start again on the MTP."""
     items = [str(a) for a in args or []]
-    return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
+    return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel", "--remote-stage")))
 
 
 def mtp_ready(args: list[Any]) -> bool | None:
