@@ -130,7 +130,8 @@ class ExpertsLogTest(LogCase):
         """Line by line and scanned: the backoff's line is a late reply and the link stays; the loss that follows it is a
         loss, not a late reply."""
         filler = "ds4: expert cache: settle 1 (one a prompt with the expert server)\n"
-        body = DS_STARTED + DS_LOAD + DS_SERVER + DS_PROMPT * 2 + DS_BACKOFF + DS_PROMPT * 3
+        head = filler * (stages.HEAD_MAX // len(filler) + 100)        # past the run's head: the lines after it scanned
+        body = DS_STARTED + DS_LOAD + head + DS_SERVER + DS_PROMPT * 2 + DS_BACKOFF + DS_PROMPT * 3
         for scanned in (False, True):
             with self.subTest(scanned=scanned):
                 Path(self.log).write_text("", encoding="utf-8")
@@ -146,13 +147,13 @@ class ExpertsLogTest(LogCase):
                 self.assertIn("no reply at all", w["error"]["text"])
 
     def test_a_scan_across_chunks_and_looks_agrees_with_reading_line_by_line(self):
-        """Events on both sides of the 8 MiB chunks, lines cut by a chunk's end, and a scan budget (SCAN_MAX) spent over
-        several looks: the same facts as a log read line by line."""
+        """Events over a 12 MiB log and a scan budget (SCAN_MAX) spent over several looks: the same facts as a log read
+        line by line (a line cut by a chunk's end: the next test)."""
         from unittest import mock
         fill = "ds4: expert cache: settle 1 (one a prompt with the expert server) " + "x" * 937 + "\n"   # 1000 bytes
         parts = [DS_STARTED, DS_LOAD, DS_SERVER, DS_PROMPT * 4]
         for i in range(12):                                        # ~1 MiB between events: 12 MiB, a chunk end inside lines
-            parts += [fill * (1 << 10) + "y" * (i * 37), "\n", DS_PROMPT * (i + 1), DS_LATE if i % 4 == 1 else ""]
+            parts += [fill * (1 << 10) + "y" * (i * 37), "\n", DS_PROMPT * (i + 1), DS_LATE if i % 4 == 1 or i == 10 else ""]
             if i == 6:
                 parts += [DS_BACKOFF]
             if i == 9:
@@ -175,8 +176,54 @@ class ExpertsLogTest(LogCase):
             mon = stages.StageMonitor()
             mon.agents_cfg = False
             scanned = facts(mon, ds_engine(self.tok, self.log))
-        self.assertEqual(whole, ("connected", 1, 11 + 12 + 2, 1, 1278))   # i == 9's prompts and late come before its start
+        self.assertEqual(whole, ("connected", 1, 11 + 12 + 2, 2, 1278))   # i == 9's prompts and late come before its start
         self.assertEqual(scanned, whole)
+
+    def test_lines_cut_by_a_scan_chunks_end(self):
+        """Each kind of line the scan counts or replays, cut by the end of its first 8 MiB chunk (carried into the next
+        one), LF and CRLF: the same facts as the log read line by line."""
+        from unittest import mock
+        fill = "ds4: expert cache: settle 1 (one a prompt with the expert server) " + "x" * 937 + "\n"   # 1000 bytes
+        before = DS_STARTED + DS_LOAD + DS_SERVER + DS_PROMPT * 2 + fill * (7 << 10)
+        restart = DS_STARTED + DS_LOAD + DS_SERVER.replace("1278", "1200")
+        cases = {   # the lines, where the cut falls in them, the facts read line by line
+            "prompt": (DS_PROMPT, len(DS_PROMPT) // 2, ("connected", 0, 3, 0, 1278)),
+            "late": (DS_LATE, len(DS_LATE) // 2, ("connected", 0, 2, 1, 1278)),
+            "backoff": (DS_BACKOFF + DS_PROMPT, len(DS_BACKOFF) // 2, ("connected", 0, 3, 1, 1278)),
+            "lost": (DS_LOST + DS_PROMPT, len(DS_LOST) // 2, ("down", 0, 2, 0, 1278)),
+            "lost64": (DS_LOST64 + DS_PROMPT, len(DS_LOST64) // 2, ("down", 0, 2, 0, 1278)),
+            "start": (restart + DS_PROMPT, len(DS_STARTED) // 2, ("connected", 1, 1, 0, 1200)),
+        }
+
+        def facts(mon, e):
+            for _ in range(20):
+                v = mon.view(e)
+                if not v["provisional"]:
+                    w = v["workers"][0]
+                    return w["state"], w["reconnects"], w["experts"]["requests"], w["experts"]["late"], w["experts"]["held"]
+            raise AssertionError("the scan did not catch up")
+        for name, (text, at, want) in cases.items():
+            for crlf in (False, True):
+                with self.subTest(name=name, crlf=crlf):
+                    def b(s):
+                        return (s.replace("\n", "\r\n") if crlf else s).encode()
+                    lead = b(before)
+                    cut = lead[:stages.HEAD_MAX].rfind(b"\n") + 1 + (8 << 20)   # the scan begins after the run's head
+                    at_b = len(b(text[:at]))
+                    pad = cut - len(lead) - at_b - len(b("\n"))
+                    self.assertGreater(pad, 0)
+                    data = lead + b"z" * pad + b("\n") + b(text) + b(fill * (2 << 10))   # 2 MiB after: past READ_MAX
+                    self.assertEqual(data[cut - at_b:cut - at_b + 16], b(text)[:16])       # the line straddles the cut
+                    Path(self.log).write_bytes(data)
+                    with mock.patch.object(stages, "READ_MAX", 1 << 40):
+                        mon = stages.StageMonitor()
+                        mon.agents_cfg = False
+                        whole = facts(mon, ds_engine(self.tok, self.log))
+                    mon = stages.StageMonitor()
+                    mon.agents_cfg = False
+                    scanned = facts(mon, ds_engine(self.tok, self.log))
+                    self.assertEqual(whole, want)
+                    self.assertEqual(scanned, whole)
 
     def test_fills_off_and_none_held(self):
         mon = stages.StageMonitor()
