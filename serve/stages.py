@@ -155,7 +155,14 @@ class MainLog:
                   "rx_up": b" in the server's VRAM, uploaded in ", "rx_warm": b" warm-up requests of 1 row: round trip ",
                   "rx_fon": b"ds4: remote experts: fills on (", "rx_foff": b"ds4: remote experts: fills off (",
                   "rx_nofill": b"ds4: remote experts: no fills (", "rx_lost": b" - the CPU lane computes all its experts",
-                  "rx_none": b"ds4: remote experts: none held"})
+                  "rx_none": b"ds4: remote experts: none held",
+                  "rx_late": b"ds4: remote experts: a reply past its deadline",
+                  "rx_late64": b"ds4: remote experts: 8 of the last 64 replies past the link's bound"})
+    # a scan's order of the expert server's events (scan): a start, the server taken, the link given up, a request served,
+    # a late-reply line
+    RX_SEQ = re.compile(rb"\n\[strata\][^\n]*" + re.escape(STARTED.encode()) + rb"|GB of VRAM for experts\): sending "
+                        rb"| - the CPU lane computes all its experts|\nmaya ds4 serve: prompt "
+                        rb"|ds4: remote experts: (?:a reply past its deadline|8 of the last 64 replies past the link's bound)")
     FINGERPRINT = 64       # the log's first bytes: other ones at a later look, a log rotated (though not shorter)
 
     def __init__(self):
@@ -280,8 +287,11 @@ class MainLog:
         """The whole lines from byte a to b, scanned (see the class): the bytes scanned, up to the last line end."""
         f.seek(a)
         pos, left, carry, last = a, b - a, b"", {}
-        served = 0                                      # the requests after the last start scanned (the expert server's)
-        prompt = self.PROMPT.encode()
+        # the expert server's counts, in the log's order: the requests while its link was up and the late-reply lines,
+        # both from the last start scanned on (a start: from 0; none: added to what this run has)
+        rx = self.state["rx"]
+        up = bool(rx and rx["server"] and not rx["lost"])
+        served = late = 0
         while left > 0:
             chunk = f.read(min(left, 8 << 20))
             if not chunk:
@@ -304,9 +314,18 @@ class MainLog:
                 self.state["runs"] += 1
             if m:
                 last["start"] = self.line_at(buf, m.start() + 1, base)
-                served = buf.count(prompt, m.end(), end)
-            else:
-                served += buf.count(prompt, 0, end)
+            for m in self.RX_SEQ.finditer(buf, 0, end):
+                k = m[0]
+                if k.startswith(b"\n["):
+                    up, served, late = False, 0, 0
+                elif k.startswith(b"GB of VRAM"):
+                    up = True
+                elif k.startswith(b" - the CPU lane"):
+                    up = False
+                elif k.startswith(b"\nmaya"):
+                    served += up
+                else:
+                    late += 1
             m = None
             for m in self.ERRORS.finditer(buf, 0, end):
                 pass
@@ -317,8 +336,9 @@ class MainLog:
         for at, line in sorted(last.values()):         # in the log's order
             self.event(line, at, now, count=False)
         rx = self.state["rx"]
-        if rx and rx["server"] and not rx["lost"]:     # (a scanned part: all of its requests, none when the link is lost by its end)
+        if rx:
             rx["requests"] += served
+            rx["late"] += late
         return pos - a
 
     def feed(self, data: bytes, base: int) -> None:
@@ -654,8 +674,9 @@ class StageMonitor:
             return None
         with self.lock:
             a = self.agents.get(addr)
-            if a is None or a.url != agent_url(url):
-                a = self.agents[addr] = Agent(url, None if expert_server else port_of(addr))
+            port = None if expert_server else port_of(addr)   # (an expert server's agent: no log; a worker's: its port's)
+            if a is None or a.url != agent_url(url) or a.port != port:
+                a = self.agents[addr] = Agent(url, port)
             return a
 
     def ask_agents(self, chain: list[str], keys: str, expert_server: bool = False) -> None:

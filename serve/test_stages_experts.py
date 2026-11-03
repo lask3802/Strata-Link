@@ -154,6 +154,20 @@ class ExpertsLogTest(LogCase):
         self.assertEqual((w["state"], w["reconnects"], w["experts"]["held"]), ("connected", 1, 1278))
         self.assertEqual(w["experts"]["requests"], 6)               # the second run's: 5 scanned and 1 read
 
+    def test_a_scan_counts_in_the_log_s_order(self):
+        """A scanned part with the server taken, requests, late replies and then the link given up: the requests before
+        the loss count, the ones after it do not, and the late-reply lines are counted with the last one's text."""
+        mon = stages.StageMonitor()
+        mon.agents_cfg = False
+        e = ds_engine(self.tok, self.log)
+        filler = "ds4: expert cache: settle 1 (one a prompt with the expert server)\n"
+        n = stages.READ_MAX // len(filler) + 100
+        self.append(DS_STARTED + DS_LOAD + DS_SERVER + DS_PROMPT * 3 + DS_LATE * 2 + DS_LOST + DS_PROMPT * 4 + filler * n)
+        w = mon.view(e)["workers"][0]
+        self.assertEqual(w["state"], "down")
+        self.assertEqual((w["experts"]["requests"], w["experts"]["late"]), (3, 2))
+        self.assertIn("layer 35", w["experts"]["late_note"]["text"])
+
 
 class ExpertsAgentTest(LogCase):
     """The server PC's node agent: its /info gives the VRAM; its /log is never asked (it does not run the server)."""
@@ -184,6 +198,19 @@ class ExpertsAgentTest(LogCase):
         self.assertEqual(w["state"], "connected")                   # (the agent runs no worker: not "down" for it)
         self.assertEqual(asked, [])                                 # no /log of a port
         self.assertNotIn("PRIVATE KEY", json.dumps(v))
+
+    def test_one_pc_as_a_worker_then_as_an_expert_server_and_back(self):
+        """The same address asked as a stage worker (its log by port) and as an expert server (no log): each its own
+        agent, whichever came first."""
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": "https://127.0.0.1:9"}
+        a = mon.agent_for("10.10.10.2:7841")
+        self.assertEqual(a.port, 7841)
+        b = mon.agent_for("10.10.10.2:7841", expert_server=True)
+        self.assertIsNone(b.port)
+        c = mon.agent_for("10.10.10.2:7841")
+        self.assertEqual(c.port, 7841)
+        self.assertIsNot(c, b)
 
     def test_an_agent_that_does_not_answer(self):
         self.append(DS_STARTED + DS_LOAD + DS_SERVER)
@@ -221,17 +248,43 @@ class ExpertsCardPage(unittest.TestCase):
             "const el = (id) => els[id] || (els[id] = {id, hidden: false, innerHTML: '', textContent: '', dataset: {}});\n"
             "const $ = el;\n"
             f"el('wk-head').innerHTML = {json.dumps(head)};\n"
-            "const fmt = (n, d = 0) => (n == null ? '–' : Number(n).toFixed(d));\n"
-            "const gb = (b, d = 1) => (b / 1073741824).toFixed(d);\n"
-            "const esc = (s) => String(s).replace(/[&<>\"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;'})[c]);\n"
+            # the page's own esc / fmt / gb (its first lines), in the en-US locale (fmt's toLocaleString)
+            + "".join(line + "\n" for line in js.splitlines()
+                      if line.startswith(("const esc = ", "const fmt = ", "const gb = "))) +
             "const icon = () => '';\n"
             f"{block}\n"
             "const out = [];\n"
             f"for (const v of {json.dumps(views)}) {{ renderWorkers(v); out.push({{hidden: el('wk-card').hidden, head: el('wk-head').innerHTML, "
             "body: el('wk-body').innerHTML, sum: el('wk-sum').textContent, note: el('wk-note').textContent}); }\n"
             "console.log(JSON.stringify(out));")
-        done = subprocess.run([NODE, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
+        done = subprocess.run([NODE, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=60, check=True,
+                              env={**os.environ, "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"})
         return json.loads(done.stdout)
+
+    def test_untrusted_strings_are_escaped(self):
+        """The GPU's name and the engine's reasons come from another PC and the log: never markup on the page."""
+        tok = ByteTokenizer()
+        bad = '<img src=x onerror="alert(1)">'
+        with LogDir() as d:
+            Path(d.log).write_text(DS_STARTED + DS_LOAD + DS_SERVER.replace("NVIDIA GeForce RTX 3080", bad)
+                                   + DS_LOST.replace("receive failed", "<script>alert(2)</script>"), encoding="utf-8")
+            mon = stages.StageMonitor()
+            mon.agents_cfg = False
+            (a,) = self.render([mon.view(ds_engine(tok, d.log))])
+        self.assertNotIn("<img", a["body"])
+        self.assertNotIn("<script", a["body"])
+        self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", a["body"])
+        self.assertIn("&lt;script&gt;alert(2)&lt;/script&gt;", a["body"])
+        self.assertIn("Down", a["body"])
+
+    def test_a_card_still_counting_says_at_least(self):
+        v = {"kind": "experts", "listen": "0.0.0.0:27861", "provisional": True, "agents": False, "workers": [
+            {"address": "10.10.10.2", "listen": "0.0.0.0:27861", "state": "connected", "gpu": {"name": "GPU"},
+             "reconnects": 2, "round_trip_ms": None, "since": None, "error": None,
+             "experts": {"held": 5, "lane": 9, "requests": 1234, "late": 3, "fills": True}}]}
+        (a,) = self.render([v])
+        for want in ("≥ 2", "≥ 1,234", "≥ 3", "catching up"):
+            self.assertIn(want, a["body"], want)
 
     def test_experts_then_a_stage_then_nothing(self):
         tok = ByteTokenizer()
@@ -246,11 +299,12 @@ class ExpertsCardPage(unittest.TestCase):
         self.assertFalse(a["hidden"])
         self.assertIn("Expert server", a["head"])
         self.assertIn("Experts held", a["head"])
-        for want in ("NVIDIA GeForce RTX 3080", "10.10.10.2", "1278", "9.57 GB", "23.0% of routings", "Connected",
-                     "0.15 ms", ">2<", ">On<", ">1<"):
+        for want in ("NVIDIA GeForce RTX 3080", "10.10.10.2", "1,278", "9.57 GB", "23.0% of routings", "Connected",
+                     "0.16 ms", ">2<", ">On<", ">1<"):
             self.assertIn(want, a["body"], want)
+        self.assertNotIn("≥", a["body"])                           # (a log read whole: the counts are not lower bounds)
         self.assertIn("listening on 0.0.0.0:27861", a["sum"])
-        self.assertIn("1278 of the lane's 15039 experts", a["sum"])
+        self.assertIn("1,278 of the lane's 15,039 experts", a["sum"])
         self.assertIn("stage_agents", a["note"])
         # the remote stage's card as it was: its own header, layers, link
         self.assertIn("<th>Layers</th>", b["head"])

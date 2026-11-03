@@ -402,6 +402,8 @@ let wkStageHead = null;
 function renderExperts(s) {
   const ws = s.workers || [];
   const ms = (v) => (v == null ? "–" : `${fmt(v, 2)} ms`);
+  // a long log still being read: its counts so far are lower bounds (as the stage's Reconnects column says)
+  const atLeast = (v) => (s.provisional && v != null ? `<span title="Still counting: the log is read on at each look">≥ ${fmt(v)}</span>` : fmt(v));
   $("wk-body").innerHTML = ws.map((w) => {
     const [cls, text, tip] = WK_STATE[w.state] || WK_STATE.unknown;
     const x = w.experts || {};
@@ -417,12 +419,12 @@ function renderExperts(s) {
       <td><span class="wk-name">${esc(name)}</span>${where ? `<span class="muted small wk-sub">${esc(where)}</span>` : ""}</td>
       <td class="num">${held}</td>
       <td><span class="st-badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}${s.provisional ? `<span class="muted small wk-sub" title="The log is still being read: this state is as of the part read so far">catching up</span>` : ""}</td>
-      <td class="num">${fmt(w.reconnects)}</td>
+      <td class="num">${atLeast(w.reconnects)}</td>
       <td class="num">${ms(w.round_trip_ms)}</td>
-      <td class="num">${x.requests == null ? "–" : fmt(x.requests)}</td>
+      <td class="num">${x.requests == null ? "–" : atLeast(x.requests)}</td>
       <td>${vram}${g.vram_mib ? `<div class="st-progress"${vpct > 95 ? ' data-tone="danger"' : ""}><div class="st-progress__bar" style="width:${vpct}%"></div></div>` : ""}</td>
       <td>${fills}</td>
-      <td class="num"${late}>${fmt(x.late || 0)}</td></tr>`;
+      <td class="num"${late}>${atLeast(x.late || 0)}</td></tr>`;
     const err = w.error ? `<tr class="wk-err"><td colspan="9"><div class="wk-err__text">${icon("error", "st-icon st-icon--sm")}<span>${esc(clock(w.error.at))}${w.error.at ? " · " : ""}${esc(w.error.text || "")}</span></div></td></tr>` : "";
     return row + err;
   }).join("") || `<tr><td colspan="9" class="muted">No expert server yet</td></tr>`;
