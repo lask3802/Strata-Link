@@ -14164,7 +14164,7 @@ int main(int argc, char** argv) {
                     for (const PfPart& p : pf_parts) {
                         if (p.first < 0) continue;
                         const int64_t need = part_slots(p, want);
-                        if (need <= 0 || need + 128 > p.cache->slots()) return false;
+                        if (need <= 0 || need + g_lend_keep > p.cache->slots()) return false;   // (lend()'s keep)
                     }
                     return want >= tokens;
                 };
