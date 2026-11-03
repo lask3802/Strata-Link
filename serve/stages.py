@@ -154,15 +154,19 @@ class MainLog:
     MARKS.update({"rx_wait": b"ds4: remote experts: waiting up to ", "rx_server": b"GB of VRAM for experts): sending ",
                   "rx_up": b" in the server's VRAM, uploaded in ", "rx_warm": b" warm-up requests of 1 row: round trip ",
                   "rx_fon": b"ds4: remote experts: fills on (", "rx_foff": b"ds4: remote experts: fills off (",
-                  "rx_nofill": b"ds4: remote experts: no fills (", "rx_lost": b" - the CPU lane computes all its experts",
+                  "rx_nofill": b"ds4: remote experts: no fills (",
+                  # the link given up (or never made) ends its line there; the backoff's "... for the next N requests,
+                  # then the link is tried again" is a late-reply line, not a loss
+                  "rx_lost": b" - the CPU lane computes all its experts\n",
+                  "rx_lost_crlf": b" - the CPU lane computes all its experts\r\n",
+                  "rx_lost_now": b" - the CPU lane computes all its experts from now on",
                   "rx_none": b"ds4: remote experts: none held",
                   "rx_late": b"ds4: remote experts: a reply past its deadline",
-                  "rx_late64": b"ds4: remote experts: 8 of the last 64 replies past the link's bound"})
-    # a scan's order of the expert server's events (scan): a start, the server taken, the link given up, a request served,
-    # a late-reply line
-    RX_SEQ = re.compile(rb"\n\[strata\][^\n]*" + re.escape(STARTED.encode()) + rb"|GB of VRAM for experts\): sending "
-                        rb"| - the CPU lane computes all its experts|\nmaya ds4 serve: prompt "
-                        rb"|ds4: remote experts: (?:a reply past its deadline|8 of the last 64 replies past the link's bound)")
+                  "rx_late64": b"ds4: remote experts: 8 of the last 64 replies past the link's bound ("})
+    # a scan's order of the expert server's events (scan): a start, a request served, and each "ds4: remote experts: "
+    # line whole - told apart by rx_event's own patterns (a loss before a late reply, as there)
+    RX_SEQ = re.compile(rb"\n\[strata\][^\n]*" + re.escape(STARTED.encode()) + rb"|\nmaya ds4 serve: prompt "
+                        rb"|\nds4: remote experts: [^\n]*")
     FINGERPRINT = 64       # the log's first bytes: other ones at a later look, a log rotated (though not shorter)
 
     def __init__(self):
@@ -318,14 +322,16 @@ class MainLog:
                 k = m[0]
                 if k.startswith(b"\n["):
                     up, served, late = False, 0, 0
-                elif k.startswith(b"GB of VRAM"):
-                    up = True
-                elif k.startswith(b" - the CPU lane"):
-                    up = False
                 elif k.startswith(b"\nmaya"):
                     served += up
                 else:
-                    late += 1
+                    t = k[len(self.RX) + 1:].decode("utf-8", "replace").rstrip("\r")
+                    if self.RX_SERVER.match(t):
+                        up = True
+                    elif self.RX_LOST.match(t):
+                        up = False
+                    elif self.RX_LATE.match(t):
+                        late += 1
             m = None
             for m in self.ERRORS.finditer(buf, 0, end):
                 pass
@@ -647,6 +653,7 @@ class StageMonitor:
         # {"HOST:PORT": "https://agent:7840", ...} asks the agents it names and no other (http:// is taken as https://)
         self.agents_cfg = None
         self.agents: dict[str, Agent] = {}
+        self.rx_agents: dict[str, Agent] = {}   # (the expert server's: agent_for)
         self.lock = threading.Lock()
         self.busy = False
         self.asked_at = 0.0
@@ -672,11 +679,13 @@ class StageMonitor:
             url = f"https://{'[' + h + ']' if ':' in h else h}:{AGENT_PORT}"
         if urlsplit(url).scheme not in ("http", "https"):
             return None
+        # an expert server's agents are kept apart from the workers' (no log of it: port None), so one PC asked both
+        # ways never hands the stage card an agent without its worker's log, or the other way round
+        store = self.rx_agents if expert_server else self.agents
         with self.lock:
-            a = self.agents.get(addr)
-            port = None if expert_server else port_of(addr)   # (an expert server's agent: no log; a worker's: its port's)
-            if a is None or a.url != agent_url(url) or a.port != port:
-                a = self.agents[addr] = Agent(url, port)
+            a = store.get(addr)
+            if a is None or a.url != agent_url(url):
+                a = store[addr] = Agent(url, None if expert_server else port_of(addr))
             return a
 
     def ask_agents(self, chain: list[str], keys: str, expert_server: bool = False) -> None:

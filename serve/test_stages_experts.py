@@ -39,6 +39,11 @@ DS_PROMPT = ("maya ds4 serve: prompt 53 tokens = 0 reused + 53 read in 5123 ms (
 DS_LATE = ("ds4: remote experts: a reply past its deadline (0.88 ms after the lane's part, 1.29 ms after its send; layer "
            "35): its 1 picks computed here (said once; the count is in the stats)\n")
 DS_LOST = "ds4: remote experts: receive failed (the peer closed the connection) - the CPU lane computes all its experts from now on\n"
+# the engine's backoff (the link kept: tried again after N requests) and its loss after one (src/dsv41/ds4_model.cu rx_wait)
+DS_BACKOFF = ("ds4: remote experts: 8 of the last 64 replies past the link's bound (0.20 ms after the lane's part) - the CPU lane "
+              "computes all its experts for the next 64 requests, then the link is tried again (said once; the count is in the stats)\n")
+DS_LOST64 = ("ds4: remote experts: 8 of the last 64 replies past the link's bound again, and no reply at all since the link was "
+             "last idle - the CPU lane computes all its experts from now on\n")
 DS_NEVER = "ds4: remote experts: no expert server within 300 s - the CPU lane computes all its experts\n"
 GPU_3080 = [{"name": "NVIDIA GeForce RTX 3080", "vram_mib": 10240, "used_mib": 9364, "util": 3, "temp_c": 49}]
 
@@ -120,6 +125,58 @@ class ExpertsLogTest(LogCase):
         self.assertEqual(mon.view(e)["workers"][0]["state"], "down")
         e.unloaded = True
         self.assertEqual(mon.view(e)["workers"][0]["state"], "unloaded")
+
+    def test_a_backoff_is_not_a_loss(self):
+        """Line by line and scanned: the backoff's line is a late reply and the link stays; the loss that follows it is a
+        loss, not a late reply."""
+        filler = "ds4: expert cache: settle 1 (one a prompt with the expert server)\n"
+        body = DS_STARTED + DS_LOAD + DS_SERVER + DS_PROMPT * 2 + DS_BACKOFF + DS_PROMPT * 3
+        for scanned in (False, True):
+            with self.subTest(scanned=scanned):
+                Path(self.log).write_text("", encoding="utf-8")
+                mon = stages.StageMonitor()
+                mon.agents_cfg = False
+                e = ds_engine(self.tok, self.log)
+                self.append(body + (filler * (stages.READ_MAX // len(filler) + 100) if scanned else ""))
+                w = mon.view(e)["workers"][0]
+                self.assertEqual((w["state"], w["experts"]["requests"], w["experts"]["late"]), ("connected", 5, 1))
+                self.append(DS_LOST64 + DS_PROMPT + (filler * (stages.READ_MAX // len(filler) + 100) if scanned else ""))
+                w = mon.view(e)["workers"][0]
+                self.assertEqual((w["state"], w["experts"]["requests"], w["experts"]["late"]), ("down", 5, 1))
+                self.assertIn("no reply at all", w["error"]["text"])
+
+    def test_a_scan_across_chunks_and_looks_agrees_with_reading_line_by_line(self):
+        """Events on both sides of the 8 MiB chunks, lines cut by a chunk's end, and a scan budget (SCAN_MAX) spent over
+        several looks: the same facts as a log read line by line."""
+        from unittest import mock
+        fill = "ds4: expert cache: settle 1 (one a prompt with the expert server) " + "x" * 937 + "\n"   # 1000 bytes
+        parts = [DS_STARTED, DS_LOAD, DS_SERVER, DS_PROMPT * 4]
+        for i in range(12):                                        # ~1 MiB between events: 12 MiB, a chunk end inside lines
+            parts += [fill * (1 << 10) + "y" * (i * 37), "\n", DS_PROMPT * (i + 1), DS_LATE if i % 4 == 1 else ""]
+            if i == 6:
+                parts += [DS_BACKOFF]
+            if i == 9:
+                parts += [DS_STARTED, DS_LOAD, DS_SERVER]          # a new run: its own counts from here
+        parts += [DS_PROMPT * 2, DS_LATE, fill * 3]
+        self.append("".join(parts))
+
+        def facts(mon, e):
+            for _ in range(200):
+                v = mon.view(e)
+                if not v["provisional"]:
+                    w = v["workers"][0]
+                    return w["state"], w["reconnects"], w["experts"]["requests"], w["experts"]["late"], w["experts"]["held"]
+            raise AssertionError("the scan did not catch up")
+        with mock.patch.object(stages, "READ_MAX", 1 << 40):         # read line by line
+            mon = stages.StageMonitor()
+            mon.agents_cfg = False
+            whole = facts(mon, ds_engine(self.tok, self.log))
+        with mock.patch.object(stages, "SCAN_MAX", 3 << 20):         # scanned, 3 MiB a look
+            mon = stages.StageMonitor()
+            mon.agents_cfg = False
+            scanned = facts(mon, ds_engine(self.tok, self.log))
+        self.assertEqual(whole, ("connected", 1, 11 + 12 + 2, 1, 1278))   # i == 9's prompts and late come before its start
+        self.assertEqual(scanned, whole)
 
     def test_fills_off_and_none_held(self):
         mon = stages.StageMonitor()
@@ -208,9 +265,9 @@ class ExpertsAgentTest(LogCase):
         self.assertEqual(a.port, 7841)
         b = mon.agent_for("10.10.10.2:7841", expert_server=True)
         self.assertIsNone(b.port)
-        c = mon.agent_for("10.10.10.2:7841")
-        self.assertEqual(c.port, 7841)
-        self.assertIsNot(c, b)
+        self.assertIs(mon.agent_for("10.10.10.2:7841"), a)          # each kept apart, each kept
+        self.assertIs(mon.agent_for("10.10.10.2:7841", expert_server=True), b)
+        self.assertEqual((list(mon.agents), list(mon.rx_agents)), (["10.10.10.2:7841"], ["10.10.10.2:7841"]))
 
     def test_an_agent_that_does_not_answer(self):
         self.append(DS_STARTED + DS_LOAD + DS_SERVER)
@@ -226,7 +283,7 @@ class ExpertsAgentTest(LogCase):
         mon.agents_cfg = {"10.10.10.9:7841": "https://127.0.0.1:9"}  # another PC's: not asked
         w = view_now(mon, ds_engine(self.tok, self.log))["workers"][0]
         self.assertIsNone(w["agent"])
-        self.assertEqual(mon.agents, {})
+        self.assertEqual((mon.agents, mon.rx_agents), ({}, {}))
 
 
 WEB = Path(__file__).resolve().parent / "web"
@@ -283,8 +340,10 @@ class ExpertsCardPage(unittest.TestCase):
              "reconnects": 2, "round_trip_ms": None, "since": None, "error": None,
              "experts": {"held": 5, "lane": 9, "requests": 1234, "late": 3, "fills": True}}]}
         (a,) = self.render([v])
-        for want in ("≥ 2", "≥ 1,234", "≥ 3", "catching up"):
+        for want in ("≥ 2", ">…<", "catching up"):              # (the run's requests and late replies: not bounds)
             self.assertIn(want, a["body"], want)
+        self.assertNotIn("1,234", a["body"])
+        self.assertEqual(a["body"].count(">…<"), 2)
 
     def test_experts_then_a_stage_then_nothing(self):
         tok = ByteTokenizer()
