@@ -36,8 +36,9 @@
 // to it instead of reading it again (also without slots).  `marks=a,b,..` and `tail=P` ask for more restore points (the
 // start of the last user message, a point near the prompt's tail; ds4_marks.hpp, STRATA_DS4_RESTORE_POINTS of them at
 // most a conversation, 4; 0: none kept), where a prompt that leaves the conversation after one goes back to it instead
-// of further.  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).  A remote stage keeps no
-// restore points and no shared starts (the worker holds no part of one).
+// of further.  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).  A remote stage keeps the
+// shared start alone, one at a time, the worker its part of it at the same position (Model::link_shared; no marks=,
+// tail= or shared start kept apart in RAM; STRATA_DS4_LINK_SHARED=0: none).
 #if defined(__APPLE__)
 #include <execinfo.h>
 #include <csignal>
@@ -1573,6 +1574,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
                 cuts = strata::ds4::mark_plan(asked, shared, (int64_t) from, (int64_t) total, m.marks_cap(), 16, spans);
             }
+        } else if (m.link_shared()) {   // (a remote stage: the shared start alone, kept on both ends - link_mark_plan)
+            const long long shared = r.shared >= 0 ? r.shared : (r.pin >= 256 ? r.pin : -1);
+            std::vector<std::pair<int64_t, int64_t>> spans;
+            for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
+            cuts = strata::ds4::link_mark_plan(shared, (int64_t) from, (int64_t) total, 16, spans);
         }
         // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
         // feeds, --parallel's between pieces) and goes back to the state before this prompt - kept here first, in

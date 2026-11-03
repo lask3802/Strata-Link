@@ -389,9 +389,13 @@ public:
     /// start of the last user message, a point near the prompt's tail, the end of a shared start - shared: given up
     /// last), besides the three above: restore() and a slot go back to these too.  At most marks_cap() a conversation
     /// (DS4_RESTORE_POINTS, 4; 0: none kept), the least recently used giving way; each check_bytes() of host RAM.
-    /// A remote stage keeps none (marks_cap() 0): the worker holds no part of one.
+    /// A remote stage keeps the shared start alone, one at a time (marks_cap() 0, link_shared()): the worker keeps its
+    /// part of it in checkpoint role stage::kCkShared at the same position; mark(false) there keeps nothing.
     void mark(bool shared = false);
     int marks_cap() const;
+    /// A remote stage's main process that keeps its shared start (checkpoints over the link, STRATA_DS4_LINK_SHARED
+    /// not 0): the read stops at a request's shared= / pin=N and mark(true) keeps it on both ends (link_mark_plan).
+    bool link_shared() const;
     size_t check_bytes() const;
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
@@ -403,7 +407,7 @@ public:
     /// `remote_id` (a remote stage's main process, Options::stage_ckpt; non-zero): the worker's layers' part of the slot
     /// is taken first, under that id, and the slot is this process's layers' part - 0 and err when the worker did not
     /// keep it.  `at` >= 0: the conversation as it stood at its restore point `at` (a mark kept by mark()), though it was
-    /// read on past it (a remote stage keeps no restore points).
+    /// read on past it (not on a remote stage: its slots are whole, both ends' parts at the same position).
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t remote_id = 0, int64_t at = -1);
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
     /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).

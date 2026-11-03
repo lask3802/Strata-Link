@@ -382,16 +382,19 @@ inline net::StageBuffers worker_buffers(float* run_in, float* run_out, int max_t
 
 // ---- conversation checkpoints and slots across the link.  The link's CkptSave / CkptRestore carry an id, a position L
 // and the ids the main process holds (keep[]); the DeepSeek engine gives the id a meaning of its own, as its state is
-// not a Qwen engine's: the engine's four checkpoints (the end of the last prompt, the position before it, the anchor, the
-// shared start - Model's kChecks) are rings and partial groups both ends keep by role at the same positions, and a slot
-// is the whole of a conversation's state, which the worker keeps in a PartStore under the main process's slot id.
+// not a Qwen engine's: the engine's checkpoints (the end of the last prompt, the position before it, the anchor) and the
+// shared start (kCkShared: a remote stage's one restore point, shared= / pin=) are rings and partial groups both ends keep
+// by role at the same positions, and a slot is the whole of a conversation's state, which the worker keeps in a
+// PartStore under the main process's slot id.  Role 2 is the anchor's place in the numbering only (kCkPin keeps it).
 //   CkptSave    kCkRole0 + r   the worker takes its checkpoint of role r (L is its position, as the link checks)
 //               kCkPin         the worker pins (checkpoint 1 also becomes the anchor; L is its position)
 //               >= kSlotId0    the worker sets its part of the conversation aside under that id
 //   CkptRestore kCkAt          the worker goes back to its checkpoint at L (the main process chose it)
 //               >= kSlotId0    the worker takes its part of that slot back (L: the slot's length)
 // keep[] holds slot ids only (the checkpoints are kept by role, not by id): the worker drops the parts not in it.
-constexpr int kCkRoles = 4;   // the model's kChecks
+constexpr int kCkRoles = 4;   // 0, 1, the anchor's 2, the shared start (the wire's ids: unchanged since the port's kChecks)
+constexpr int kCkShared = 3;  // the shared start's role: the worker keeps it as its one restore point (Model::mark)
+static_assert(kCkShared < kCkRoles, "the shared start is a role the link carries");
 constexpr int64_t kCkRole0 = 1;
 constexpr int64_t kCkPin = kCkRole0 + kCkRoles;
 constexpr int64_t kCkAt = kCkPin + 1;

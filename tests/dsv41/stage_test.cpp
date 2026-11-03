@@ -775,7 +775,7 @@ struct FakeModel {
         for (int64_t& c : ck) c = -1;
         held = false;
     }
-    void checkpoint(int role) { ck[role & 3] = p; }
+    void checkpoint(int role) { ck[role & 3] = p; }   // (role kCkShared: the Model's one shared start, link_mark)
     void pin() {
         if (ck[1] > 0) ck[2] = ck[1];
     }
@@ -1004,6 +1004,9 @@ static void test_ids() {
     int role = -1;
     CHECK(st::ck_save_op(st::kCkRole0, &role) == st::CkOp::Role && role == 0);
     CHECK(st::ck_save_op(st::kCkRole0 + 3, &role) == st::CkOp::Role && role == 3);
+    // (the shared start keeps the port's role 3 on the wire: a worker of either build reads the same id)
+    CHECK(st::kCkShared == 3 && st::ck_save_op(st::kCkRole0 + st::kCkShared, &role) == st::CkOp::Role &&
+          role == st::kCkShared);
     CHECK(st::ck_save_op(st::kCkRole0 + 4) == st::CkOp::Pin && st::ck_save_op(st::kCkPin) == st::CkOp::Pin);
     CHECK(st::ck_save_op(0) == st::CkOp::Bad && st::ck_save_op(-5) == st::CkOp::Bad);
     CHECK(st::ck_save_op(st::kCkAt) == st::CkOp::Bad && st::ck_save_op(st::kSlotId0 - 1) == st::CkOp::Bad);
@@ -1148,6 +1151,24 @@ static void test_link(const fs::path& root) {
     CHECK(t.feed(16, 4, 200));
     CHECK(t.restore(st::kCkAt, 20, {}) == 0);            // a position past the checkpoints: missing too
     CHECK(t.feed(20, 4, 300));                           // the session is where it was: the next window runs
+
+    // 1b. the shared start (role kCkShared, Model::link_mark): kept at the position the read stopped at, past the end's
+    // checkpoints, and gone back to by position when another prompt shares only it
+    CHECK(t.c.reset({}, t.err) && t.feed(0, 8, 400));
+    CHECK(t.save(st::kCkRole0 + st::kCkShared, 8, {}));  // (the read stopped at the start: 8)
+    CHECK(t.feed(8, 8, 408));                            // pos 16
+    CHECK(t.save(st::kCkRole0 + 1, 16, {}) && t.save(st::kCkRole0 + 0, 16, {}));
+    {
+        const FakeModel w = t.snap();
+        CHECK(w.ck[st::kCkShared] == 8 && w.ck[0] == 16 && w.ck[1] == 16);
+    }
+    CHECK(t.restore(st::kCkAt, 8, {}) == 1);             // another agent behind the same start: back to 8
+    {
+        const FakeModel w = t.snap();
+        CHECK(w.p == 8 && w.ck[st::kCkShared] == 8 && w.ck[0] == -1 && w.ck[1] == -1);
+    }
+    CHECK(!t.save(st::kCkRole0 + st::kCkShared, 9, {}) && t.err.find("session is at 8") != std::string::npos);
+    CHECK(t.connect());                                  // (a failed save ends the session: a new one)
 
     // 2. slots: a conversation set aside under the main process's id, another one run, the first taken back whole
     CHECK(t.c.reset({}, t.err) && t.feed(0, 8, 1000));

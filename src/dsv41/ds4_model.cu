@@ -1565,7 +1565,8 @@ struct Model::Impl {
                                       // reasoning at a new user message re-renders the history from about there)
     // the restore points a request asked for (GEN marks= / shared=, ds4_marks.hpp; pin=N is shared=N): the start of the
     // last user message, a point near the prompt's tail, the end of a shared start - each a Check, taken where the read
-    // stopped for it; at most marks_cap() a conversation (DS4_RESTORE_POINTS), none unless a request asks.  Like ck,
+    // stopped for it; at most marks_cap() a conversation (DS4_RESTORE_POINTS), none unless a request asks (a remote
+    // stage: the shared start alone, link_mark).  Like ck,
     // every one is at or before pos and holds the state of the conversation's own tokens up to it
     std::vector<Check> mk;
     uint64_t mark_clock = 0;
@@ -8519,6 +8520,10 @@ struct Model::Impl {
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
         if (!ckpt_ok()) return;   // (a remote stage: the worker's layers would need theirs too - none, restore() goes nowhere)
+        if (slot == stage::kCkShared) {   // (a remote stage's worker: its part of the main process's shared start, link_mark)
+            if (o.stage_worker) link_mark();
+            return;
+        }
         Check& c = ck[slot & 1];
         snap_into(c);
         // (a remote stage's main process: the worker takes its layers' checkpoint of this role, at this position; one it
@@ -8572,11 +8577,51 @@ struct Model::Impl {
     // the state at pos as a restore point a request asked for (shared: the end of a shared start, given up last); one
     // at this position already is kept (it holds the same state), else the one mark_victim() picks makes room
     void mark(bool shared) {
+        if (linked()) {   // (a remote stage: the shared start alone, link_mark)
+            if (shared) link_mark();
+            return;
+        }
         if (Check* c = mark_room(pos, shared)) snap_into(*c);
+    }
+    // a remote stage's shared start (ds4_marks.hpp: link_mark_plan; a0a6c19e's checkpoint 3), on either end: its one
+    // restore point, both ends at the same position.  The main process sends the worker's part first (role kCkShared;
+    // the link checks the worker is at this position) and keeps its own once the worker kept its part; the worker's
+    // checkpoint(kCkShared) comes here.  One kept there already holds this state on both ends: in use again
+    void link_mark() {
+        if (pos <= 0 || !ckpt_ok() || (o.remote_stage && (stage_lost || !link_shared_on()))) return;
+        for (Check& x : mk)
+            if (x.pos == pos) {
+                x.shared = true;
+                x.used = ++mark_clock;
+                return;
+            }
+        if (o.remote_stage) {
+            bool stored = false;
+            std::string e;
+            if (!stage_ck.save(stage::kCkRole0 + stage::kCkShared, pos, stored, e) || !stored) {
+                stage_lost = true;   // (a worker out of step fails the next window, as a failed hop does)
+                stage_err = e.empty() ? "the worker did not keep the shared start" : e;
+                return;
+            }
+        }
+        mk.resize(kLinkMarks);   // (the one kept gives way: its buffers taken over)
+        Check& c = mk[0];
+        c.shared = true;
+        c.used = ++mark_clock;
+        slot_held = false;   // (a slot taken before holds no such point)
+        snap_into(c);
+    }
+    // STRATA_DS4_LINK_SHARED=0: a remote stage's main process keeps no shared start (as 0.2.10 merged, marks_cap 0)
+    static bool link_shared_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_DS4_LINK_SHARED");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        return on;
     }
     // the restore point at position `at` to fill (nullptr: none kept, or one there already - in use again)
     Check* mark_room(int64_t at, bool shared) {
-        if (marks_cap() <= 0 || at <= 0 || linked()) return nullptr;   // (a remote stage: the worker keeps no part of one)
+        if (marks_cap() <= 0 || at <= 0 || linked()) return nullptr;   // (a remote stage: link_mark's shared start alone)
         for (Check& x : mk)
             if (x.pos == at) {
                 x.shared = x.shared || shared;
@@ -8725,8 +8770,8 @@ struct Model::Impl {
     // on past it - the window rings and partial groups from that mark, the compressed KV and index keys of rows 0 .. at / ratio
     // (the rows a position completed never change), the tokens up to it.  The mark stays; the slot holds the checkpoints
     // at or before it.  (A shared start kept from a read that went on past it: #607 without a stop at the start.)
-    // `remote_id` (a remote stage's main process): the worker's part first, under that id (no restore point: a remote
-    // stage keeps none, mark_room).
+    // `remote_id` (a remote stage's main process): the worker's part first, under that id (no restore point `at`: a
+    // remote stage keeps no shared start apart, prefix_keep).
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t remote_id = 0, int64_t at = -1) {
         if (!slot_ok()) {
             err = "this process holds only layers [" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
@@ -9106,8 +9151,11 @@ struct Model::Impl {
         for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
         mk = std::move(got_mk);
+        if (linked())   // (a remote stage: the shared start alone, link_mark - both ends' slots trimmed alike)
+            mk.erase(std::remove_if(mk.begin(), mk.end(), [](const Check& x) { return !x.shared; }), mk.end());
+        const int cap = linked() ? kLinkMarks : marks_cap();
         for (Check& x : mk) x.used = ++mark_clock;   // (in the slot's order; past this engine's cap, the ones
-        while ((int) mk.size() > marks_cap()) {       //  mark_victim() picks go)
+        while ((int) mk.size() > cap) {               //  mark_victim() picks go)
             std::vector<MarkUse> u;
             for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
             mk.erase(mk.begin() + mark_victim(u));
@@ -19657,7 +19705,9 @@ bool Model::feed_marks(const int* tokens, int n, int logits_rows, int slot,
 }
 bool Model::marks_inside(int n, const std::vector<int64_t>& rel) const {
     const Impl& p = *p_;
-    if (p.chunk <= 0 || rel.empty() || rel.size() + 1 > (size_t) kSnapN || rel.front() <= 0 || rel.back() >= n - 1)
+    // (a remote stage: no point inside a run - the worker takes its part where it is, after a read that stopped there)
+    if (p.linked() || p.chunk <= 0 || rel.empty() || rel.size() + 1 > (size_t) kSnapN || rel.front() <= 0 ||
+        rel.back() >= n - 1)
         return false;
     static const bool on = [] {
         const char* v = std::getenv("STRATA_DS4_MARKS_INSIDE");
@@ -19738,7 +19788,8 @@ int Model::verify_max() const { return kWin; }
 void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 void Model::mark(bool shared) { p_->mark(shared); }
-int Model::marks_cap() const { return p_->linked() ? 0 : Impl::marks_cap(); }   // (a remote stage: none, mark_room)
+int Model::marks_cap() const { return p_->linked() ? 0 : Impl::marks_cap(); }   // (a remote stage: link_shared's alone)
+bool Model::link_shared() const { return p_->o.remote_stage && p_->ckpt_ok() && Impl::link_shared_on(); }
 size_t Model::check_bytes() const { return p_->check_bytes(); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }

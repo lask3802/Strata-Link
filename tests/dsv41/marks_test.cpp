@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <vector>
 
+using strata::ds4::kLinkMarks;
 using strata::ds4::latest_point;
+using strata::ds4::link_mark_plan;
 using strata::ds4::mark_plan;
 using strata::ds4::mark_victim;
 using strata::ds4::MarkAt;
@@ -30,6 +32,7 @@ struct Conv {
     std::vector<MarkUse> mk;
     uint64_t clock = 0;
     int cap = 4;
+    bool link = false;             // a remote stage's (either end): the shared start alone, link_mark_plan / link_mark
     std::vector<int64_t> pieces;   // the last read's pieces (their ends)
 
     int64_t pos() const { return (int64_t) toks.size(); }
@@ -39,12 +42,17 @@ struct Conv {
         return v;
     }
     void mark(bool shared) {
+        if (link && !shared) return;   // (Impl::mark: a remote stage keeps no other point)
         for (MarkUse& m : mk)
             if (m.pos == pos()) {
                 m.shared = m.shared || shared;
                 m.used = ++clock;
                 return;
             }
+        if (link) {   // (link_mark: the one kept gives way)
+            mk.assign(1, {pos(), true, ++clock});
+            return;
+        }
         if ((int) mk.size() >= cap) mk.erase(mk.begin() + mark_victim(mk));
         mk.push_back({pos(), shared, ++clock});
     }
@@ -79,7 +87,8 @@ struct Conv {
             mk.clear();
         }
         const int64_t total = (int64_t) ids.size();
-        const std::vector<MarkAt> cuts = mark_plan(marks, shared, from, total, cap, 16);
+        const std::vector<MarkAt> cuts = link ? link_mark_plan(shared, from, total, 16)
+                                              : mark_plan(marks, shared, from, total, cap, 16);
         pieces.clear();
         size_t k = 0;
         if (!cuts.empty() && cuts[0].pos == from) mark(cuts[k++].shared);
@@ -168,6 +177,20 @@ int main() {
         assert(v.size() == 2 && v[0].pos == 100 && v[1].pos == 200);
     }
 
+    // link_mark_plan (a remote stage): the shared start alone, where mark_plan keeps it
+    {
+        assert(kLinkMarks == 1);
+        assert(link_mark_plan(-1, 0, 1000, 16).empty());          // (none asked)
+        auto v = link_mark_plan(300, 0, 1000, 16);
+        assert(v.size() == 1 && v[0].pos == 300 && v[0].shared);
+        assert(link_mark_plan(300, 400, 1000, 16).empty());       // (behind the read: the state holds it, or not)
+        assert(link_mark_plan(999, 0, 1000, 16).empty());         // (the last token: checkpoint 1's)
+        v = link_mark_plan(410, 400, 1000, 16);                    // (a few tokens past `from`: at `from`)
+        assert(v.size() == 1 && v[0].pos == 400 && v[0].shared);
+        v = link_mark_plan(150, 0, 1000, 16, {{100, 100}});        // (inside a picture's span: at its start)
+        assert(v.size() == 1 && v[0].pos == 100 && v[0].shared);
+    }
+
     // mark_victim: the least recently used that is not a shared start, else the least recently used
     assert(mark_victim({}) == -1);
     assert(mark_victim({{10, false, 5}, {20, false, 3}, {30, false, 9}}) == 1);
@@ -225,6 +248,35 @@ int main() {
         for (const MarkUse& m : cv.mk) has_shared = has_shared || (m.pos == 3000 && m.shared);
         assert(has_shared);
         assert(cv.prompt(cat(sys, run(80000, 100))) == 3000);
+    }
+    {   // a remote stage (both ends alike, link_mark): another agent behind the same start goes back to it, as a0a6c19e's
+        // checkpoint 3 did; marks= and tail= keep nothing (the read stops at the shared start alone)
+        Conv cv;
+        cv.link = true;
+        const std::vector<int> a = cat(sys, run(50000, 8000)), b = cat(sys, run(60000, 9000));
+        assert(cv.prompt(a, {(int64_t) a.size() - 200}, 3000) == 0);
+        assert((cv.pieces == std::vector<int64_t>{3000, (int64_t) a.size()}));
+        assert(cv.mk.size() == 1 && cv.mk[0].pos == 3000 && cv.mk[0].shared);
+        cv.answer(run(30000, 300));
+        assert(cv.prompt(b, {(int64_t) b.size() - 200}, 3000) == 3000);
+        assert((cv.pieces == std::vector<int64_t>{(int64_t) b.size()}));   // (its point at `from`: kept as it is)
+        assert(cv.mk.size() == 1 && cv.mk[0].pos == 3000);
+        // the same edit of the last message: no boundary point here - back to the end's checkpoints or the start
+        cv.answer(run(31000, 300));
+        const std::vector<int> b2 = cat(cat(sys, run(60000, 8500)), run(61000, 100));
+        assert(cv.prompt(b2, {8500 + 3000}, 3000) == 3000);
+        // another start (a different system prompt): it takes the one place, both ends alike
+        const std::vector<int> sys2 = run(2000000, 2000);
+        assert(cv.prompt(cat(sys2, run(70000, 4000)), {}, 2000) == 0);
+        assert(cv.mk.size() == 1 && cv.mk[0].pos == 2000);
+        cv.answer(run(32000, 100));
+        assert(cv.prompt(cat(sys2, run(80000, 100)), {}, 2000) == 2000);
+        assert(cv.prompt(cat(sys, run(90000, 100)), {}, 3000) == 0);   // (the first start is not kept any more)
+        // without shared= / pin=: nothing kept (the read is one run)
+        Conv none;
+        none.link = true;
+        none.prompt(a, {(int64_t) a.size() - 200});
+        assert(none.mk.empty() && (none.pieces == std::vector<int64_t>{(int64_t) a.size()}));
     }
     {   // a turn that continues in place: its boundary a token past the state's end is kept at the end (no split)
         Conv cv;

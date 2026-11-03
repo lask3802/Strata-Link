@@ -70,6 +70,17 @@ inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t 
     return out;
 }
 
+// A remote stage's restore points (both ends, docs/REMOTE_STAGE.md): the shared start alone, one at a time - the main
+// process's state there and the worker's part of it in checkpoint role stage::kCkShared, taken at the same position
+// after a read that stopped there (a run of chunks keeps no point inside it across the link).  The read of [from,
+// total) keeps it where mark_plan would; the request's other points (marks=, tail=) are none there.
+constexpr int kLinkMarks = 1;
+inline std::vector<MarkAt> link_mark_plan(int64_t shared, int64_t from, int64_t total, int64_t gap,
+                                          const std::vector<std::pair<int64_t, int64_t>>& spans = {}) {
+    if (shared < 0) return {};
+    return mark_plan({}, shared, from, total, kLinkMarks, gap, spans);
+}
+
 // The tail point's cost on this PC (the server's tail=<pos>, MAYA_DS4_RESTORE_TAIL; #668).  The read stops there, so
 // the tokens after it are a run of their own: where most experts are not in VRAM, that short run costs nearly a whole
 // pass over them (each expert's weights read for a few rows - on the CPU lane, or lent to the GPU's prompt path one
