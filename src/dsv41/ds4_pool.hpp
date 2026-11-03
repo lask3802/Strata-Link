@@ -36,7 +36,7 @@ class Pool {
 public:
     explicit Pool(int n, const std::vector<int>& cpus = {}, int spin_us = 200) : spin_us_(spin_us) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this] { loop(0); });   // (generation 0: a batch started before the thread runs is still its)
+            th_.emplace_back([this] { loop(); });
             if (!cpus.empty()) os::pin_thread(th_.back(), cpus[(size_t) i % cpus.size()]);
         }
     }
@@ -66,10 +66,11 @@ public:
         total_.store(n, std::memory_order_release);
         done_.store(0, std::memory_order_relaxed);
         ticket_.store(g << 32, std::memory_order_release);
-        // (seq_cst, both: the other half is a worker's sleeping_ add, then its gen_ read - with release / acquire the store
-        // and the load may pass each other, the worker sleeps through this batch and nobody wakes it)
-        gen_.store(g, std::memory_order_seq_cst);
-        if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+        gen_.store(g, std::memory_order_release);
+        // (store -> load: without the fence x86 may read sleeping_ before gen_ is visible, and a worker going to sleep
+        // at that instant - its fetch_add, then gen_ - misses both the generation and the notify)
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_acquire) > 0) {
             std::lock_guard<std::mutex> lk(mu_);
             cv_.notify_all();
         }
@@ -113,7 +114,8 @@ private:
             done_.fetch_add(1, std::memory_order_acq_rel);
         }
     }
-    void loop(uint64_t seen) {
+    void loop() {
+        uint64_t seen = 0;   // (gen_ at construction: a batch start()ed before this thread first ran is still new)
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
             uint64_t g;

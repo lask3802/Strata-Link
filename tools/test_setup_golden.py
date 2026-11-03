@@ -109,6 +109,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "cpu_cores", lambda: None),   # #642: not a hybrid CPU
             # the goldens' PC had 12 threads (the CPU image encoder's "threads" is half of them), not the test PC's
             mock.patch.object(setup.os, "cpu_count", lambda: 12),
+            mock.patch.object(setup, "vision_threads", lambda logical=None: 6),   # the baseline PC has 12 logical CPUs; the runner's own count must not change the golden config
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "is_wsl", lambda: False),
             mock.patch.object(setup, "rotational_disk", lambda p: None),   # #605: the test PC's own disk
