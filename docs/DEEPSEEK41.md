@@ -258,6 +258,14 @@ the TLS keys of `strata --stage-keygen` (`STRATA_STAGE_TLS`).
 `DS4_RX_FILL=1` lets the server's set follow what the model uses. Its fills read the model's files through their mappings, so on the main computer set
 `DS4_NO_VIEW=0` beside it: the engine refuses `DS4_NO_VIEW=1` with `DS4_RX_FILL=1` before it loads the model.
 
+The web app's Monitor tab shows the expert server on the Workers card (the card a remote stage uses, with its own columns): its address and graphics
+card, the link's state (Connecting while the engine waits for it, Connected, Down with the engine's reason once the link is given up or never made), the
+experts it holds and their share of the CPU lane's routings, the median round trip of the load's warm-up requests, the requests served while the link was
+up, whether fills are on, and the late replies the log names. These come from the main engine's log (the run config needs `"log"`). The server PC's VRAM
+comes from its node agent's `GET /info` (`tools/stage_node.py`) when the run config has `"stage_agents"`, as for a remote stage
+([REMOTE_STAGE.md](REMOTE_STAGE.md#the-monitors-workers-card)); a map's entry for another port of the same PC (a remote stage's `HOST:7841`) names
+that PC's agent too. The agent does not run the expert server, so the card reads no log from it.
+
 Both computers run the same commit, each built for its own card, for example a main computer with an RTX 2080 Ti (sm_75) and a server with an RTX 3080 (sm_86):
 
 ```

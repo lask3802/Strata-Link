@@ -388,9 +388,66 @@ function clock(t) {
   const opts = Date.now() - d > 86400000 ? {weekday: "short", hour: "2-digit", minute: "2-digit"} : {hour: "2-digit", minute: "2-digit"};
   return d.toLocaleString([], opts);
 }
+// DeepSeek-V4.1's expert server (--remote-experts): this PC runs every layer, another PC's GPU computes some of the CPU
+// lane's experts. One row, its own columns (s.kind "experts"); the remote stage's header comes back with a stage.
+const WK_EXPERTS_HEAD = `<tr><th>Expert server</th>
+  <th class="num" title="The CPU lane's experts the server holds in its VRAM, and their share of the lane's routings in the expert profile">Experts held</th><th>Link</th>
+  <th class="num" title="Expert servers taken again since this server started (each engine start takes one)">Reconnects</th>
+  <th class="num" title="The median round trip of the 16 one-row warm-up requests at the engine's load">Round trip</th>
+  <th class="num" title="Requests this engine served while the link was up">Requests</th>
+  <th title="The server PC's GPU memory, from its node agent">VRAM</th>
+  <th title="Whether the engine refills the server's experts as the routing moves">Fills</th>
+  <th class="num" title="Lines in the engine log about replies that came too late (those picks were computed here)">Late replies</th></tr>`;
+let wkStageHead = null;
+function renderExperts(s) {
+  const ws = s.workers || [];
+  const ms = (v) => (v == null ? "–" : `${fmt(v, 2)} ms`);
+  $("wk-body").innerHTML = ws.map((w) => {
+    const [cls, text, tip] = WK_STATE[w.state] || WK_STATE.unknown;
+    const x = w.experts || {};
+    const g = w.gpu || {};
+    const name = g.name || w.host || w.address || `listening on ${w.listen}`;
+    const where = [w.address, g.name && w.host ? w.host : ""].filter(Boolean).filter((v) => v !== name).join(" · ");
+    const vram = g.vram_mib ? `${gb(g.used_mib * 1048576)} / ${gb(g.vram_mib * 1048576, 0)} GB` : "–";
+    const vpct = g.vram_mib ? Math.min(100, (100 * g.used_mib) / g.vram_mib) : 0;
+    const held = x.held != null ? `${fmt(x.held)}<span class="muted small wk-sub">${x.gb != null ? `${fmt(x.gb, 2)} GB` : ""}${x.routing_pct != null ? ` · ${fmt(x.routing_pct, 1)}% of routings` : ""}</span>` : "–";
+    const fills = x.fills == null ? "–" : x.fills ? "On" : `Off${x.fills_note ? `<span class="muted small wk-sub">${esc(x.fills_note)}</span>` : ""}`;
+    const late = x.late_note ? ` title="${esc(x.late_note.text)}"` : "";
+    const row = `<tr${w.error ? ' class="wk-has-err"' : ""}>
+      <td><span class="wk-name">${esc(name)}</span>${where ? `<span class="muted small wk-sub">${esc(where)}</span>` : ""}</td>
+      <td class="num">${held}</td>
+      <td><span class="st-badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}${s.provisional ? `<span class="muted small wk-sub" title="The log is still being read: this state is as of the part read so far">catching up</span>` : ""}</td>
+      <td class="num">${fmt(w.reconnects)}</td>
+      <td class="num">${ms(w.round_trip_ms)}</td>
+      <td class="num">${x.requests == null ? "–" : fmt(x.requests)}</td>
+      <td>${vram}${g.vram_mib ? `<div class="st-progress"${vpct > 95 ? ' data-tone="danger"' : ""}><div class="st-progress__bar" style="width:${vpct}%"></div></div>` : ""}</td>
+      <td>${fills}</td>
+      <td class="num"${late}>${fmt(x.late || 0)}</td></tr>`;
+    const err = w.error ? `<tr class="wk-err"><td colspan="9"><div class="wk-err__text">${icon("error", "st-icon st-icon--sm")}<span>${esc(clock(w.error.at))}${w.error.at ? " · " : ""}${esc(w.error.text || "")}</span></div></td></tr>` : "";
+    return row + err;
+  }).join("") || `<tr><td colspan="9" class="muted">No expert server yet</td></tr>`;
+  const w0 = ws[0] || {};
+  const x0 = w0.experts || {};
+  $("wk-sum").textContent = [`This PC runs every layer; the expert server computes part of its CPU lane's experts (listening on ${s.listen})`,
+    x0.lane != null ? `${fmt(x0.held)} of the lane's ${fmt(x0.lane)} experts there` : ""].filter(Boolean).join(" · ");
+  const agentDown = ws.filter((w) => w.agent && w.agent.ok === false).map((w) =>
+    `No node agent answered at ${w.agent.url} (${w.agent.error}): the VRAM column comes from it ("stage_agents" in the run config can name another address; the server reads it when it starts).`);
+  $("wk-note").textContent = s.agents ? agentDown.join(" ")
+    : "The VRAM column comes from the expert server PC's node agent (tools/stage_node.py): add \"stage_agents\" to the run config and start the server again to ask it.";
+  $("wk-hint").textContent = ws.length && ws[0].state === "nolog"
+    ? "Add \"log\" to the run config to see the link's state (the server reads it when it starts)." : "";
+}
 function renderWorkers(s) {
   $("wk-card").hidden = !s;
   if (!s) return;                                  // no remote stage (or an older server)
+  const head = $("wk-head");
+  if (head && wkStageHead == null) wkStageHead = head.innerHTML;
+  if (s.kind === "experts") {
+    if (head && head.dataset.kind !== "experts") { head.innerHTML = WK_EXPERTS_HEAD; head.dataset.kind = "experts"; }
+    renderExperts(s);
+    return;
+  }
+  if (head && head.dataset.kind === "experts") { head.innerHTML = wkStageHead; delete head.dataset.kind; }
   const ws = s.workers || [];
   const ms = (v) => (v == null ? "–" : `${fmt(v, 1)} ms`);
   const span = (l) => (l ? `${l[0]}–${l[1]}` : "–");

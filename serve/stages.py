@@ -13,6 +13,13 @@ slow agent nor the agent's nvidia-smi is ever on a request's path.
 The lines read are the engine's (a reconnect within a run: "waiting for the worker", "connected again", with
 INFO remote_stage_wait= on stdout while a request waits; the hand-off rows' format, ", rows bf16"), and the older
 remote stage's without them.  The run config is read when the server starts.
+
+DeepSeek-V4.1's expert server (strata-dsv41 --remote-experts HOST:PORT; docs/DEEPSEEK41.md) is the other kind of link:
+this PC runs every layer, and the expert server (another PC's GPU) computes some of the CPU lane's experts.  Its card
+("kind": "experts") has one row: the server's address, GPU and the experts it holds as the engine's "ds4: remote
+experts: ..." lines say (waiting, the server taken, the upload, the warm-up's round trip, the fills, a link given up),
+the requests served while it was up, and the server PC's VRAM from its node agent (GET /info only: the agent does not
+run the expert server, so it has no log of it).
 """
 from __future__ import annotations
 
@@ -60,6 +67,16 @@ def remote_args(args) -> tuple[str | None, int | None]:
             else:
                 k = v
     return addr, end if end is not None and addr is not None else k
+
+
+def remote_experts_arg(args) -> str | None:
+    """DeepSeek-V4.1's --remote-experts HOST:PORT (where this PC listens for its expert server), or None.  A
+    --remote-stage beside it wins (remote_args): the card shows the stage, as before."""
+    args = list(args or [])
+    for i, a in enumerate(args[:-1]):
+        if a == "--remote-experts":
+            return str(args[i + 1])
+    return None
 
 
 def host_of(addr: str) -> str:
@@ -120,6 +137,25 @@ class MainLog:
              "gap": b"strata remote: main process between windows "}
     STARTS = re.compile(rb"\n\[strata\][^\n]*" + re.escape(STARTED.encode()))
     ERRORS = re.compile(ERROR.pattern.encode())
+    # DeepSeek-V4.1's expert server (--remote-experts): the engine's own lines (src/dsv41/ds4_model.cu, rx_setup /
+    # rx_lost), each after "ds4: remote experts: "
+    RX = "ds4: remote experts: "
+    RX_WAIT = re.compile(r"waiting up to (\d+) s for an expert server on (\S+)")
+    RX_SERVER = re.compile(r"server (\S+) \((.*), ([\d.]+) GB of VRAM for experts\): sending (\d+) of the CPU lane's "
+                           r"(\d+) experts \(([\d.]+) GB, ([\d.]+)% of their routings")
+    RX_UP = re.compile(r"(\d+) experts \(([\d.]+) GB\) in the server's VRAM, uploaded in ([\d.]+) s")
+    RX_WARM = re.compile(r"(\d+) warm-up requests of 1 row: round trip median ([\d.]+) ms")
+    RX_FILLS = re.compile(r"(fills on|fills off|no fills) \((.*?)[;)]")
+    RX_LOST = re.compile(r"(.*) - the CPU lane computes all its experts( from now on)?\s*$")
+    RX_NONE = re.compile(r"none held")
+    RX_LATE = re.compile(r"(a reply past its deadline|8 of the last 64 replies past the link's bound)")
+    PROMPT = "maya ds4 serve: prompt "     # one request served (the engine's line after each)
+    COUNTED["rx_connects"] = b"GB of VRAM for experts): sending "
+    MARKS.update({"rx_wait": b"ds4: remote experts: waiting up to ", "rx_server": b"GB of VRAM for experts): sending ",
+                  "rx_up": b" in the server's VRAM, uploaded in ", "rx_warm": b" warm-up requests of 1 row: round trip ",
+                  "rx_fon": b"ds4: remote experts: fills on (", "rx_foff": b"ds4: remote experts: fills off (",
+                  "rx_nofill": b"ds4: remote experts: no fills (", "rx_lost": b" - the CPU lane computes all its experts",
+                  "rx_none": b"ds4: remote experts: none held"})
     FINGERPRINT = 64       # the log's first bytes: other ones at a later look, a log rotated (though not shorter)
 
     def __init__(self):
@@ -137,7 +173,9 @@ class MainLog:
         # the new log's start, "at": the read before it
         self.state = {"connect": None, "connects": 0, "relinks": 0, "waiting": None, "error": None, "link": None,
                       "windows": None, "gap_ms": None, "runs": 0, "run_pos": None, "run_connected": False,
-                      "stage_err": None, "behind": 0, "size": 0, "rotated": None}
+                      "stage_err": None, "behind": 0, "size": 0, "rotated": None,
+                      # the expert server's link: "rx" this run's facts (rx_new), "rx_connects" the servers taken so far
+                      "rx": None, "rx_connects": 0}
 
     def poll(self, path, first, start, err=None) -> dict:
         """The state after the log's new lines.  `first`: where the engine's first run in this server began (read
@@ -242,6 +280,8 @@ class MainLog:
         """The whole lines from byte a to b, scanned (see the class): the bytes scanned, up to the last line end."""
         f.seek(a)
         pos, left, carry, last = a, b - a, b"", {}
+        served = 0                                      # the requests after the last start scanned (the expert server's)
+        prompt = self.PROMPT.encode()
         while left > 0:
             chunk = f.read(min(left, 8 << 20))
             if not chunk:
@@ -264,6 +304,9 @@ class MainLog:
                 self.state["runs"] += 1
             if m:
                 last["start"] = self.line_at(buf, m.start() + 1, base)
+                served = buf.count(prompt, m.end(), end)
+            else:
+                served += buf.count(prompt, 0, end)
             m = None
             for m in self.ERRORS.finditer(buf, 0, end):
                 pass
@@ -273,6 +316,9 @@ class MainLog:
         now = time.time()
         for at, line in sorted(last.values()):         # in the log's order
             self.event(line, at, now, count=False)
+        rx = self.state["rx"]
+        if rx and rx["server"] and not rx["lost"]:     # (a scanned part: all of its requests, none when the link is lost by its end)
+            rx["requests"] += served
         return pos - a
 
     def feed(self, data: bytes, base: int) -> None:
@@ -288,10 +334,19 @@ class MainLog:
         st = self.state
         if line.startswith("[strata]") and self.STARTED in line:
             st["runs"] += count
-            st.update(run_pos=at, run_connected=False, waiting=None, link=None)
+            st.update(run_pos=at, run_connected=False, waiting=None, link=None, rx=None)
             st["windows"] = st["gap_ms"] = None             # the timing of this run's link only
             return
+        if line.startswith(self.PROMPT):
+            rx = st["rx"]
+            if count and rx and rx["server"] and not rx["lost"]:
+                rx["requests"] += 1
+            return
         if "remote" not in line:
+            return
+        i = line.find(self.RX)
+        if i >= 0:
+            self.rx_event(line[i + len(self.RX):], at, now, count)
             return
         m = self.CONNECT.search(line)
         if m:
@@ -327,6 +382,42 @@ class MainLog:
         if m:
             st["error"] = {"text": m[1], "at": now, "pos": at}
             st["run_connected"], st["waiting"] = False, None   # (a start that waited and gave up ends)
+
+    @staticmethod
+    def rx_new() -> dict:
+        """An engine run's expert-server facts: "wait" (listening for one), "server" (the one taken: its address, GPU,
+        the experts sent), "held" (the upload done), "warm_ms" (the warm-up's median round trip), "fills" (True / False,
+        and why not), "lost" (the link given up, or never made: its reason), "none" (it holds none of them), "late"
+        (the late-reply lines) and "requests" (served while the link was up)."""
+        return {"wait": None, "server": None, "held": None, "warm_ms": None, "fills": None, "fills_note": None,
+                "lost": None, "none": False, "late": 0, "late_note": None, "requests": 0}
+
+    def rx_event(self, text: str, at: int, now: float, count: bool) -> None:
+        """One "ds4: remote experts: " line (`text`: what follows it)."""
+        st = self.state
+        rx = st["rx"]
+        if rx is None:
+            rx = st["rx"] = self.rx_new()
+        if m := self.RX_SERVER.match(text):
+            st["rx_connects"] += count
+            rx.update(server={"address": m[1], "gpu": m[2], "vram_gb": float(m[3]), "experts": int(m[4]),
+                              "lane": int(m[5]), "gb": float(m[6]), "routing_pct": float(m[7]), "at": now, "pos": at},
+                      wait=None, lost=None, none=False)
+        elif m := self.RX_WAIT.match(text):
+            rx.update(wait={"seconds": int(m[1]), "listen": m[2], "at": now, "pos": at}, lost=None)
+        elif m := self.RX_UP.match(text):
+            rx["held"] = {"experts": int(m[1]), "gb": float(m[2]), "upload_s": float(m[3]), "at": now}
+        elif m := self.RX_WARM.match(text):
+            rx["warm_ms"] = float(m[2])
+        elif m := self.RX_FILLS.match(text):
+            rx["fills"], rx["fills_note"] = m[1] == "fills on", None if m[1] == "fills on" else m[2]
+        elif m := self.RX_LOST.match(text):
+            rx.update(lost={"text": m[1], "at": now, "pos": at, "after_link": bool(m[2])}, wait=None)
+        elif self.RX_NONE.match(text):
+            rx["none"] = True
+        elif m := self.RX_LATE.match(text):
+            rx["late"] += count
+            rx["late_note"] = {"text": text.strip(), "at": now}
 
 
 class WorkerLog:
@@ -543,13 +634,17 @@ class StageMonitor:
     def agents_on(self) -> bool:
         return self.agents_cfg is True or isinstance(self.agents_cfg, dict)
 
-    def agent_for(self, addr: str) -> Agent | None:
+    def agent_for(self, addr: str, expert_server: bool = False) -> Agent | None:
         cfg = self.agents_cfg
         if not self.agents_on():
             return None
         # a map names every agent that is asked; true: each worker's own host (its agent's certificate must be one
-        # this PC accepts, as the worker's is)
+        # this PC accepts, as the worker's is).  `expert_server`: DeepSeek-V4.1's expert server at `addr` (its address and
+        # this PC's listening port): a map's entry for another port of that host names the same PC's agent, and only its
+        # /info is asked (the agent does not run the expert server: no log of it)
         url = cfg.get(addr) if isinstance(cfg, dict) else None
+        if isinstance(cfg, dict) and not url and expert_server:
+            url = next((u for k, u in cfg.items() if isinstance(k, str) and host_of(k) == host_of(addr)), None)
         if isinstance(cfg, dict) and not (isinstance(url, str) and url):
             return None
         if not url:
@@ -560,10 +655,10 @@ class StageMonitor:
         with self.lock:
             a = self.agents.get(addr)
             if a is None or a.url != agent_url(url):
-                a = self.agents[addr] = Agent(url, port_of(addr))
+                a = self.agents[addr] = Agent(url, None if expert_server else port_of(addr))
             return a
 
-    def ask_agents(self, chain: list[str], keys: str) -> None:
+    def ask_agents(self, chain: list[str], keys: str, expert_server: bool = False) -> None:
         """Every agent of the chain, on a thread, at most every AGENT_EVERY_S; a call while one runs does nothing."""
         now = time.time()
         with self.lock:
@@ -573,7 +668,7 @@ class StageMonitor:
 
         def run():
             try:
-                for a in [a for a in (self.agent_for(x) for x in chain) if a is not None]:
+                for a in [a for a in (self.agent_for(x, expert_server) for x in chain) if a is not None]:
                     a.refresh(keys)
             finally:
                 with self.lock:
@@ -584,12 +679,15 @@ class StageMonitor:
         spawn = getattr(engine, "spawn", None)
         args = spawn[1] if isinstance(spawn, tuple) and len(spawn) > 1 else []
         first, k = remote_args(args)
-        if not first:
+        listen = None if first else remote_experts_arg(args)
+        if not first and not listen:
             return None
         env = spawn[4] if len(spawn) > 4 and isinstance(spawn[4], dict) else None
         keys = (env or os.environ).get("STRATA_STAGE_TLS", "")   # the engine's key folder: this PC's
         log = self.main_log.poll(getattr(engine, "log_path", None), getattr(engine, "first_log_start", None),
                                  getattr(engine, "log_start", None), getattr(engine, "stage_err", None))
+        if listen:
+            return self.experts_view(engine, listen, log, keys, ask)
         # the chain: the main process's worker, then each relay's next worker as its log names it
         chain = [first]
         while len(chain) < CHAIN_MAX:
@@ -609,6 +707,63 @@ class StageMonitor:
         return {"local_layers": [0, k - 1] if k else None, "rows": rows, "chunk": c["chunk"] if c else None,
                 "context": c["context"] if c else None, "gap_ms": log["gap_ms"], "agents": on, "timing": timing,
                 "provisional": log["behind"] > 0, "workers": workers}
+
+    def experts_view(self, engine, listen: str, log: dict, keys: str, ask: bool) -> dict:
+        """The card for DeepSeek-V4.1's expert server (--remote-experts `listen`): one row, "kind": "experts"."""
+        rx = dict(log.get("rx") or MainLog.rx_new())
+        srv = rx["server"]
+        on = self.agents_on()
+        a = None
+        if srv:
+            # the server's address as the engine names it (no port: the server connected to this PC's `listen`)
+            peer = srv["address"]
+            key = f"{'[' + peer + ']' if ':' in peer else peer}:{port_of(listen) or 0}"
+            if on:
+                if ask:
+                    self.ask_agents([key], keys, expert_server=True)
+                a = self.agent_for(key, expert_server=True)
+        info = a.info if a is not None and a.ok else None
+        gpu = (info.get("gpus") or [None])[0] if info else None
+        if gpu is None and srv:
+            gpu = {"name": srv["gpu"], "vram_mib": None, "used_mib": None}   # (the engine's word for it, no VRAM)
+        state, since, err = self.experts_state(engine, rx)
+        held = rx["held"]
+        w = {"address": srv["address"] if srv else None, "listen": listen, "host": info.get("host") if info else None,
+             "agent": a.view() if a else None, "gpu": gpu, "version": None, "cache_slots": None, "cache_gib": None,
+             "own_ms": None, "relay_to": None, "layers": None, "round_trip_ms": rx["warm_ms"], "worker_ms": None,
+             "link_ms": None, "reconnects": max(0, log.get("rx_connects", 0) - 1), "since": since, "error": err,
+             "state": state,
+             "experts": {"held": held["experts"] if held else (srv["experts"] if srv else None),
+                         "gb": held["gb"] if held else (srv["gb"] if srv else None),
+                         "lane": srv["lane"] if srv else None, "routing_pct": srv["routing_pct"] if srv else None,
+                         "vram_gb": srv["vram_gb"] if srv else None, "upload_s": held["upload_s"] if held else None,
+                         "fills": rx["fills"], "fills_note": rx["fills_note"], "late": rx["late"],
+                         "late_note": rx["late_note"], "requests": rx["requests"] if srv else None}}
+        return {"kind": "experts", "listen": listen, "local_layers": None, "rows": None, "chunk": None, "context": None,
+                "gap_ms": None, "agents": on, "timing": True, "provisional": log["behind"] > 0, "workers": [w]}
+
+    def experts_state(self, engine, rx: dict):
+        """The expert server's link: (state, since, error), from this run's lines (MainLog.rx_event) and the engine."""
+        if getattr(engine, "unloaded", False):
+            return "unloaded", None, None
+        alive = engine.alive() if hasattr(engine, "alive") else True
+        proc = getattr(engine, "proc", None)
+        starting = not alive and proc is not None and proc.poll() is None
+        if not getattr(engine, "log_path", None):
+            return ("nolog" if alive else "connecting" if starting else "down"), None, None
+        lost, srv, wait = rx["lost"], rx["server"], rx["wait"]
+        if lost:   # given up (or never made): the CPU lane computes every expert until the engine starts again
+            return "down", lost["at"], {"text": lost["text"], "at": lost["at"]}
+        if not alive and not starting:
+            return "down", None, None
+        if rx["none"]:
+            return "idle", None, {"text": "the expert server holds none of this PC's experts", "at": None}
+        if srv:
+            return "connected", getattr(engine, "ready_at", None) or srv["at"], None
+        if wait:
+            return "connecting", wait["at"], {"text": f"waiting up to {wait['seconds']} s for an expert server on "
+                                                      f"{wait['listen']}", "at": wait["at"]}
+        return ("connecting" if starting else "unknown"), None, None
 
     def worker_view(self, i: int, addr: str, chain: list[str], engine, log: dict, on: bool) -> dict:
         a = self.agents.get(addr) if on else None
