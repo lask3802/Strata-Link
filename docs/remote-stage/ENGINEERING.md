@@ -952,6 +952,42 @@ Open: `STRATA_PRIMARY_DEVICE` other than 0 on a worker is allowed and not checke
 device 0); a checkpoint taken from `STRATA_CKPT_POOL` that the worker did not store is dropped rather than given back
 (`src/program/generate.cpp:9757-9760`); `clear_marks` (`src/program/generate.cpp:1788`) does not clear `remote_id`.
 
+### After the merge of 0.2.10 (2026-11-03)
+
+Upstream v0.2.10 (ffa80d73, engine 0.1.56) was merged into the fork's line (merge branch `merge-0210`, from
+0.1.55-link.1). Nothing in the stage link, its TLS, `tools/stage_node.py` or the release workflow changed upstream;
+protocol 8 stands. What meets a remote stage:
+- **Auto drafting on a layer split**: 0.2.10's `blocked_by` (`strata_control/drafting.py`) no longer stops DFlash2 on
+  a layer split, so Auto would pick `--draft dflash2 --draft-fallback none`. A remote stage's layers have no DFlash2
+  taps in the main process, so that engine would end after the whole load and the server start it again on the MTP.
+  `--remote-stage` is in `blocked_by`'s list: Auto keeps the MTP there, as before the merge.
+- **The RAM rules of the arena** (`--ram-keep-gib`, the hard-limit fallback to the file read): priced on the bytes of
+  the stage's own layer range (`span` in `ArenaExpertSource::open`), not the whole model's.
+- **The loan of the prompt path**: 0.2.10 keeps `g_lend_keep` slots (16 on a card too short for the usual loan, 128
+  otherwise) where it kept 128. The worker's `lend_whole` (the test of whether it can lend the main's whole chunk)
+  keeps the same number.
+- **The picture reader**: 0.2.10 starts a GPU reader on the first picture inside a 2048 MiB reserve by default
+  (`apply_vision_defaults`, one NVIDIA card). A vision section with Link's `"on_demand": true` is left alone (on_demand
+  wins over elastic in `start_vision`), so its reserve stays the config's. Not added for on_demand: upstream's CPU
+  reader when the card has no room.
+- **The dispatch counts** (`graph_launch`) are made where the window's graph is launched (`pl_graph_launch`): at once
+  locally, after the worker's rows on a remote stage.
+
+Measured on the rig (CT 580 RTX 2080 Ti, layers 0-19, + pve-5900x RTX 3080, layers 20-47, 10 GbE, TLS 1.3; DavidAU
+IQ3_S on SC117's tensors; K=20, no `--pipeline-windows`, `--vram-reserve-mib` 844 / 444, `--pcie-frac 0`,
+`STRATA_ROUTE_PRIOR` unset), 0.1.55-link.1 (the release zip) and then this merge (a CT build of 5bdc5d88, the release's
+CMake flags: `STRATA_PORTABLE`, CUDA 13, sm_75;86, OpenSSL 3.5.9 static) on both PCs, one run each, the same hour, no
+other build or request: 12 prompts x 200 tokens x 3 rounds, then 3 prompts of about 30K tokens read from 0.
+
+| | short prompts, decode (3 rounds) | ~30K prefill | ~30K decode |
+|---|---|---|---|
+| 0.1.55-link.1 | 82.83 / 84.24 / 84.01 tok/s | 1309 / 1376 / 1321 tok/s | 62.2 / 78.8 / 75.4 tok/s |
+| this merge | 84.77 / 85.24 / 84.26 tok/s | 1336 / 1331 / 1332 tok/s | 63.1 / 73.8 / 78.7 tok/s |
+
+Both are inside the noise of earlier same-setting runs (short prompts 81.9-84.2 tok/s, prefill 1329-1380 tok/s). The
+same 12 checks passed on both (arithmetic, a Chinese answer, code, a tool call and its result, three pictures and a
+text turn after them).
+
 ### After the merge of 0.2.9 (2026-10-31)
 
 Upstream v0.2.9 (c62d5e3a, engine 0.1.55) was merged into the fork's line (merge branch `merge-029`, from the 0.2.8
