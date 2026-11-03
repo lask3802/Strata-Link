@@ -1146,10 +1146,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the values, the layers split, the heavy picks, each pick's blocks once into its part, the tally; rx_send's rows,
       # the adds and the fallback by part (ds4_defer_rows.hpp), Pool::help_one (the speed path's poll); no GPU, no model
       add_executable(ds4_defer_split_test tests/dsv41/defer_split_test.cpp)
+      target_include_directories(ds4_defer_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_defer_split_test PRIVATE cxx_std_17)
       target_link_libraries(ds4_defer_split_test PRIVATE Threads::Threads)
       # DS4_IO_SPLIT (IoQueue's split read, ds4_pool.hpp): a read with a resident lead against a file of its own; Linux
       add_executable(ds4_io_split_test tests/dsv41/io_split_test.cpp)
+      target_include_directories(ds4_io_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_io_split_test PRIVATE cxx_std_17)
       target_link_libraries(ds4_io_split_test PRIVATE Threads::Threads)
       if(STRATA_ENABLE_CUDA)
@@ -1219,6 +1221,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_compile_features(ds4_rx_fill_test PRIVATE cxx_std_17)
       # the link's arrival time in the kernel (rx::Conn, SO_TIMESTAMPNS on Linux) over loopback: no GPU
       add_executable(ds4_rx_link_test tests/dsv41/rx_link_test.cpp src/dsv41/ds4_rx.cpp)
+      target_include_directories(ds4_rx_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_rx_link_test PRIVATE cxx_std_17)
       target_link_libraries(ds4_rx_link_test PRIVATE Threads::Threads)
       if(WIN32)
@@ -1227,6 +1230,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # DS4_RX_PREWAKE (rx::PreWake, rx::Main::prewake): when a prompt's wake request is due, and its reply kept out of
       # the requests' (take_late, stales, a wait's result) against a stand-in server over loopback: no GPU
       add_executable(ds4_rx_prewake_test tests/dsv41/rx_prewake_test.cpp src/dsv41/ds4_rx.cpp)
+      target_include_directories(ds4_rx_prewake_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_rx_prewake_test PRIVATE cxx_std_17)
       target_link_libraries(ds4_rx_prewake_test PRIVATE Threads::Threads)
       if(WIN32)
