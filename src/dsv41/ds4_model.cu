@@ -3776,7 +3776,8 @@ struct Model::Impl {
         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
         // (Strata: a GGUF's 32 while the lane is on, DS4_STREAM=1, and streamed experts land in them, DS4_LAND - the
         // link's bytes stay in VRAM; otherwise opt-in with DS4_RECENT=<n>)
-        recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && pk.gguf && ln_land && !lane_env_off() ? 32.0f : 0.0f));
+        recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && pk.gguf && ln_land && !lane_env_off() &&
+                                                         lane_off_why() == nullptr ? 32.0f : 0.0f));
         if (chunk > 0) {
             chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
@@ -13234,16 +13235,18 @@ struct Model::Impl {
     // leave: a request's picks, k_exp slots of the largest blob (~64 MB for Maya's quant, ~113 MB for MXFP4: ~0.3% of a
     // 32 GB card's experts).  Not where every expert of its layers fits in VRAM (no CPU lane), nor where the times file
     // says this GPU's split never streams (its start costs no VRAM then).
-    bool lane_alloc(std::string& err) {
-        if (!pk.gguf || lane_env_off() || !moe_token_path || sync_decode) return true;
-        // (the expert server's lane, its deferral and a remote stage plan the decode's CPU-lane picks themselves: the
-        // PCIe lane was never measured beside them, so it stays off there)
+    // (the expert server's lane, its deferral and a remote stage plan the decode's CPU-lane picks themselves: the
+    // PCIe lane was never measured beside them, so it stays off there - and its recent slots with it.  null: none)
+    const char* lane_off_why() const {
         const char* dv = std::getenv("DS4_EP_DEFER");
         const char* vv = std::getenv("DS4_EP_DEFER_VERIFY");
         const bool ep_def = (dv != nullptr && *dv != '\0' && std::atoi(dv) != 0) || (vv != nullptr && *vv != '\0' && std::atoi(vv) != 0);
-        if (!o.remote_experts.empty() || linked() || ep_def) {
-            std::fprintf(stderr, "ds4: DS4_STREAM: off for this run - %s\n",
-                         !o.remote_experts.empty() ? "--remote-experts" : linked() ? "a remote stage" : "DS4_EP_DEFER");
+        return !o.remote_experts.empty() ? "--remote-experts" : linked() ? "a remote stage" : ep_def ? "DS4_EP_DEFER" : nullptr;
+    }
+    bool lane_alloc(std::string& err) {
+        if (!pk.gguf || lane_env_off() || !moe_token_path || sync_decode) return true;
+        if (const char* why = lane_off_why()) {
+            std::fprintf(stderr, "ds4: DS4_STREAM: off for this run - %s\n", why);
             return true;
         }
         ln_file = lane_file();
@@ -18809,15 +18812,16 @@ struct Model::Impl {
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 const double m1 = tlog2 ? now_ms() : 0.0;
-                // U9 tail: the device experts' down before the wait (it reads the plan, not the answer; DS4_PROF's
-                // gate/up stretch then holds it)
-                const bool early = mx && u9::on(u9::kTail);
-                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed once, counted)
-                prof_mark(d, 3);
                 // the PCIe lane (a layer that streams): the experts the host reads for it pulled into this GPU's slots as
                 // they land, into the plan, their gate / up - all while the CPU lane computes - their down with the VRAM
                 // ones' below
                 const int lc = lead && nm == 1 && mx ? lane_class(l.il) : -1;
+                // U9 tail: the device experts' down before the wait (it reads the plan, not the answer; DS4_PROF's
+                // gate/up stretch then holds it).  Not on a layer that streams: the streamed experts enter the plan
+                // below, after it, and their down is the one after the wait
+                const bool early = mx && u9::on(u9::kTail) && lc < 0;
+                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed once, counted)
+                prof_mark(d, 3);
                 if (lc >= 0) {
                     const LaneDev& LD = ln_dev[(size_t) l.dev];
                     pcie::stream_fetch(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), !LD.direct,
