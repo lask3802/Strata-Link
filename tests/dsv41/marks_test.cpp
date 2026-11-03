@@ -14,7 +14,9 @@
 
 using strata::ds4::kLinkMarks;
 using strata::ds4::latest_point;
+using strata::ds4::link_mark_op;
 using strata::ds4::link_mark_plan;
+using strata::ds4::LinkMark;
 using strata::ds4::mark_plan;
 using strata::ds4::mark_victim;
 using strata::ds4::MarkAt;
@@ -42,17 +44,21 @@ struct Conv {
         return v;
     }
     void mark(bool shared) {
-        if (link && !shared) return;   // (Impl::mark: a remote stage keeps no other point)
+        if (link) {   // (Impl::mark -> link_mark: the shared start alone, link_mark_op's choice)
+            if (!shared) return;
+            const LinkMark op = link_mark_op(mk, pos());
+            if (op == LinkMark::Again)
+                for (MarkUse& m : mk)
+                    if (m.pos == pos()) m.used = ++clock;
+            if (op == LinkMark::Fill) mk.assign(kLinkMarks, {pos(), true, ++clock});
+            return;
+        }
         for (MarkUse& m : mk)
             if (m.pos == pos()) {
                 m.shared = m.shared || shared;
                 m.used = ++clock;
                 return;
             }
-        if (link) {   // (link_mark: the one kept gives way)
-            mk.assign(1, {pos(), true, ++clock});
-            return;
-        }
         if ((int) mk.size() >= cap) mk.erase(mk.begin() + mark_victim(mk));
         mk.push_back({pos(), shared, ++clock});
     }
@@ -190,6 +196,11 @@ int main() {
         v = link_mark_plan(150, 0, 1000, 16, {{100, 100}});        // (inside a picture's span: at its start)
         assert(v.size() == 1 && v[0].pos == 100 && v[0].shared);
     }
+    // link_mark_op (Model's link_mark, both ends): none at 0, the one there in use again, else the one place filled
+    assert(link_mark_op({}, 0) == LinkMark::None && link_mark_op({{5, true, 1}}, -1) == LinkMark::None);
+    assert(link_mark_op({}, 3000) == LinkMark::Fill);
+    assert(link_mark_op({{3000, true, 4}}, 3000) == LinkMark::Again);   // (nothing sent: both ends hold it)
+    assert(link_mark_op({{2000, true, 4}}, 3000) == LinkMark::Fill);    // (the one kept gives way)
 
     // mark_victim: the least recently used that is not a shared start, else the least recently used
     assert(mark_victim({}) == -1);

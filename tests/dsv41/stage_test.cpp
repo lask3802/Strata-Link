@@ -775,7 +775,9 @@ struct FakeModel {
         for (int64_t& c : ck) c = -1;
         held = false;
     }
-    void checkpoint(int role) { ck[role & 3] = p; }   // (role kCkShared: the Model's one shared start, link_mark)
+    void checkpoint(int role) {   // (as Model::checkpoint on a worker: st::ck_role - kCkShared its one shared start)
+        if (st::ck_role(role) != st::CkRole::None) ck[role & 3] = p;
+    }
     void pin() {
         if (ck[1] > 0) ck[2] = ck[1];
     }
@@ -1004,9 +1006,14 @@ static void test_ids() {
     int role = -1;
     CHECK(st::ck_save_op(st::kCkRole0, &role) == st::CkOp::Role && role == 0);
     CHECK(st::ck_save_op(st::kCkRole0 + 3, &role) == st::CkOp::Role && role == 3);
-    // (the shared start keeps the port's role 3 on the wire: a worker of either build reads the same id)
+    // (the shared start keeps the port's role 3 on the wire, a0a6c19e's checkpoint 3; a worker of c9000417 took it as
+    // checkpoint 1 - both ends of a link are one build)
     CHECK(st::kCkShared == 3 && st::ck_save_op(st::kCkRole0 + st::kCkShared, &role) == st::CkOp::Role &&
           role == st::kCkShared);
+    // what a worker's Model::checkpoint(role) keeps: 0 / 1 the end's, 3 the shared start, 2 nothing (kCkPin's)
+    CHECK(st::ck_role(0) == st::CkRole::Check && st::ck_role(1) == st::CkRole::Check);
+    CHECK(st::ck_role(st::kCkShared) == st::CkRole::Shared);
+    CHECK(st::ck_role(2) == st::CkRole::None && st::ck_role(-1) == st::CkRole::None && st::ck_role(4) == st::CkRole::None);
     CHECK(st::ck_save_op(st::kCkRole0 + 4) == st::CkOp::Pin && st::ck_save_op(st::kCkPin) == st::CkOp::Pin);
     CHECK(st::ck_save_op(0) == st::CkOp::Bad && st::ck_save_op(-5) == st::CkOp::Bad);
     CHECK(st::ck_save_op(st::kCkAt) == st::CkOp::Bad && st::ck_save_op(st::kSlotId0 - 1) == st::CkOp::Bad);

@@ -147,4 +147,16 @@ inline int mark_victim(const std::vector<MarkUse>& v) {
     return -1;
 }
 
+// A remote stage's shared start kept at `pos` (Model's link_mark, either end), given the points this end holds (`kept`):
+// None (position 0: nothing to go back to), Again (one is at `pos`: both ends hold it - in use again, nothing sent),
+// Fill (the worker's part asked for first on the main process, then this end's in the one place, kLinkMarks: the one
+// kept gives way; a worker that did not keep its part leaves this end none)
+enum class LinkMark { None, Again, Fill };
+inline LinkMark link_mark_op(const std::vector<MarkUse>& kept, int64_t pos) {
+    if (pos <= 0) return LinkMark::None;
+    for (const MarkUse& m : kept)
+        if (m.pos == pos) return LinkMark::Again;
+    return LinkMark::Fill;
+}
+
 }  // namespace strata::ds4

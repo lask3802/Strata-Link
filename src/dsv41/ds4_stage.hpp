@@ -419,6 +419,13 @@ inline CkOp ck_restore_op(int64_t id) {
     if (id == kCkAt) return CkOp::At;
     return id >= kSlotId0 ? CkOp::Slot : CkOp::Bad;
 }
+/// what Model::checkpoint(role) keeps: Check the end's checkpoint 0 or 1, Shared the shared start (its one restore
+/// point, Model's link_mark), None nothing (2 is the anchor's number only: kCkPin keeps the anchor)
+enum class CkRole { Check, Shared, None };
+inline CkRole ck_role(int role) {
+    if (role == 0 || role == 1) return CkRole::Check;
+    return role == kCkShared ? CkRole::Shared : CkRole::None;
+}
 
 /// The worker's answers to Reset (the main process starts again; `keep`: the slots it still has) and to the link ending
 /// (a new main process is a new id space: nothing is kept)

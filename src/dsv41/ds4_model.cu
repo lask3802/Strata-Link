@@ -8520,9 +8520,10 @@ struct Model::Impl {
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
         if (!ckpt_ok()) return;   // (a remote stage: the worker's layers would need theirs too - none, restore() goes nowhere)
-        if (slot == stage::kCkShared) {   // (a remote stage's worker: its part of the main process's shared start, link_mark)
-            if (o.stage_worker) link_mark();
-            return;
+        if (o.stage_worker) {   // (a remote stage's worker: the role the main process sent, stage::ck_role)
+            const stage::CkRole r = stage::ck_role(slot);
+            if (r == stage::CkRole::Shared) link_mark();   // (its part of the main process's shared start)
+            if (r != stage::CkRole::Check) return;
         }
         Check& c = ck[slot & 1];
         snap_into(c);
@@ -8588,17 +8589,24 @@ struct Model::Impl {
     // the link checks the worker is at this position) and keeps its own once the worker kept its part; the worker's
     // checkpoint(kCkShared) comes here.  One kept there already holds this state on both ends: in use again
     void link_mark() {
-        if (pos <= 0 || !ckpt_ok() || (o.remote_stage && (stage_lost || !link_shared_on()))) return;
-        for (Check& x : mk)
-            if (x.pos == pos) {
-                x.shared = true;
-                x.used = ++mark_clock;
-                return;
-            }
+        if (!ckpt_ok() || (o.remote_stage && (stage_lost || !link_shared_on()))) return;
+        std::vector<MarkUse> u;
+        for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
+        const LinkMark op = link_mark_op(u, pos);
+        if (op == LinkMark::None) return;
+        if (op == LinkMark::Again) {
+            for (Check& x : mk)
+                if (x.pos == pos) {
+                    x.shared = true;
+                    x.used = ++mark_clock;
+                }
+            return;
+        }
         if (o.remote_stage) {
             bool stored = false;
             std::string e;
             if (!stage_ck.save(stage::kCkRole0 + stage::kCkShared, pos, stored, e) || !stored) {
+                mk.clear();          // (the one kept may be gone on the worker: none here either)
                 stage_lost = true;   // (a worker out of step fails the next window, as a failed hop does)
                 stage_err = e.empty() ? "the worker did not keep the shared start" : e;
                 return;
