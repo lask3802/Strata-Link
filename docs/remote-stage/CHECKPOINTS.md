@@ -60,7 +60,8 @@ Out (forced off or refused in remote mode, each with a stderr line):
   on the remote receive thread, past `done`). A later step if prompts that diverge mid-way matter.
 - Parking (`--conversation-cache-mib`): ignored on a remote main (forced 0, stderr line), with or without
   checkpoints, as #1748 does, so a config with both still starts. A later step: the worker would keep its K/V images
-  under a park id.
+  under a park id. Since built as an opt-in: [PARKING.md](PARKING.md) (an explicit `--conversation-cache-mib N` with
+  `--prompt-cache N`, and a worker that lists `kStageCapPark`; without them, as above).
 - Session files: refused with a remote stage (the existing guard checks `stages`/`multi_gpu`, which a remote main has
   neither of).
 

@@ -1,6 +1,7 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
+#include "conversation_copy.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 
@@ -183,6 +184,30 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(!conversation_checkpoint_restore(no_ids,ss,g,97,error) && unchanged(),
           "explicit length past the cells rejected before writes");
     check(!conversation_checkpoint_save(no_ids,ss,g,97,error), "explicit-length save past the cells rejected");
+    // a remote stage worker's half of a parked conversation (docs/remote-stage/PARKING.md): this session's own layers'
+    // K/V and its running state at the length given, checked whole before any write
+    {
+        std::vector<ConversationKv> part_kv(image.kv.begin(), image.kv.end() - 1);   // (no draft layer: the main's)
+        size_t part_n = 0;
+        check(conversation_part_bytes(ss,g,9,part_n,error) && part_n > 0, "a park's byte count works without CUDA");
+        check(conversation_part_validate(part_kv,no_ids,ss,g,9,error), "a park of this carve validates");
+        auto reject_part = [&](const std::vector<ConversationKv>& kv, const ConversationCheckpoint& st, size_t tokens,
+                               const char* label) {
+            check(conversation_part_restore(kv,st,ss,g,tokens,error) == ConversationRestore::invalid, label);
+            check(unchanged(), "an invalid park's restore did not touch any layer or running-state buffer");
+        };
+        reject_part(part_kv, no_ids, 0, "an empty park rejected");
+        reject_part(part_kv, no_ids, 97, "a park past the cells rejected before writes");
+        auto short_state = no_ids; short_state.gdn.pop_back();
+        reject_part(part_kv, short_state, 9, "a park's bad running state rejected");
+        if (!zero_qsa) {
+            auto fewer = part_kv; fewer.pop_back();
+            reject_part(fewer, no_ids, 9, "a park of another layer carve rejected");
+            auto torn = part_kv; torn.back().k.pop_back();
+            reject_part(torn, no_ids, 9, "a park's corrupted K/V rejected before the first write");
+            check(!conversation_part_validate(image.kv,no_ids,ss,g,9,error), "a park with the draft layer rejected");
+        }
+    }
 #if defined(CONVERSATION_TEST_TRANSFERS)
     auto reset = [&] {
         for (auto* p : {&first,&last,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0xa5);
@@ -290,5 +315,40 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+    // a checkpoint copied into a dropped one's storage (STRATA_CKPT_POOL) takes the worker part's id too: the storage's
+    // own id is another checkpoint's part (docs/remote-stage/PARKING.md)
+    {
+        using namespace strata::core::conversation_detail;
+        ConversationCheckpoint from, into;
+        from.ids = {1, 2, 3}; from.gdn.resize(16, 3); from.remote_id = 42; from.pinned = true;
+        from.stage_parts.resize(1);
+        into.ids = {9}; into.gdn.resize(64, 9); into.remote_id = 7;
+        copy_checkpoint_into(into, from);
+        check(into.remote_id == 42 && into.ids == from.ids && into.gdn == from.gdn && into.pinned &&
+              into.stage_parts.size() == 1, "a pooled copy takes the remote id with the bytes");
+        const ConversationCheckpoint fresh = copy_checkpoint_beating(from);
+        check(fresh.remote_id == 42 && fresh.ids == from.ids, "a fresh copy keeps the remote id");
+        std::vector<ConversationCheckpoint> storage(1);
+        storage[0].remote_id = 5;
+        const auto copies = copy_checkpoints_beating({from}, &storage);
+        check(copies.size() == 1 && copies[0].remote_id == 42 && storage.empty(),
+              "copies into dropped storage keep each checkpoint's own remote id");
+    }
+    // the worker ids a parked image holds (its park and its checkpoints' parts)
+    {
+        SavedConversation a;
+        a.live.ids = {1, 2};
+        a.remote_park = 11;
+        a.checkpoints.resize(2);
+        a.checkpoints[0].remote_id = 3;
+        a.checkpoints[1].remote_id = 0;   // (none on the worker)
+        std::vector<int64_t> out{99};
+        a.remote_ids(out);
+        check((out == std::vector<int64_t>{99, 11, 3}), "an image appends its park and its checkpoints' parts");
+        SavedConversation none;
+        out.clear();
+        none.remote_ids(out);
+        check(out.empty(), "an image without a remote stage holds no worker ids");
+    }
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

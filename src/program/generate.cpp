@@ -83,6 +83,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/net/stage_link.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
+#include "strata/net/stage_park_store.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/gated_proposal.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -928,6 +929,10 @@ struct Options {
     /// (--stage-end K2 --stage-next HOST:PORT); that worker's reply is this one's
     int64_t stage_end = -1;
     std::string stage_next;
+    /// a worker: the RAM it may give a parking main process's parked conversations (--stage-park-mib N;
+    /// docs/remote-stage/PARKING.md).  -1: half of the RAM available at the main process's hello, less its checkpoint
+    /// share, at most 16 GiB; 0: no parking (the worker's hello does not list kStageCapPark)
+    int64_t stage_park_mib = -1;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1129,6 +1134,8 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --stage-park-mib N   a stage worker: RAM for a parking main process's parked conversations (default:\n"
+                 "                       half the RAM available at its hello, up to 16384; 0 = none; docs/remote-stage/PARKING.md)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -3677,6 +3684,7 @@ int main(int argc, char** argv) {
         else if (a == "--stage-bind") o.stage_bind = next("--stage-bind");
         else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
         else if (a == "--stage-next") o.stage_next = next("--stage-next");
+        else if (a == "--stage-park-mib") o.stage_park_mib = std::atoll(next("--stage-park-mib"));
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -4204,6 +4212,7 @@ int main(int argc, char** argv) {
     const bool remote_main = !o.remote_stage.empty();
     const bool stage_worker = o.stage_worker > 0;
     int64_t own_lo = 0, own_hi = -1;
+    bool remote_park_asked = false;   // a remote main with --conversation-cache-mib N (docs/remote-stage/PARKING.md)
     std::shared_ptr<strata::net::TlsCredentials> stage_cred;   // remote stage: this PC's key and the certificates it accepts
     if (remote_main || stage_worker) {
         const char* why = nullptr;
@@ -4259,14 +4268,33 @@ int main(int argc, char** argv) {
         if (remote_main && o.prompt_cache == 0)
             std::fprintf(stderr, "strata generate: remote stage: conversation checkpoints are off, every prompt is read "
                                  "from token 0 (--prompt-cache N on the main process turns them on)\n");
-        if (remote_main && o.conversation_cache_mib > 0)
+        // parked conversations (docs/remote-stage/PARKING.md): only when --conversation-cache-mib N is given (never the
+        // automatic size of a one-GPU server) with checkpoints on; the worker keeps its half, when its hello says it
+        // can (read at every connection)
+        remote_park_asked = remote_main && o.prompt_cache > 0 && o.conversation_cache_mib > 0 &&
+                                       o.conversation_cache_slots > 0;
+        if (remote_main && o.conversation_cache_mib > 0 && !remote_park_asked)
             std::fprintf(stderr, "strata generate: remote stage: conversation parking is off "
-                                 "(--conversation-cache-mib ignored)\n");
+                                 "(--conversation-cache-mib needs --prompt-cache N on the main process)\n");
         if (o.prompt_cache > 0)
             std::fprintf(stderr, "strata generate: remote stage: %d conversation checkpoints, at the prompt's turn "
                                  "boundaries only (--prompt-cache-every and --prompt-cache-tail are off)\n",
                          o.prompt_cache);
-        o.conversation_cache_mib = 0;
+        // the ids a parking main process may hold on the worker: the chain and each parked conversation's checkpoints,
+        // plus one park each, must fit in one keep[] (kStageKeepMax) and the worker's checkpoint store (kStageCkptMax)
+        if (remote_park_asked &&
+            ((int64_t) o.conversation_cache_slots + 1) * (o.prompt_cache + 1) > strata::net::kStageCkptMax) {
+            std::fprintf(stderr, "strata generate: remote stage: %d parked conversations of up to %d checkpoints "
+                                 "each need more checkpoint parts than a worker keeps (%d): lower "
+                                 "--conversation-cache-slots or --prompt-cache\n",
+                         o.conversation_cache_slots, o.prompt_cache + 1, strata::net::kStageCkptMax);
+            return 2;
+        }
+        if (remote_park_asked)
+            std::fprintf(stderr, "strata generate: remote stage: up to %d parked conversations in %lld MiB here, the "
+                                 "worker keeping its half (docs/remote-stage/PARKING.md)\n",
+                         o.conversation_cache_slots, (long long) o.conversation_cache_mib);
+        if (!remote_park_asked) o.conversation_cache_mib = 0;
         o.prompt_cache_every = 0;
         o.prompt_cache_tail = false;
         o.kv_grow = false;   // the elastic K/V gives this process's cache slots up without the other side knowing
@@ -12431,6 +12459,28 @@ int main(int argc, char** argv) {
             });
         };
         pool_topup();   // the first request's checkpoints find the pool full
+        // remote-stage: the last id a checkpoint's or a parked conversation's worker part got (from 1, never reused)
+        int32_t remote_ckpt_id = 0;
+        // remote-stage parks (docs/remote-stage/PARKING.md): whether the worker keeps its half of a parked
+        // conversation (set at every connect), and the worker ids of the parked conversation a request has taken from
+        // the cache but not restored yet (a root the cache no longer lists)
+        bool remote_park_on = false;
+        std::vector<int64_t> remote_park_extra;
+        // every worker id the main process still holds, once each and in this order: `v` (a chain's checkpoint parts),
+        // then the parked conversations' parks and parts, then remote_park_extra.  Without parks it is `v` as given.
+        auto remote_roots = [&](std::vector<int64_t> v) {
+            std::vector<int64_t> more;
+            conversations.remote_ids(more);
+            more.insert(more.end(), remote_park_extra.begin(), remote_park_extra.end());
+            return strata::net::stage_keep_roots(std::move(v), more);
+        };
+        // the worker's parts a Reset, CkptRestore or ParkRestore keeps: this chain's and every root above
+        auto remote_keep = [&] {
+            std::vector<int64_t> v;
+            for (const ConvCheckpoint& k : checks)
+                if (k.remote_id != 0) v.push_back(k.remote_id);
+            return remote_roots(std::move(v));
+        };
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -12440,6 +12490,20 @@ int main(int argc, char** argv) {
                 ParkStage() { strata::core::progress_at("request: parking the previous conversation"); }
                 ~ParkStage() { strata::core::progress_at("request"); strata::core::progress_beat(); }
             } park_stage;
+            // a remote stage: a park needs the worker's half too (docs/remote-stage/PARKING.md) - only from the main
+            // session (a batch slot's state is not the worker's session), only with a worker that keeps parks, and
+            // not after a pipelined window failed (the worker's session is not confirmed then)
+            if (remote_main) {
+                const char* why = !remote_park_on ? "the remote stage keeps no parked conversations"
+                                  : !src.with_reuse ? "a batch slot with a remote stage"
+                                  : !pl_drain_err.empty() ? "a pipelined window failed"
+                                  : remote_ckpt_id == INT32_MAX ? "the remote stage's ids are used up"
+                                  : nullptr;
+                if (why != nullptr) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", why);
+                    return true;
+                }
+            }
             // --conversation-cache-min-tokens: a short conversation is not worth one of the slots.  Parking is a
             // switch-time decision, so a client's small side requests would otherwise park themselves and, once the
             // cache is full, evict the long conversation they were interleaved with (oldest first) - the reuse it
@@ -12569,6 +12633,30 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                // a remote stage: the worker keeps its half first, under a new id, with every root the main process
+                // holds (this chain, the parked conversations left after the evictions above, one a request took
+                // out).  Not kept there: no park here either.  An error skips it too: a lost link is made again by
+                // the request's next message, and a worker's error leaves a session the request replaces next.
+                int32_t park_id = 0;
+                if (remote_main) {
+                    std::vector<int64_t> keep;
+                    for (const ConvCheckpoint& k : view.checkpoints)
+                        if (k.remote_id != 0) keep.push_back(k.remote_id);
+                    park_id = ++remote_ckpt_id;
+                    keep.push_back(park_id);
+                    keep = remote_roots(std::move(keep));
+                    bool kept = false;
+                    std::string re;
+                    const auto tw = Clock::now();
+                    if (!remote_link.park_save(park_id, (int64_t) src.ids.size(), keep, kept, re) || !kept) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n",
+                                     kept || !re.empty() ? re.c_str() : "the remote stage did not keep its half");
+                        return true;
+                    }
+                    std::fprintf(stderr, "strata serve: remote stage: parked conversation %lld (%zu tokens) kept on the "
+                                         "worker in %.1f ms\n", (long long) park_id, src.ids.size(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
@@ -12614,6 +12702,7 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
+                image.remote_park = park_id;   // (after the saves: they fill the image afresh)
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
@@ -12730,7 +12819,6 @@ int main(int argc, char** argv) {
                 : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
                                                                tail_flags.get(), pin_flags.get());
         };
-        int32_t remote_ckpt_id = 0;   // remote-stage: the last id a checkpoint's worker part got (from 1, never reused)
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
@@ -12766,6 +12854,7 @@ int main(int argc, char** argv) {
                 for (const ConvCheckpoint* k : after)
                     if (k->remote_id != 0) keep.push_back(k->remote_id);
                 if (std::find(keep.begin(), keep.end(), c.remote_id) == keep.end()) keep.push_back(c.remote_id);
+                keep = remote_roots(std::move(keep));   // (the parked conversations' parts stay: PARKING.md)
                 // the part's windows are on the wire before this (read_windows_pl ends with nothing in flight), and
                 // a pipelined window that failed meanwhile is not saved over
                 if (!pl_drain_err.empty()) {
@@ -14615,6 +14704,7 @@ int main(int argc, char** argv) {
             }
         };
         bool remote_cancelled = false;   // the last remote_connect ended on a STOP (in a request)
+        bool said_parks = false;         // remote_connect logged whether the worker keeps parks
         auto remote_connect = [&](std::string& e, bool in_request) -> bool {
             static const int wait_s = [] {
                 const char* v = std::getenv("STRATA_REMOTE_CONNECT_S");
@@ -14655,6 +14745,16 @@ int main(int argc, char** argv) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
             strata::core::progress_allow(0);
+            // parked conversations (docs/remote-stage/PARKING.md): this worker's hello says whether it keeps its half
+            const bool parks = remote_park_asked && (remote_peer.row_formats & strata::net::kStageCapPark) != 0;
+            if (remote_park_asked && (parks != remote_park_on || !said_parks)) {
+                std::fprintf(stderr, "strata serve: remote stage: %s\n",
+                             parks ? "the worker keeps its half of parked conversations"
+                                   : "the worker keeps no parked conversations (an older build, --stage-park-mib 0, a "
+                                     "relay or a split worker): conversations are not parked");
+                said_parks = true;
+            }
+            remote_park_on = parks;
             return true;
         };
         if (stage_worker || remote_main) {
@@ -14678,6 +14778,12 @@ int main(int argc, char** argv) {
             // conversation checkpoints: the parts the main process may have the worker keep (the chain and the one
             // being saved); a worker's own hello: its limit
             me.ckpt_max = stage_worker ? strata::net::kStageCkptMax : o.prompt_cache > 0 ? o.prompt_cache + 1 : 0;
+            // parked conversations (docs/remote-stage/PARKING.md): a worker that keeps its half of them - not a relay,
+            // not one whose layers are split over its own GPUs (a park holds its first session only), not with
+            // --stage-park-mib 0 - and a main process that parks
+            const bool park_cap = stage_worker ? o.stage_park_mib != 0 && !stage_relay && stages.empty()
+                                               : remote_park_asked;
+            if (park_cap) me.row_formats |= strata::net::kStageCapPark;
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -14777,6 +14883,11 @@ int main(int argc, char** argv) {
                 };
                 int32_t main_ckpt_max = 0;       // the checkpoint parts the main process may have this worker keep
                 uint32_t main_rows = 1u << 0;    // the row formats it lists (a relay's next link asks for the same)
+                // parked conversations (docs/remote-stage/PARKING.md): this worker keeps them (its hello lists the bit),
+                // the main process it serves parks (its hello does), and what it may hold for them
+                const bool wk_parks = (me.row_formats & strata::net::kStageCapPark) != 0;
+                bool main_parks = false;
+                strata::net::StageParkBudget park_budget;
                 hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
                     mine = me;   // (the worker's own hello carries no token)
                     // another protocol: the link refuses it for its number (its fields may sit elsewhere)
@@ -14805,11 +14916,11 @@ int main(int argc, char** argv) {
                     }
                     // its conversation checkpoints: this worker's part of each (its layers' running state) must fit in
                     // half of the RAM available
+                    uint64_t part = 0;
                     {
                         const ConvStateSizes cz = conv_state_sizes(g, ss);
                         const uint64_t qsa = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
-                        const uint64_t part = cz.gdn + (ss.ple_hist ? cz.ple : 0) +
-                                              qsa * (cz.tail + cz.dead + cz.block_pos);
+                        part = cz.gdn + (ss.ple_hist ? cz.ple : 0) + qsa * (cz.tail + cz.dead + cz.block_pos);
                         if (!strata::net::stage_ckpt_ram_ok(theirs.ckpt_max, part,
                                                             strata::core::available_host_bytes(), e))
                             return false;
@@ -14844,6 +14955,23 @@ int main(int argc, char** argv) {
                     }
                     main_ckpt_max = theirs.ckpt_max;
                     main_rows = theirs.row_formats;
+                    // parked conversations: the budget is this main process's (the RAM available now, its checkpoints)
+                    main_parks = wk_parks && (theirs.row_formats & strata::net::kStageCapPark) != 0;
+                    park_budget = {};
+                    if (main_parks) {
+                        const auto avail = strata::core::available_host_bytes();
+                        const uint64_t ckpt_share = (uint64_t) std::max<int32_t>(theirs.ckpt_max, 0) * part;
+                        park_budget.budget = o.stage_park_mib > 0 ? (uint64_t) o.stage_park_mib << 20
+                                                                  : strata::net::stage_park_auto_budget(avail, ckpt_share);
+                        park_budget.floor = (uint64_t) std::max<int64_t>(o.conversation_cache_min_free_mib, 0) << 20;
+                        park_budget.ckpt_max = theirs.ckpt_max;
+                        park_budget.part_bytes = part;
+                        std::fprintf(stderr, "strata stage worker: parked conversations: up to %llu MiB (%s; RAM floor "
+                                             "%llu MiB; checkpoint parts %llu MiB each)\n",
+                                     (unsigned long long) (park_budget.budget >> 20),
+                                     o.stage_park_mib > 0 ? "--stage-park-mib" : "half the RAM available, at most 16 GiB",
+                                     (unsigned long long) (park_budget.floor >> 20), (unsigned long long) (part >> 20));
+                    }
                     return true;
                 };
                 int64_t wk_rounds = 0;
@@ -15029,6 +15157,14 @@ int main(int argc, char** argv) {
                 // conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): this worker's layers' part of each,
                 // under the main process's id; the main process decides what stays (`keep`), this store never evicts
                 strata::net::StageCkptStore ckpt_store;
+                // parked conversations (docs/remote-stage/PARKING.md): this worker's half of each - its layers' K/V of
+                // the first L cells and its running state at L - under the main process's id; the main process decides
+                // what stays, as for the checkpoint parts
+                struct WkPark {
+                    std::vector<strata::core::ConversationKv> kv;
+                    strata::core::ConversationCheckpoint state;
+                };
+                strata::net::StageParkStore<WkPark> park_store;
                 hs.reset = [&](const std::vector<int64_t>& keep, std::string& e) -> bool {
                     const WkBusy busy("stage worker reset");
                     if (stage_relay) {   // the next worker zeroes its session too (a broken link is made again)
@@ -15042,6 +15178,7 @@ int main(int argc, char** argv) {
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     if (cudaStreamSynchronize(main_stream) != cudaSuccess) return false;
                     ckpt_store.prune(keep);
+                    park_store.prune(keep);
                     return true;
                 };
                 // a relay: the next worker first, synchronously (its reply then decides this worker's step)
@@ -15067,6 +15204,19 @@ int main(int argc, char** argv) {
                     }
                     if (!ver.wait_commit(e)) return -1;
                     if (!ckpt_store.admits(id, keep)) return not_stored("64 kept at most");
+                    // a parking main process (docs/remote-stage/PARKING.md): the parts beyond its hello's count go
+                    // against the parks' budget, and every new part against the RAM floor (refused: the store as it was)
+                    if (main_parks) {
+                        std::string why;
+                        if (!strata::net::stage_park_fits(park_budget, park_store.bytes_kept(keep),
+                                                          ckpt_store.size_after(id, keep),
+                                                          park_budget.part_bytes, strata::core::available_host_bytes(),
+                                                          why)) {
+                            std::fprintf(stderr, "strata stage worker: checkpoint %lld not stored (%s)\n",
+                                         (long long) id, why.c_str());
+                            return 0;
+                        }
+                    }
                     try {
                         strata::net::StageCkptStore::Part part;
                         part.L = L;
@@ -15076,6 +15226,7 @@ int main(int argc, char** argv) {
                         }
                         if (!strata::core::conversation_checkpoint_save(part.state, ss, g, (size_t) L, e)) return -1;
                         ckpt_store.put(id, std::move(part), keep);
+                        park_store.prune(keep);   // (the parks the main process dropped since its last keep[])
                     } catch (const std::bad_alloc&) {   // host RAM: not stored, the store as it was
                         return not_stored("allocation failed");
                     }
@@ -15116,8 +15267,106 @@ int main(int argc, char** argv) {
                     }
                     if (!strata::core::conversation_checkpoint_restore(part->state, ss, g, (size_t) L, e)) return false;
                     ckpt_store.prune(keep);
+                    park_store.prune(keep);
                     return true;
                 };
+                // parked conversations (docs/remote-stage/PARKING.md); unset when this worker does not keep them (its
+                // hello does not list the bit, so no main process sends these)
+                if (wk_parks) {
+                    hs.park_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
+                        const WkBusy busy("stage worker park save");
+                        if (!main_parks) {
+                            e = "the main process did not say at its hello that it parks conversations";
+                            return -1;
+                        }
+                        if (!ver.wait_commit(e)) return -1;
+                        // the main process applied its evictions before it sent this: what keep[] does not name goes
+                        // first, whatever comes of the save (docs/remote-stage/PARKING.md)
+                        ckpt_store.prune(keep);
+                        park_store.prune(keep);
+                        auto not_stored = [&](const std::string& why) -> int {
+                            std::fprintf(stderr, "strata stage worker: parked conversation %lld (%lld tokens) not kept "
+                                                 "(%s); %zu parked, %llu MiB\n", (long long) id, (long long) L,
+                                         why.c_str(), park_store.size(), (unsigned long long) (park_store.bytes() >> 20));
+                            return 0;
+                        };
+                        size_t need = 0;
+                        if (!strata::core::conversation_part_bytes(ss, g, (size_t) L, need, e)) return -1;
+                        std::string why;
+                        if (!strata::net::stage_park_fits(park_budget, park_store.bytes() + need, ckpt_store.size(),
+                                                          need, strata::core::available_host_bytes(), why))
+                            return not_stored(why);
+                        const auto t0 = Clock::now();
+                        try {
+                            if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                                e = std::string("stage worker: before a park: ") + cudaGetErrorString(se);
+                                return -1;
+                            }
+                            strata::net::StageParkStore<WkPark>::Park p;
+                            p.L = L;
+                            p.bytes = need;
+                            if (!strata::core::conversation_part_save(p.payload.kv, p.payload.state, ss, g, (size_t) L, e))
+                                return -1;
+                            park_store.put(id, std::move(p));
+                        } catch (const std::bad_alloc&) {   // host RAM: not stored (the prune above stands)
+                            return not_stored("allocation failed");
+                        }
+                        std::fprintf(stderr, "strata stage worker: parked conversation %lld: %lld tokens, %llu MiB in "
+                                             "%.0f ms; %zu parked, %llu MiB\n", (long long) id, (long long) L,
+                                     (unsigned long long) (need >> 20),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     park_store.size(), (unsigned long long) (park_store.bytes() >> 20));
+                        return 1;
+                    };
+                    hs.park_restore = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> bool {
+                        const WkBusy busy("stage worker park restore");
+                        if (!ver.wait_commit(e) || !refill(e)) return false;
+                        apply_pending(true);
+                        // STRATA_REMOTE_PARK_DROP=1 (testing): the parks are emptied first, so the main process's
+                        // fallback (the prompt from token 0) runs
+                        static const bool drop = [] {
+                            const char* v = std::getenv("STRATA_REMOTE_PARK_DROP");
+                            return v && v[0] == '1';
+                        }();
+                        if (drop) park_store.clear();
+                        const auto* p = park_store.find(id);
+                        if (p == nullptr) {
+                            e = std::string(strata::net::kStageCkptMissing) + "parked conversation " + std::to_string(id);
+                            return false;
+                        }
+                        if (p->L != L) {
+                            e = "parked conversation " + std::to_string(id) + " was saved at " + std::to_string(p->L) +
+                                ", not at " + std::to_string(L);
+                            return false;
+                        }
+                        if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                            e = std::string("stage worker: before a park's restore: ") + cudaGetErrorString(se);
+                            return false;
+                        }
+                        const auto t0 = Clock::now();
+                        std::string why;
+                        const auto r = strata::core::conversation_part_restore(p->payload.kv, p->payload.state, ss, g,
+                                                                               (size_t) L, why);
+                        if (r == strata::core::ConversationRestore::invalid) {   // nothing written: the fallback
+                            e = std::string(strata::net::kStageCkptMissing) + "parked conversation " +
+                                std::to_string(id) + " failed its check (" + why + ")";
+                            return false;
+                        }
+                        if (r != strata::core::ConversationRestore::restored) {   // partly written: the session is lost
+                            e = "stage worker: a parked conversation's restore failed: " + why;
+                            return false;
+                        }
+                        const uint64_t bytes = p->bytes;
+                        ckpt_store.prune(keep);
+                        park_store.prune(keep);   // (this park among them: the main process took it)
+                        std::fprintf(stderr, "strata stage worker: restored parked conversation %lld: %lld tokens, %llu "
+                                             "MiB in %.0f ms; %zu parked, %llu MiB\n", (long long) id, (long long) L,
+                                     (unsigned long long) (bytes >> 20),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     park_store.size(), (unsigned long long) (park_store.bytes() >> 20));
+                        return true;
+                    };
+                }
                 // --vision: the main process's position table for its next request.  A picture's cells rotate by
                 // their (t, h, w) and every cell after it by the picture's extent, not its token count, so this
                 // worker's rope kernels need the same table the main process built (they read their own copy).
@@ -15163,6 +15412,7 @@ int main(int argc, char** argv) {
                 hs.disconnected = [&] {
                     std::string e;
                     ckpt_store.clear();   // a new main process is a new id space
+                    park_store.clear();   // (its parked conversations too)
                     (void) ver.wait_commit(e);
                     // a picture's positions do not reach the next main process's text (a relay's next worker resets
                     // its own when this relay closes the link below)
@@ -15274,7 +15524,17 @@ int main(int argc, char** argv) {
             if (!strata::net::stage_link_lost(e)) return false;
             const std::string lost = e;
             const bool made = remote_connect(e, true);
-            if (made) remote_fresh = true;
+            if (made) {
+                remote_fresh = true;
+                // the worker's parks went with the old connection: the parked conversations here are halves
+                // (docs/remote-stage/PARKING.md), and so is one a request took out
+                remote_park_extra.clear();
+                if (remote_park_asked)
+                    if (const size_t dropped = conversations.clear())
+                        std::fprintf(stderr, "strata serve: conversation cache: dropped %zu parked conversation%s "
+                                             "(the remote stage's halves went with the link)\n", dropped,
+                                     dropped == 1 ? "" : "s");
+            }
             if (!made ||
                 (remote_pos_cells >= 0 &&
                  !remote_link.positions(remote_pos_cells > 0 ? mrope_host.data() : nullptr, remote_pos_cells, e))) {
@@ -17497,7 +17757,8 @@ int main(int argc, char** argv) {
             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
             // start of this prompt wins as before)
-            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+            // (a remote stage takes a parked conversation whole too: the worker's park is restored whole, PARKING.md)
+            bool borrow = stages.empty() && !remote_main && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
@@ -17610,6 +17871,9 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
+            // a remote stage: the parked conversation taken out stays a root of every keep[] until its restore
+            remote_park_extra.clear();
+            if (remote_main && incoming) incoming->remote_ids(remote_park_extra);
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -17810,7 +18074,52 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                // a remote stage (docs/remote-stage/PARKING.md): the worker's half, restored whole at the image's
+                // length (a checkpoint inside it is mounted below on both sides, as for any checkpoint).  A park the
+                // worker does not hold, or one that fails its check before any write, reads this prompt from token
+                // 0 (the reset below); a lost link is made again, which holds none.  Anything else ends the engine.
+                bool remote_half_missing = false;
+                if (remote_main) {
+                    const int32_t park_id = incoming->remote_park;
+                    remote_park_extra.clear();   // (taken: its checkpoints are this chain's now)
+                    const auto tw = Clock::now();
+                    bool missing = park_id == 0;
+                    if (!missing &&
+                        !remote_link.park_restore(park_id, (int64_t) live.size(), remote_keep(), missing, err)) {
+                        if (!missing && strata::net::stage_link_lost(err)) {
+                            if (!remote_relink(err)) {
+                                std::printf("ERR %s (restoring a parked conversation)\n", err.c_str());
+                                std::fflush(stdout);
+                                if (remote_cancelled) continue;   // (a STOP: the link stays closed, the engine stays)
+                                return 1;
+                            }
+                            missing = true;
+                        }
+                        if (!missing) {   // the worker's session is lost: the engine stops (the server starts it again)
+                            if (err.rfind("remote stage", 0) == 0)
+                                std::printf("ERR %s (restoring a parked conversation)\n", err.c_str());
+                            else
+                                std::printf("ERR restoring a parked conversation failed: %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
+                    if (missing) {
+                        std::fprintf(stderr, "strata serve: the remote stage does not hold parked conversation %lld "
+                                             "(%s): reading the prompt from token 0\n", (long long) park_id,
+                                     park_id == 0 ? "none was kept" : remote_fresh ? "the link was made again"
+                                                                                   : err.c_str());
+                        err.clear();
+                        remote_half_missing = true;
+                        resume = 0;
+                        from_live = false;
+                        checks.clear();
+                    } else {
+                        std::fprintf(stderr, "strata serve: remote stage: parked conversation %lld (%zu tokens) "
+                                             "restored on the worker in %.1f ms\n", (long long) park_id, live.size(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                    }
+                }
+                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr && !remote_half_missing) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
@@ -17851,13 +18160,7 @@ int main(int argc, char** argv) {
                 }
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
-            // remote-stage: the worker's parts of the checkpoints kept here (a Reset or CkptRestore keeps only those)
-            auto remote_keep = [&] {
-                std::vector<int64_t> v;
-                for (const ConvCheckpoint& k : checks)
-                    if (k.remote_id != 0) v.push_back(k.remote_id);
-                return v;
-            };
+            // (remote-stage: a Reset or CkptRestore keeps the worker's parts remote_keep() names, above)
             // every session zeroed for a read from token 0 - a remote worker's too, keeping its checkpoint parts `keep`
             auto session_from0 = [&](const std::vector<int64_t>& keep) -> bool {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
@@ -17957,7 +18260,7 @@ int main(int argc, char** argv) {
                                                  "tokens (%s): reading the prompt from token 0\n", (long long) resume,
                                          err.c_str());
                         err.clear();
-                        if (!session_from0({})) {
+                        if (!session_from0(remote_roots({}))) {   // (the chain goes; the parked conversations stay)
                             std::printf("ERR %s\n", err.c_str());
                             std::fflush(stdout);
                             if (remote_cancelled) continue;

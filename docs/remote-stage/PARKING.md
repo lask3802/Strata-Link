@@ -1,7 +1,8 @@
 # Parked conversations across a remote stage
 
-Status: design (2026-11-11), reviewed before it was built ([Review](#review)); [As built](#as-built) is filled in
-with the code. Opt-in: nothing changes without `--conversation-cache-mib N` given explicitly to the main process.
+Status: built (2026-11-11) and checked without a GPU; not yet run on GPUs. The design was reviewed before it was built
+([Review](#review)); where the code differs from it, [As built](#as-built) says so. Opt-in: nothing changes without
+`--conversation-cache-mib N` given explicitly to the main process.
 
 ## The problem
 
@@ -183,7 +184,8 @@ admits, so a dropped park never makes it refuse a new one.
 | A park does not fit (budget, RAM floor, RAM unknown, allocation) | `ParkSaveOk a=0`: not parked, one line; as today for that conversation |
 | A restore finds no park (pruned, restarted worker, invalid image) | That request reads from token 0; as today |
 | The link is lost at a request's start (alive, ParkSave, ParkRestore) | Made again; parks dropped; the request reads from token 0 |
-| A copy fails after its first write, a position mismatch | The engine ends, the server starts it again (CkptSave's class) |
+| A ParkSave fails on the worker (position, pending error, copy) | Not parked, one line ([As built](#as-built)) |
+| A ParkRestore fails after its first write, or at another length | The engine ends, the server starts it again (CkptSave's class) |
 
 ## Cost and expected effect (estimated, not measured)
 
@@ -208,18 +210,66 @@ admits, so a dropped park never makes it refuse a new one.
 
 ## Checks
 
-- Unit (no GPU): the worker's store (admission with the extra checkpoint parts and the allocation peak, a ParkSave's
-  prune before admission, a refused CkptSave leaving the store as it was, ids counted once, clear); the new messages
-  over a loopback link (fields, keep[] longer than 64, the bit, the position checks, missing vs other restore errors,
-  a failed position table reported by a ParkRestore, a worker without the handlers); `copy_checkpoint_into` keeping
-  `remote_id`; `ConversationCache::remote_ids`.
-- Integration (no GPU): a loopback main and worker whose "session" is host memory written as a function of the tokens:
-  a long conversation, a side request, the long conversation again, an eviction, a park the worker refuses, a lost
-  park; the restored cells and state must equal what reading the prompt from 0 gives, and keep[] must free exactly the
-  dropped parks.
-- On GPUs (not run here): the CHECKPOINTS.md replay with a side request between turns, every repeated turn
-  byte-identical and the restores in both logs; the default path byte-identical to the base build; the fallback with
-  a worker debug switch that empties its parks; a worker restarted between turns.
+Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1`):
+
+- `stage_park_store_test` (new, header-only): the worker's park store (bytes, replace, prune, clear); the admission
+  (the budget with the checkpoint parts beyond `ckpt_max`, exactly full, the RAM floor at the allocation, unknown RAM,
+  overflow); the default budget; `StageCkptStore::size_after`; the main process's keep[] (`stage_keep_roots`: without
+  parks exactly the chain's list); and a walk of both stores through a long conversation, a side request, the long
+  conversation restored, a park over the budget and an eviction.
+- `stage_link_test` section 18 (new): ParkSave / ParkRestore over a TLS loopback link: the bit, a keep[] of 201 ids
+  (more than 64), one of 257 refused with the link in step, the position checks, a=0 with the prune kept, a worker's
+  error kept apart from a lost link, missing vs other restore errors, no position after a failed restore, a failed
+  position table and a failed Commit on each message, a disconnect, and a worker without the handlers (no bit, errors
+  that are not the missing one, at most 64 ids).
+- `conversation_validation_test` (added to): the worker half's byte count, its validation, and every rejection before
+  the first write (empty, past the cells, a bad running state, another layer carve, a torn K/V, the draft layer);
+  `copy_checkpoint_into` and the other checkpoint copies keeping `remote_id`; `SavedConversation::remote_ids`.
+- `conversation_cache_test` (added to): `ConversationCache::remote_ids` after a put, a take, an eviction, `clear()`.
+- The tests that passed before the change pass after it (`stage_ckpt_store_test`, `conv_cache_test`, the rest above).
+
+Not run:
+
+- The integration test the design asked for (a loopback main and worker over a host-memory session) is not built: the
+  main process's side of parking is inline in `generate.cpp`'s serve loop and cannot run without a model. Its pieces
+  are tested apart (above); the order of the messages in `generate.cpp` is checked by review only.
+- A Linux build (GCC): the WSL here has GCC 9, which the code base does not build with already.
+- On GPUs: the CHECKPOINTS.md replay with a side request between turns, every repeated turn byte-identical and the
+  restores in both logs; the default path byte-identical to the base build; the fallback with
+  `STRATA_REMOTE_PARK_DROP=1` on the worker; a worker restarted between turns.
+
+## As built
+
+Where the code differs from the design above, or says more than it:
+
+- A ParkSave that fails on the worker (a position mismatch, a pending Commit or position error, a failed copy) skips
+  that park with one line instead of ending the engine. The park is sent only when the main process leaves the live
+  session, so the request's next message (a Reset, a CkptRestore or a ParkRestore) replaces the worker's session
+  anyway. A failed position table is the exception that must not be lost with the park: the worker reports it on the
+  ParkSave and keeps it pending, so that next message reports it again and the request ends with an error as before
+  (the request's positions are wrong). A ParkRestore failure after the first write still ends the engine.
+- A CkptSave's admission counts the parks its keep[] still names (`bytes_kept`), not the ones it is about to drop.
+- Not helped, because there is no borrow: a new conversation that starts with a checkpoint inside a parked one (a
+  sub-agent with the same system prompt and tools) takes that parked conversation whole and goes on from the
+  checkpoint, so the parked conversation's turns past that checkpoint are gone; its next turn reads from the deepest
+  checkpoint still held, or from token 0. A compaction or title request with its own system prompt is not affected.
+- A ParkSave that finds the link lost skips the park; it does not abandon the resume decision itself. The request's
+  next message finds the link lost too and makes it again (`remote_relink`), which drops every parked conversation and
+  the one taken out; a ParkRestore or CkptRestore then answers missing and the request reads from token 0. The result
+  is the one the design gives.
+- `remote_relink` drops the parked conversations only when parking was asked for; without it the cache is empty
+  anyway (forced to 0 MiB), so the default path is unchanged.
+- The main process refuses to start when `(--conversation-cache-slots + 1) x (--prompt-cache + 1)` passes 64 (the
+  worker's checkpoint store): the defaults (4 slots, `--prompt-cache 6`) need 35.
+- The main process also skips a park from a `--batch` slot (its state is not the worker's session) and after its last
+  pipelined window failed. The id counter stops parks at `INT32_MAX`; the checkpoint counter has no such stop (as
+  before this change: 2^31 checkpoints in one process).
+- `STRATA_REMOTE_PARK_DROP=1` on the worker (testing) empties its parks before every ParkRestore, so the main process's
+  fallback runs.
+- Log lines to look for: main `remote stage: parked conversation N (T tokens) kept on the worker in X ms`,
+  `remote stage: parked conversation N (T tokens) restored on the worker in X ms`, `the remote stage does not hold
+  parked conversation N (...): reading the prompt from token 0`; worker `parked conversation N: T tokens, M MiB in X
+  ms`, `restored parked conversation N: ...`, `parked conversation N (T tokens) not kept (why)`.
 
 ## Review
 

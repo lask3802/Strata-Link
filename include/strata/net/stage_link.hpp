@@ -46,6 +46,10 @@ inline constexpr int32_t kStageCkptMax = 64;
 /// the start of the worker's CkptRestore error for an id it does not hold - the one restore error the main process
 /// recovers from (it reads the prompt from token 0); every other error means the worker's session is lost
 inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
+/// Parked conversations (docs/remote-stage/PARKING.md): the ids a keep[] may name on a worker that lists
+/// kStageCapPark (the live chain's checkpoints, the parked conversations' parks and checkpoints).  A worker without
+/// the bit reads kStageCkptMax at most, as before: a main process names more only when it parks.
+inline constexpr int32_t kStageKeepMax = 256;
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -67,6 +71,12 @@ enum class StageMsg : uint32_t {
     CkptSaveOk = 13,     // a = 1 stored, 0 not stored (the worker's store is as it was)
     CkptRestore = 14,    // a = id, b = L; payload: int64 keep[]
     CkptRestoreOk = 15,
+    // parked conversations (docs/remote-stage/PARKING.md; only to a worker whose hello lists kStageCapPark)
+    ParkSave = 16,       // a = id, b = L (the worker must be at L); payload: int64 keep[] (with id).  The worker
+                         // drops what keep[] does not name first, whatever the outcome
+    ParkSaveOk = 17,     // a = 1 stored, 0 not stored (the prune above happened)
+    ParkRestore = 18,    // a = id, b = L; payload: int64 keep[] (the park itself not in it: the main process took it)
+    ParkRestoreOk = 19,
 };
 
 #pragma pack(push, 1)
@@ -127,6 +137,11 @@ void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, 
 /// which still compares kv_type itself): no K/V type is compared here, and each side logs a line (--kv must
 /// match by hand); two without it: kv_type compared, as earlier builds do.
 inline constexpr uint32_t kStageCapKvElem = 1u << 31;
+/// Bit 30 (kStageCapPark): parked conversations (docs/remote-stage/PARKING.md).  A worker lists it when it keeps the
+/// parks (ParkSave / ParkRestore) and reads a keep[] of up to kStageKeepMax ids; a main process lists it when it
+/// parks (the worker then admits every checkpoint part against its RAM floor too).  A side without it never sends or
+/// gets the park messages; an older peer ignores the bit (neither the hello check nor the row formats read it).
+inline constexpr uint32_t kStageCapPark = 1u << 30;
 /// the row_formats bits for a K/V element type as --kv names it (fp16, int8, q4_0, k8v4); 0 for another name
 uint32_t stage_kv_elem_bits(const std::string& kv);
 /// both hellos carry their K/V element type
@@ -215,6 +230,13 @@ public:
     /// The worker puts checkpoint `id` (saved at L) back and keeps only `keep`; `missing` (with false): it does not
     /// hold `id` and nothing changed there.  Any other error: the worker's session is lost.
     bool ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
+    /// Parked conversations (a worker whose hello lists kStageCapPark): the worker drops what `keep` does not name,
+    /// then keeps its layers' K/V of cells [0, L) and its running state at L under `id`; `stored` false: it could not
+    /// (the prune happened).  An error: the worker's session is lost.
+    bool park_save(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& stored, std::string& err);
+    /// The worker puts park `id` (saved at L) back whole and keeps only `keep`; `missing` (with false): it does not
+    /// hold `id`, or the park failed its check before anything was written.  Any other error: the session is lost.
+    bool park_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
 
     const StageStats& stats() const { return stats_; }
     std::string peer_name() const { return peer_; }
@@ -298,6 +320,12 @@ struct StageHandlers {
     /// it was), -1 an error.  ckpt_restore: an id it does not hold is an error starting with kStageCkptMissing.
     std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_save;
     std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_restore;
+    /// Parked conversations (optional; unset: a ParkSave / ParkRestore gets an error).  serve_stage has checked the
+    /// position (ParkSave) and the pending errors as for the checkpoint messages.  park_save: 1 stored, 0 not stored,
+    /// -1 an error.  park_restore: an id it does not hold, or a park that fails its check before any write, is an
+    /// error starting with kStageCkptMissing; the session is at L after a success.
+    std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> park_save;
+    std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> park_restore;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
     /// optional (a relay worker): about once a second while the served main process is idle (no message read or being
     /// read, no reply going out), on the serving thread.  False ends that connection with `err`, as a closed one ends:

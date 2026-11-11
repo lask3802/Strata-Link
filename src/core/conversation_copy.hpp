@@ -222,6 +222,9 @@ inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCh
     assign_beating(o.block_pos, c.block_pos);
     o.used = c.used;
     o.pinned = c.pinned;
+    // the worker's part of a remote stage's checkpoint (docs/remote-stage/PARKING.md): `o` is a dropped checkpoint's
+    // storage, so its own id would otherwise stay - another checkpoint's part, possibly of the same length
+    o.remote_id = c.remote_id;
     o.stage_parts.clear();
     for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
 }

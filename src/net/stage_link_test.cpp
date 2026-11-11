@@ -64,10 +64,18 @@
 //      not hold, or one that answers without TLS - neither is a lost link - and an older worker, which closes on
 //      the handshake, is a closed connection that says why; a prompt chunk of many records, and a KeyUpdate every
 //      4 KiB, keep every byte (every link above runs over TLS too: 15's rows are sealed as one message per reply).
+//  18. parked conversations (docs/remote-stage/PARKING.md): a worker with the park handlers lists kStageCapPark and
+//      reads a keep[] of up to kStageKeepMax ids (one more is refused, the link in step); ParkSave only where the
+//      session is and never empty, a=0 when not kept (the prune stands), a worker's error kept apart from the link;
+//      ParkRestore of a park not held is the missing-id error, at another length not, and after any failed restore
+//      no position is trusted; a failed Positions comes back on a ParkRestore, a failed Commit on a ParkSave and is
+//      dropped by a ParkRestore; a disconnect drops the parks; a worker without the handlers lists no bit, answers
+//      both messages with an error that is not the missing-id one and still reads at most 64 ids.
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
 #include "strata/net/stage_link.hpp"
+#include "strata/net/stage_park_store.hpp"
 #include "strata/net/stage_tls.hpp"
 
 #include <algorithm>
@@ -2125,6 +2133,195 @@ int main() {
               "a KeyUpdate every 4 KiB: 3 chunks and 200 windows keep every byte, the link in step");
         a.close();
         wkb.stop();
+    }
+
+    // 18. parked conversations (docs/remote-stage/PARKING.md): ParkSave / ParkRestore over the link
+    {
+        std::mutex pm;
+        StageParkStore<int> parks;
+        std::vector<int64_t> park_keep;
+        std::atomic<bool> park_refuse{false}, park_fail{false};
+        std::atomic<int> park_disconnects{0};
+        StageHandlers hp = h;
+        hp.hello = [&](const StageHello&, StageHello& m, std::string&) {
+            m = hello_of();
+            m.row_formats |= kStageCapPark;
+            return true;
+        };
+        hp.park_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
+            std::lock_guard<std::mutex> lk(pm);
+            park_keep = keep;
+            parks.prune(keep);   // (first, whatever comes of the save)
+            if (park_refuse.load()) return 0;
+            if (park_fail.load()) {
+                e = "the park failed (test)";
+                return -1;
+            }
+            StageParkStore<int>::Park p;
+            p.L = L;
+            p.bytes = 100;
+            p.payload = (int) id;
+            parks.put(id, std::move(p));
+            return 1;
+        };
+        hp.park_restore = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> bool {
+            std::lock_guard<std::mutex> lk(pm);
+            park_keep = keep;
+            const auto* p = parks.find(id);
+            if (p == nullptr) {
+                e = std::string(kStageCkptMissing) + "parked conversation " + std::to_string(id);
+                return false;
+            }
+            if (p->L != L) {
+                e = "parked conversation saved at another position";
+                return false;
+            }
+            parks.prune(keep);
+            return true;
+        };
+        hp.disconnected = [&] {
+            {
+                std::lock_guard<std::mutex> lk(pm);
+                parks.clear();
+            }
+            ++park_disconnects;
+        };
+        auto held = [&] {
+            std::lock_guard<std::mutex> lk(pm);
+            return parks.size();
+        };
+        auto kept_was = [&](const std::vector<int64_t>& k) {
+            std::lock_guard<std::mutex> lk(pm);
+            return park_keep == k;
+        };
+        worker_vision = 1;
+        fail_commit = false;
+        fail_positions = false;
+        Worker wkp;
+        if (!wkp.start(hp, buf)) {
+            std::printf("stage_link_test: no loopback port to listen on\n");
+            return 1;
+        }
+        Client pc;
+        StageHello pp;
+        StageHello parking = hello_of();
+        parking.ckpt_max = 4;
+        parking.row_formats |= kStageCapPark;
+        auto pchunk = [&] {
+            std::fill(back.begin(), back.end(), 0.0f);
+            return pc.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
+                   pc.prefill_recv(back.data(), (size_t) kD, kChunk, 0, err) && back == rows;
+        };
+        err.clear();
+        check(pc.connect(wkp.where, parking, pp, err) && (pp.row_formats & kStageCapPark) != 0,
+              "a worker that keeps parks lists kStageCapPark in its hello");
+        check(pc.reset({}, err) && !pc.park_save(1, 0, {1}, stored, err) && contains(err, "empty parked") &&
+                  pc.connected() && held() == 0,
+              "a park of no tokens is a state error (the link stays)");
+        check(pchunk() && !pc.park_save(1, 3, {1}, stored, err) && contains(err, "session is at 8") && held() == 0,
+              "a park where the session is not is a state error");
+        std::vector<int64_t> wide;   // more than kStageCkptMax ids: the parked conversations' parts with the chain's
+        for (int64_t i = 1; i <= 200; ++i) wide.push_back(i * 1000);
+        wide.push_back(1);
+        check(pc.park_save(1, kChunk, wide, stored, err) && stored && kept_was(wide) && held() == 1,
+              "ParkSave carries a keep[] of 201 ids whole to a worker that parks; stored");
+        std::vector<int64_t> wider((size_t) kStageKeepMax + 1, 1);
+        check(!pc.park_save(2, kChunk, wider, stored, err) && contains(err, "bad checkpoint list") && held() == 1,
+              "a keep[] of more than 256 ids is refused, and the link stays in step");
+        check(pc.reset(wide, err) && w.last_keep_is(wide), "... a reset after it is served, its 201 ids whole");
+        check(pchunk() && pc.park_save(2, kChunk, {1, 2}, stored, err) && stored && held() == 2,
+              "a second park at the same position");
+        park_refuse = true;
+        check(pc.park_save(3, kChunk, {2, 3}, stored, err) && !stored && held() == 1,
+              "ParkSaveOk a=0: not kept, but the prune to keep[] stands");
+        park_refuse = false;
+        park_fail = true;
+        check(!pc.park_save(3, kChunk, {2, 3}, stored, err) && !stored && contains(err, "the park failed (test)") &&
+                  pc.connected(),
+              "a worker's park error comes back as an error, the link kept");
+        park_fail = false;
+        check(pc.park_restore(2, kChunk, {}, missing, err) && !missing && held() == 0 && kept_was({}),
+              "ParkRestore puts the park back; the keep[] without it drops it");
+        check(pc.ckpt_save(9, kChunk, {9}, stored, err) && stored,
+              "after a restore the session is at the park's length: a checkpoint there is stored");
+        check(!pc.park_restore(2, kChunk, {}, missing, err) && missing && pc.connected(),
+              "a park the worker does not hold is the missing-id error (the main process reads from 0)");
+        check(!pc.ckpt_save(10, kChunk, {10}, stored, err) && contains(err, "session is at -1"),
+              "after a failed restore no position is trusted: a save is a state error");
+        check(pc.reset({}, err) && pchunk() && pc.park_save(4, kChunk, {4}, stored, err) && stored,
+              "a reset and a prompt again: the session is known again");
+        check(!pc.park_restore(4, kChunk + 1, {4}, missing, err) && !missing && held() == 1,
+              "a park restored at another length is not the missing-id error (the engine stops)");
+        check(pc.reset({4}, err) && pchunk(), "a reset after it");
+        const int32_t one_p[3] = {5, 5, 5};
+        fail_positions = true;
+        err.clear();
+        bool sent_p = pc.positions(one_p, 1, err);
+        check(sent_p && !pc.park_restore(4, kChunk, {4}, missing, err) && !missing &&
+                  contains(err, "the positions failed (test)") && held() == 1,
+              "a failed Positions comes back on a ParkRestore (not the missing-id error), the park kept");
+        fail_positions = false;
+        check(pc.park_restore(4, kChunk, {}, missing, err) && held() == 0, "... the restore after it is served");
+        // the main process skips a park that fails and goes on: a failed position table must not end with it
+        fail_positions = true;
+        err.clear();
+        sent_p = pc.positions(one_p, 1, err);
+        check(sent_p && !pc.park_save(7, kChunk, {7}, stored, err) && contains(err, "the positions failed (test)") &&
+                  held() == 0,
+              "a failed Positions comes back on a ParkSave (nothing parked)");
+        fail_positions = false;
+        err.clear();
+        check(!pc.reset({}, err) && contains(err, "the positions failed (test)"),
+              "... and again on the Reset after it: the request's positions are wrong, it does not go on");
+        check(pc.reset({}, err) && pchunk(), "... once: the link is usable after it");
+        fail_commit = true;
+        err.clear();
+        sent_p = pc.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
+                 pc.commit(1, err);
+        check(sent_p && !pc.park_save(5, kChunk + 1, {5}, stored, err) && contains(err, "a commit failed (test)") &&
+                  held() == 0,
+              "a failed Commit comes back on the next ParkSave (nothing parked)");
+        sent_p = pc.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
+                 pc.commit(1, err);
+        check(sent_p && !pc.park_restore(5, kChunk, {}, missing, err) && missing,
+              "a failed Commit before a ParkRestore is dropped (logged): the restore's own answer comes back");
+        fail_commit = false;
+        check(pc.reset({}, err) && pchunk() && pc.park_save(6, kChunk, {6}, stored, err) && stored && held() == 1,
+              "a park before a disconnect");
+        const int pd = park_disconnects.load();
+        pc.close();
+        for (int i = 0; i < 200 && park_disconnects.load() == pd; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        check(park_disconnects.load() > pd && held() == 0, "a disconnect drops the parks");
+        check(pc.connect(wkp.where, parking, pp, err) && !pc.park_restore(6, kChunk, {}, missing, err) && missing,
+              "the next connection finds none of the last one's parks (missing: a read from 0)");
+        pc.close();
+        wkp.stop();
+
+        // a worker without the park handlers (an older build, or one that keeps none): no bit, no parks, keep[] <= 64
+        StageHandlers np = h;
+        np.hello = [&](const StageHello&, StageHello& m, std::string&) {
+            m = hello_of();
+            return true;
+        };
+        Worker wkn;
+        if (!wkn.start(np, buf)) {
+            std::printf("stage_link_test: no loopback port to listen on\n");
+            return 1;
+        }
+        err.clear();
+        check(pc.connect(wkn.where, parking, pp, err) && (pp.row_formats & kStageCapPark) == 0,
+              "a worker without the park handlers does not list the bit");
+        check(pc.reset({}, err) && pchunk() && !pc.park_save(1, kChunk, {1}, stored, err) &&
+                  contains(err, "keeps no parked conversations") && pc.connected(),
+              "a ParkSave to it is an error, the link kept");
+        check(!pc.park_restore(1, kChunk, {}, missing, err) && !missing && contains(err, "keeps no parked"),
+              "a ParkRestore to it is an error that is not the missing-id one");
+        std::vector<int64_t> over64((size_t) kStageCkptMax + 1, 1);
+        check(!pc.reset(over64, err) && contains(err, "bad checkpoint list"),
+              "it reads at most 64 ids in a keep[], as before");
+        pc.close();
+        wkn.stop();
     }
     std::error_code rm;
     std::filesystem::remove_all(g_tmp, rm);

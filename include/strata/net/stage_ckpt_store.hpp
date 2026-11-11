@@ -32,9 +32,14 @@ public:
 
     /// `id` fits once the store is pruned to `keep` (the parts that stay, other than one of the same id, plus it)
     bool admits(int64_t id, const std::vector<int64_t>& keep) const {
+        return size_after(id, keep) <= (size_t) kStageCkptMax;
+    }
+    /// the parts held once `id` is put with `keep` (a parking main process's RAM admission counts them:
+    /// stage_park_store.hpp)
+    size_t size_after(int64_t id, const std::vector<int64_t>& keep) const {
         size_t n = 1;
         for (const auto& kv : parts_) n += kv.first != id && kept(kv.first, keep) ? 1 : 0;
-        return n <= (size_t) kStageCkptMax;
+        return n;
     }
     /// stores `id` (in place of one of the same id), then drops every part not in `keep` - never `id` itself: a
     /// part reported stored is held (the main process's keep names it anyway).  A failed allocation

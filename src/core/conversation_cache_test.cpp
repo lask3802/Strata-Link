@@ -745,5 +745,33 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {
+        // a remote stage (docs/remote-stage/PARKING.md): the worker ids every parked conversation holds - the main
+        // process's keep[] roots; an evicted or taken conversation's ids are no longer listed, clear() lists none
+        ConversationCache cache(1 << 20, 3);
+        auto a = image({1, 2, 3, 4});
+        a.remote_park = 5;
+        a.checkpoints.push_back(a.live);
+        a.checkpoints.back().ids = {1, 2};
+        a.checkpoints.back().remote_id = 2;
+        auto b = image({7, 8, 9});
+        b.remote_park = 6;
+        check(cache.put(std::move(a)) && cache.put(std::move(b)), "two parked conversations with worker halves");
+        std::vector<int64_t> ids;
+        cache.remote_ids(ids);
+        check((ids == std::vector<int64_t>{5, 2, 6}), "the cache lists each one's park and checkpoint parts");
+        const auto m = cache.best(std::vector<int64_t>{7, 8, 9, 10}, {}, true);
+        check(m.tokens == 3, "the second one matches its next turn");
+        const auto taken = cache.take(m.index);
+        ids.clear();
+        cache.remote_ids(ids);
+        check(taken.remote_park == 6 && (ids == std::vector<int64_t>{5, 2}),
+              "a taken conversation keeps its park id and leaves the cache's list (the caller roots it)");
+        check(cache.evict_oldest(), "the first one evicted");
+        ids.clear();
+        cache.remote_ids(ids);
+        check(ids.empty(), "an evicted conversation's worker ids are not roots any more");
+        check(cache.put(image({1, 2})) && cache.clear() == 1, "clear() (a relinked worker) drops every conversation");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

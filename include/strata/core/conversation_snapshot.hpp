@@ -114,6 +114,20 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, size_t tokens, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, size_t tokens, std::string& error);
+// A remote stage worker's half of a parked conversation (docs/remote-stage/PARKING.md): the K/V of the session's own
+// attention layers for cells [0, tokens) (`kv`, one per owned layer, read from the authoritative pool of a streamed
+// K/V) and its running state at `tokens` (`state`, the explicit-length checkpoint above).  No token ids: the worker has
+// none.  `bytes`: what a save of `tokens` holds.  The save syncs the device first and leaves `kv` / `state` untouched
+// on a failure.  The restore validates everything before its first write (invalid: nothing written) and refreshes a
+// streamed layer's resident window; transfer_failed: the session is partly written and must not be decoded from.
+bool conversation_part_bytes(const SessionState& session, const ModelGeometry& g, size_t tokens, size_t& bytes,
+                             std::string& error);
+bool conversation_part_save(std::vector<ConversationKv>& kv, ConversationCheckpoint& state,
+                            const SessionState& session, const ModelGeometry& g, size_t tokens, std::string& error);
+bool conversation_part_validate(const std::vector<ConversationKv>& kv, const ConversationCheckpoint& state,
+                                const SessionState& session, const ModelGeometry& g, size_t tokens,
+                                std::string& error);
+// (conversation_part_restore: below, after ConversationRestore)
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
 // sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
 // `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.
@@ -153,6 +167,10 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
 enum class ConversationRestore { restored, invalid, transfer_failed };
+// a remote stage worker's park (conversation_part_save above)
+ConversationRestore conversation_part_restore(const std::vector<ConversationKv>& kv, const ConversationCheckpoint& state,
+                                              SessionState& session, const ModelGeometry& g, size_t tokens,
+                                              std::string& error);
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
