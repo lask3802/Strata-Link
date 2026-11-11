@@ -1,6 +1,7 @@
 # Parked conversations across a remote stage
 
-Status: built (2026-11-11) and checked without a GPU; not yet run on GPUs. The design was reviewed before it was built
+Status: built (2026-11-11), checked without a GPU and run on the GPUs of one split ([Measured](#measured-on-gpus)):
+a 2080 Ti main and a 3080 worker. The design was reviewed before it was built
 ([Review](#review)); where the code differs from it, [As built](#as-built) says so. Opt-in: nothing changes without
 `--conversation-cache-mib N` given explicitly to the main process.
 
@@ -200,6 +201,37 @@ admits, so a dropped park never makes it refuse a new one.
   turn: about 2.4 s at the measured 1,438 tok/s) after the two restores: about 3-5 s instead of about 178 s.
 - Not helped: the side request itself still reads its own prompt (158,895 tokens, 110 s for the compaction).
 
+## Measured on GPUs
+
+On 2026-11-11, one split: the main process on an RTX 2080 Ti (layers 0-19, a Proxmox CT), the worker on an RTX 3080
+(layers 20-47) over 10 GbE with TLS 1.3. SC117 Qwen3.8-Flash-Next IQ3_S, `--kv int8 --kv-resident 32768
+--max-context 262144 --prompt-cache 6 --spec 4 --mtp`, both processes built from this commit for sm_75 and sm_86 on
+Linux (GCC, CUDA 13.0). The main process ran with `--conversation-cache-mib 8192`; the worker kept its default budget
+(12,669 MiB: half its free RAM).
+
+The replay: a long conversation (a coding agent's system prompt with generate.cpp's text), a side request with another
+system prompt, then the long conversation again. Greedy answers are not the same byte for byte from run to run on this
+split, even on one server (8 of 40 short prompts gave the same answer twice), so each answer is checked by a codename
+put at 5%, 50% or 95% of the long text (or at 50% of the side request's text): the answer must name it.
+
+| Run | Long conversation's turn after the side request | Before (same build, no flag) |
+|---|---|---|
+| 27K tokens, 13K side | 27,370 of 27,377 tokens reused, first token in 0.35 s | 0 reused, 22.4 s |
+| 240K tokens, 91K side | 239,874 of 239,881 tokens reused, first token in 1.27 s | 0 reused (the first read took 167.5 s) |
+
+- Every codename was found: the long turns after a restore, the side request read cold and the side request restored
+  (91,031 of 91,038 tokens reused, 0.56 s).
+- A park of 240K tokens: 1,961 MiB on the worker in 0.30-0.86 s, about 1.75 GiB on the main PC in 0.42-0.81 s. A
+  restore: 0.14 s on the worker, 0.26 s on the main PC. No time-out while the worker copied.
+- `STRATA_REMOTE_PARK_DROP=1` on the worker: the main process logged `does not hold parked conversation N ... reading
+  the prompt from token 0`, read it again (23 s for 27K tokens), and the answers held the codenames.
+- The worker restarted between turns, with two conversations parked: the main process logged `dropped 2 parked
+  conversations (the remote stage's halves went with the link)`, connected again and read from token 0; the answers
+  held the codenames.
+- Without the flag the new build behaved as before (the turn after the side request: 0 reused). Its answers to 40 short
+  prompts could not be compared byte for byte with the base build's (see above: 11 of 40 equal, against 8 of 40 for
+  the new build with itself).
+
 ## Out of scope (not built)
 
 - A relay worker, and a worker whose layers are split over its own GPUs: they do not list the bit.
@@ -233,10 +265,13 @@ Not run:
 - The integration test the design asked for (a loopback main and worker over a host-memory session) is not built: the
   main process's side of parking is inline in `generate.cpp`'s serve loop and cannot run without a model. Its pieces
   are tested apart (above); the order of the messages in `generate.cpp` is checked by review only.
-- A Linux build (GCC): the WSL here has GCC 9, which the code base does not build with already.
-- On GPUs: the CHECKPOINTS.md replay with a side request between turns, every repeated turn byte-identical and the
-  restores in both logs; the default path byte-identical to the base build; the fallback with
-  `STRATA_REMOTE_PARK_DROP=1` on the worker; a worker restarted between turns.
+- The default path byte-identical to the base build on GPUs: answers on this split are not repeatable byte for byte
+  ([Measured](#measured-on-gpus)).
+
+Run later on Linux (GCC, the build that runs above): `stage_ckpt_store_test`, `stage_park_store_test`,
+`stage_link_test`, `stage_reserve_test`, `split_rules_test`, `draft_kv_plan_test`, `split_walk_test`,
+`conv_cache_test` all pass. `conversation_cache_test` and `conversation_validation_test` are not targets in that
+configuration; they passed on Windows.
 
 ## As built
 
