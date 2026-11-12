@@ -117,13 +117,32 @@ class SessionOnUnload(unittest.TestCase):
     def test_a_save_that_does_not_answer_in_time_is_given_up(self):
         # a step announced for an hour (a remote stage's worker writing its half), and then nothing
         self.engine.script = ["SWAIT worker 3600\n"]
-        self.svc.session_on_unload_wait_s = 0.5
+        self.svc.session_on_unload_timeout_s = 0.5
         t0 = time.monotonic()
         self.assertEqual(self.svc.unload(), "unloaded")
         self.assertLess(time.monotonic() - t0, 10)
         self.assertTrue(self.engine.ended, "the engine was ended (it cannot be put back in step mid-file)")
         self.assertIsNone(self.svc.restore_after_load)
         self.assertFalse(self.svc.status["busy"])
+
+    def test_with_session_save_reclaim_the_save_is_retried_within_the_timeout(self):
+        from unittest import mock
+        import serve.session_save_retry as retry
+        seen = []
+        real = retry.session_file
+
+        def spy(service, action, path, refused_type, deadline=None):
+            seen.append((action, path, deadline))
+            return real(service, action, path, refused_type, deadline=deadline)
+        self.engine.session_save_reclaim = True
+        self.svc.session_on_unload_timeout_s = 77
+        t0 = time.monotonic()
+        with mock.patch.object(retry, "session_file", spy):
+            self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][:2], ("save", self.path))
+        self.assertTrue(t0 + 77 <= seen[0][2] <= time.monotonic() + 77)
+        self.assertEqual(self.svc.restore_after_load, self.path)
 
     def test_a_running_request_or_a_switch_saves_nothing(self):
         with self.svc.fifo:                              # a request holds the FIFO: busy, nothing sent

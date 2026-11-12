@@ -365,6 +365,12 @@ class MainReadsTheConfig(unittest.TestCase):
         for bad in ("yes", 1, None):
             with self.assertRaises(SystemExit):
                 self.start({"slot_save_path": save, "session_on_unload": bad})
+        self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True}).session_on_unload_timeout_s, 120.0)
+        self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True,
+                                     "session_on_unload_timeout_s": 600}).session_on_unload_timeout_s, 600.0)
+        for bad in ("soon", -5, 3601, "inf", "nan"):              # a warning and the default
+            self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True,
+                                         "session_on_unload_timeout_s": bad}).session_on_unload_timeout_s, 120.0, bad)
         svc = self.start({"slot_save_path": save, "session_on_unload": True, "parallel": 2})
         self.assertFalse(svc.session_on_unload)
         self.assertTrue(svc.session_on_unload_said)

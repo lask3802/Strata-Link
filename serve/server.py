@@ -346,9 +346,11 @@ STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
 # "session_on_unload" (opt-in): the file the conversation is saved to before an unload, in slot_save_path, and how long
-# that save may take before the unload goes on without it (the engine is ended then: it was being stopped anyway)
+# that save may take by default before the unload goes on without it (the engine is ended then: it was being stopped
+# anyway); "session_on_unload_timeout_s" sets it, (0, UNLOAD_SESSION_WAIT_MAX_S]
 UNLOAD_SESSION_FILE = "unload-session.bin"
 UNLOAD_SESSION_WAIT_S = 120.0
+UNLOAD_SESSION_WAIT_MAX_S = 3600.0
 # ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto, issue
 # #282), and the slowest PCs read ~100 tok/s, so a first chunk can take minutes before the first line.  Until the first
 # PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
@@ -5151,7 +5153,7 @@ class Service:
         # (opt-in) "session_on_unload": an unload (POST /unload, the Monitor's Unload, the idle unload) saves the
         # conversation to slot_save_path first, and the next load restores it (restore_after_load)
         self.session_on_unload = False
-        self.session_on_unload_wait_s = UNLOAD_SESSION_WAIT_S
+        self.session_on_unload_timeout_s = UNLOAD_SESSION_WAIT_S   # the config's "session_on_unload_timeout_s"
         self.session_on_unload_said = False              # "ignored with parallel requests" logged once
         # (opt-in) "model_control": the Monitor's model card - which model this server runs and which others the
         # machine can serve on this port instead; a switch runs the configured command, which stops this server
@@ -5936,7 +5938,9 @@ class Service:
         before the engine stops; the next load restores it (ensure_loaded -> restore_after_load) and deletes the file.
         The caller holds the FIFO.  It never stops the unload: a failure (nothing to save, short of RAM or disk, an
         engine that cannot save, a remote stage whose worker keeps no session files) is one log line, and a save not
-        done in session_on_unload_wait_s ends the engine (the unload was about to stop it)."""
+        done in session_on_unload_timeout_s ends the engine (the unload was about to stop it).  The FIFO is held
+        meanwhile: a request, or a peer server's before_load calling POST /unload here, waits up to that long.  With
+        --session-save-reclaim the save is retried as the /slots save is, within the same time."""
         if not self.session_on_unload or not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return
         if getattr(self.engine, "batch", 0):            # parallel requests: no session files (slot_action's reason)
@@ -5948,8 +5952,13 @@ class Service:
         with self.status_lock:
             self.status.update(busy=True, phase="saving the session", started=time.time(), first_token=None,
                                prompt_tokens=None, generated=None, max_tokens=None)
+        deadline = time.monotonic() + self.session_on_unload_timeout_s
         try:
-            r = self.engine.session_file("save", path, deadline=time.monotonic() + self.session_on_unload_wait_s)
+            if getattr(self.engine, "session_save_reclaim", False):
+                from serve.session_save_retry import session_file
+                r = session_file(self, "save", path, SessionRefused, deadline=deadline)
+            else:
+                r = self.engine.session_file("save", path, deadline=deadline)
         except Exception as e:                          # noqa: BLE001 - the unload goes on without the conversation
             print(f"[strata] the conversation was not saved before the unload ({e}); the next request reads its "
                   "prompt again", flush=True)
@@ -10980,9 +10989,18 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         print("[strata] session_on_unload is ignored: parallel requests (\"parallel\" / --batch) keep no session "
               "files", flush=True)
     elif sou:
+        try:
+            t = float(cfg.get("session_on_unload_timeout_s") or svc.session_on_unload_timeout_s)
+            if not 0 < t <= UNLOAD_SESSION_WAIT_MAX_S:
+                raise ValueError
+            svc.session_on_unload_timeout_s = t
+        except (TypeError, ValueError):
+            print(f"[strata] \"session_on_unload_timeout_s\" in the config is not a number in (0, "
+                  f"{UNLOAD_SESSION_WAIT_MAX_S:g}]; using {svc.session_on_unload_timeout_s:g} s", flush=True)
         svc.session_on_unload = True
         print(f"[strata] session_on_unload on: an unload saves the conversation to {svc.slot_save_path}"
-              f"{os.sep}{UNLOAD_SESSION_FILE} first, and the next load restores it", flush=True)
+              f"{os.sep}{UNLOAD_SESSION_FILE} first (for up to {svc.session_on_unload_timeout_s:g} s), and the next "
+              "load restores it", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")

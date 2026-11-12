@@ -67,6 +67,20 @@ class Retry(unittest.TestCase):
         self.assertEqual(self.clock.now,30)
         self.assertEqual(self.engine.session_file.call_count,1)
 
+    def test_a_deadline_reaches_every_save_and_ends_the_wait(self):
+        # session_on_unload: the save before an unload is bounded as a whole, its wait for RAM included
+        self.engine.session_file.side_effect=[refused(),RESULT]
+        with mock.patch.object(retry,'available_mib',side_effect=[534,541,800,1400]):
+            self.assertEqual(retry.session_file(self.service,'save','same.bin',SessionRefused,deadline=60),RESULT)
+        self.assertEqual(self.engine.session_file.call_args_list,[mock.call('save','same.bin',deadline=60)]*2)
+        error=refused(); self.engine.session_file.side_effect=error; self.engine.session_file.reset_mock()
+        self.clock.now=0
+        with mock.patch.object(retry,'available_mib',return_value=541):
+            with self.assertRaises(SessionRefused):
+                retry.session_file(self.service,'save','same.bin',SessionRefused,deadline=5)
+        self.assertEqual(self.clock.now,5)                   # (not the 30 s the wait has without one)
+        self.assertEqual(self.engine.session_file.call_count,1)
+
     def test_admission_races_are_bounded_and_keep_latest_error(self):
         errors=[refused(355+n) for n in range(4)]
         self.engine.session_file.side_effect=errors
