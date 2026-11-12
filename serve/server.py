@@ -4977,6 +4977,55 @@ def slot_filename_problem(name) -> str | None:
     return None
 
 
+MODEL_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def after_unload_setting(value):
+    """The config's "after_unload": None, a command line (a string, run by the shell) or a list of arguments."""
+    if value is None or value == "" or value == []:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and value and all(isinstance(x, str) for x in value):
+        return value
+    raise ValueError("after_unload must be a command (a string) or a list of strings")
+
+
+def model_control_setting(value):
+    """The config's "model_control" (opt-in, the Monitor's model card):
+        {"this": ID, "models": [{"id": ID, "label": TEXT}, ...], "switch": [ARG, ...], "log": PATH}
+    `this` is the model this server runs; a switch to another ID runs `switch` + [ID], detached (it stops this server
+    and starts the one for ID).  IDs are plain names.  -> the checked dict, or None when the key is absent."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("model_control must be an object")
+    models = value.get("models")
+    if not isinstance(models, list) or not models:
+        raise ValueError("model_control.models must be a non-empty list")
+    out, seen = [], set()
+    for m in models:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not MODEL_ID.fullmatch(m["id"]):
+            raise ValueError("model_control.models: each needs an \"id\" of letters, digits, '.', '_' or '-'")
+        if m["id"] in seen:
+            raise ValueError(f"model_control.models: {m['id']} twice")
+        seen.add(m["id"])
+        label = m.get("label", m["id"])
+        if not isinstance(label, str):
+            raise ValueError(f"model_control.models: {m['id']}'s label must be text")
+        out.append({"id": m["id"], "label": label[:120]})
+    this = value.get("this")
+    if this not in seen:
+        raise ValueError("model_control.this must be one of the models' ids")
+    switch = value.get("switch")
+    if len(out) > 1 and not (isinstance(switch, list) and switch and all(isinstance(x, str) for x in switch)):
+        raise ValueError("model_control.switch must be a list of strings (the command; the target id is added)")
+    log = value.get("log")
+    if log is not None and not isinstance(log, str):
+        raise ValueError("model_control.log must be a path")
+    return {"this": this, "models": out, "switch": list(switch or []), "log": log or None}
+
+
 def slot_save_dir(value, base: str | None = None) -> str:
     """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
     directory), created private to this user when missing.  ValueError for anything else."""
@@ -5082,7 +5131,16 @@ class Service:
         self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
         self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
         self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
-        self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
+        # (opt-in) a command run after the engine stopped on an unload (POST /unload, the idle unload): e.g. one that
+        # stops a remote stage's worker on another PC, so that PC's RAM and VRAM go back too.  before_load starts it.
+        self.after_unload = None
+        self.after_unload_timeout_s = 300.0
+        self.after_unload_result = None                  # the last run: None, "ok" or why it failed
+        # (opt-in) "model_control": the Monitor's model card - which model this server runs and which others the
+        # machine can serve on this port instead; a switch runs the configured command, which stops this server
+        self.model_control = None
+        self.switching = None                            # {"to": id, "at": time, "pid": n} once a switch started
+        self.vram_reserve = None                        # #533: the last POST /v1/vram reserve (None: the start's)
         self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.vision_no_shrink = False                    # the engine said its cache never shrinks (no --vram-elastic)
@@ -5520,6 +5578,9 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if self.switching:                              # model_control: the switch command is stopping this server
+            raise GpuBusy(f"this port is switching to {self.switching['to']}; try again in a few minutes",
+                          retry_after=30)
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -5844,9 +5905,91 @@ class Service:
             self.vision_held = False
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
+            self.run_after_unload()                     # (still under the fifo: no load starts meanwhile)
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def run_after_unload(self) -> None:
+        """The after_unload command (opt-in), once the engine has stopped.  Its failure is logged and kept in
+        after_unload_result; the model is unloaded either way (the before_load command copes with what is left)."""
+        cmd = self.after_unload
+        if not cmd:
+            return
+        print(f"[strata] after unloading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+        why = None
+        try:
+            r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.after_unload_timeout_s,
+                               stdin=subprocess.DEVNULL)
+            if r.returncode != 0:
+                why = f"it exited with code {r.returncode}"
+        except subprocess.TimeoutExpired:
+            why = f"it did not finish in {self.after_unload_timeout_s:g} s (after_unload_timeout_s)"
+        except (OSError, subprocess.SubprocessError) as e:
+            why = f"it could not run ({e})"
+        self.after_unload_result = "ok" if why is None else why
+        if why is not None:
+            print(f"[strata] the after_unload command failed ({why}); the model is unloaded", flush=True)
+
+    def model_control_view(self) -> dict:
+        """GET /model-control: this server's model and the others the machine can serve here instead."""
+        mc = self.model_control
+        if not mc:
+            return {"enabled": False}
+        sw = self.switching
+        return {"enabled": True, "this": mc["this"], "models": [dict(m) for m in mc["models"]],
+                "loaded": self.loaded(), "switching": {"to": sw["to"], "since": sw["at"]} if sw else None,
+                "after_unload": self.after_unload_result}
+
+    def switch_model(self, target) -> tuple[int, dict]:
+        """POST /model-control {"model": ID}: run the configured switch command with ID, detached - it stops this
+        server and starts the one that serves ID.  Refused while a request runs or waits, or a switch is under way.
+        -> (HTTP status, body)."""
+        mc = self.model_control
+        if not mc:
+            return 404, {"error": {"message": "model switching is off (no \"model_control\" in the run config)"}}
+        if not isinstance(target, str) or target not in {m["id"] for m in mc["models"]}:
+            return 404, {"error": {"message": "model not found"}}
+        if target == mc["this"]:
+            return 400, {"error": {"message": f"this server runs {target}: load it with POST /load"}}
+        if not self.fifo.acquire(blocking=False):
+            return 409, {"error": {"message": "a request is running or queued"}}
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return 409, {"error": {"message": "a request is running or queued"}}
+            if self.switching:
+                return 409, {"error": {"message": f"a switch to {self.switching['to']} is under way"}}
+            cmd = [*mc["switch"], target]
+            log = mc.get("log")
+            try:
+                out = open(log, "ab") if log else subprocess.DEVNULL
+            except OSError as e:
+                return 500, {"error": {"type": "server_error", "message": f"the switch log cannot be opened: {e}"}}
+            try:
+                kw = {"start_new_session": True} if os.name != "nt" else \
+                    {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+                # its own session: the command outlives this server, which it stops
+                p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                     close_fds=True, **kw)
+            except OSError as e:
+                return 500, {"error": {"type": "server_error", "message": f"the switch command could not run: {e}"}}
+            finally:
+                if log and out is not subprocess.DEVNULL:
+                    out.close()
+            self.switching = {"to": target, "at": time.time(), "pid": p.pid}
+            print(f"[strata] switching this port to {target}: {' '.join(map(str, cmd))} (pid {p.pid})", flush=True)
+            threading.Thread(target=self._switch_reap, args=(p,), daemon=True).start()
+            return 202, {"status": "switching", "to": target}
+        finally:
+            self.fifo.release()
+
+    def _switch_reap(self, p) -> None:
+        """A switch command that ends while this server still runs failed (or went back): the card may switch again."""
+        rc = p.wait()
+        if self.switching and self.switching.get("pid") == p.pid:
+            print(f"[strata] the switch command ended with code {rc} and this server still runs", flush=True)
+            self.switching = None
 
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
@@ -8455,6 +8598,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
+            if path == "/model-control":                     # the Monitor's model card (opt-in "model_control")
+                if self._authorized():
+                    self._json(200, svc.model_control_view())
+                return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
@@ -8562,6 +8709,19 @@ def make_handler(svc: Service):
                 return
             if path == "/config":
                 self._config_post()
+                return
+            if path == "/model-control":                     # switch this port to another model (opt-in)
+                if not self._own_page("the model can be switched"):
+                    return
+                try:
+                    req = json.loads(self._body() or b"{}")
+                except ValueError:
+                    req = None
+                if not isinstance(req, dict):
+                    self._json(400, {"error": {"message": "send a JSON object: {\"model\": ID}"}})
+                    return
+                code, body = svc.switch_model(req.get("model"))
+                self._json(code, body)
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
@@ -10498,8 +10658,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         print(f"[strata] the config names no \"arch\" and this tokenizer is DeepSeek's: serving it as {cfg['arch']} (its end token, DSML tool "
               f"calls and effort words); add \"arch\": \"{cfg['arch']}\" to the config to say it outright", flush=True)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
-    if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
-        ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
+    if a.offline and (hub is not None or cfg.get("before_load") or a.before_load or cfg.get("after_unload")
+                      or cfg.get("model_control")):
+        ap.error("--offline requires MCP servers, before_load / after_unload commands and model_control to be "
+                 "disabled in this profile")
     if a.offline:
         # The same decision, reported through the policy module so the two cannot drift: a profile
         # that permits a network source is refused here rather than on its first request.
@@ -10706,6 +10868,16 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
+    try:
+        svc.after_unload = after_unload_setting(cfg.get("after_unload"))
+        svc.after_unload_timeout_s = float(cfg.get("after_unload_timeout_s") or svc.after_unload_timeout_s)
+        svc.model_control = model_control_setting(cfg.get("model_control"))
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[strata] config: {e}")
+    if svc.model_control:
+        print(f"[strata] model control on: this server runs {svc.model_control['this']}; it can switch this port to "
+              + (", ".join(m["id"] for m in svc.model_control["models"] if m["id"] != svc.model_control["this"])
+                 or "nothing else"), flush=True)
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):

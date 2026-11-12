@@ -362,6 +362,7 @@ By default the model stays loaded until you close Strata. Three server options, 
 | `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | Load an unloaded model only when that much VRAM is free (it waits up to 15 s for memory being given back). Otherwise answer **503** "the GPU is in use by another program". With several GPUs it checks the first one. |
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | A command run before the model is loaded again, for example one that unloads another server's model. |
 | | `"before_load_timeout_s": 120` | How long that command may run. When it fails or times out, the free VRAM decides: with `min_free_vram_mib` set and not enough free, the request gets **503** with `Retry-After`; otherwise the model loads with a warning. `"before_load_strict": true` always refuses on a failure; `"before_load_ignore_failure": true` always loads. |
+| | `"after_unload": "cmd"` or `["cmd", "arg"]` | A command run after the engine stopped on an unload (`POST /unload` or the idle unload), for example one that stops a remote stage's worker on its PC. `"after_unload_timeout_s"` (default 300) bounds it. A failure is logged and shown on the Monitor's Model card; the model is unloaded either way. |
 
 `POST /unload` unloads now (`409` while a request is running; `?wait=1` waits for the running turn, up to 300 s, or
 `?wait=<seconds>`). `POST /load` loads ahead of a request. Both need `Content-Type: application/json`:
@@ -379,6 +380,31 @@ API without the engine or the vision encoder. The first generation request or `P
 `before_load` and `min_free_vram_mib`. `POST /v1/load` and `/v1/unload` are JSON control aliases (they need the API key,
 `application/json` and no foreign browser Origin, and return **409** while a request is active or queued). `/api/health`
 aliases `/health`, and `/v1/status` exposes `loaded` and `auto_load`.
+
+**A remote stage's worker, and another model on the same port** (opt-in). On a remote stage an unload ends only the
+main process; the worker on the other PC keeps its layers in RAM. `"after_unload"` can stop it (a worker under
+`tools/stage_node.py`: its agent's `POST /stop`), and `"before_load"` start it again (`POST /start`; with
+`"before_load_strict": true` a worker that did not start makes the load answer **503** instead of loading without it).
+With `"model_control"` the Monitor tab shows a Model card: Unload and Load of this server's model (the header button's,
+with its checks), and Load of another model that this port can serve instead:
+
+```json
+"model_control": {"this": "qwen-sc117",
+                  "models": [{"id": "qwen-sc117", "label": "Qwen3.8 Next Flash SC117"},
+                             {"id": "deepseek", "label": "DeepSeek V4.1 Flash"}],
+                  "switch": ["bash", "/srv/strata/model-switch/model-switch.sh", "to"],
+                  "log": "/srv/strata/model-switch/switch.out"}
+```
+
+`GET /model-control` answers the list, whether the model is loaded, a switch under way and the last after_unload
+result. `POST /model-control` with `{"model": "deepseek"}` (JSON from Strata's own page, as `/unload`) runs `switch`
+plus the id in a session of its own and answers **202**. It answers **409** while a request runs or waits or a switch
+is under way, **400** for this server's own model (use `/load`), and **404** for an unknown id. The command belongs to
+the machine: it stops this server and starts the one for that id, and each server names the other in its own
+`model_control`. Until the command stops this server, a request that would load the model gets **503** with
+`Retry-After`. If the command ends while this server still runs, the switch failed or went back, and the card can
+switch again. The page waits until the port answers again, then reloads. Requests sent during the switch fail; nothing
+retries them.
 
 **Giving part of the VRAM back while it keeps serving** (opt-in, one NVIDIA GPU, [VRAM_ELASTIC.md](VRAM_ELASTIC.md)). With
 `"vram_elastic": true` (engine flag `--vram-elastic`) the expert cache is allocated in 512 MiB segments
