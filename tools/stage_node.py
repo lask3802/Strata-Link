@@ -26,6 +26,10 @@ node.json (paths are this PC's):
                                                    optional: lock the GPU's clocks (MHz) while a worker runs - for a
                                                    Windows worker (see Workers.lock_clocks); needs administrator/root
       "restart": true                              default: start a worker that ended by itself again (Workers.exited)
+      "services": {"NAME": {"start": [...], "stop": [...], "status": [...], "timeout_s": 300}}
+                                                   optional: commands this PC runs for /service by name - e.g. another
+                                                   engine's server that a main process elsewhere switches to.  Only
+                                                   these argument lists run (no shell, nothing from the request)
     }
 
 Who may drive it: the agent speaks HTTPS, TLS 1.3 only, and takes a connection only from a PC whose certificate is
@@ -66,6 +70,9 @@ out, https://):
                                connection open for the next (every other answer closes it)
     GET  /ranges?path=P        the byte ranges of data_dir/P written so far ([[offset, length], ...]) and its size
     GET  /sha256?path=P        the sha256 of data_dir/P (a whole file shipped again only when it changed)
+    POST /service              {"name": NAME, "action": "start"|"stop"|"status"} - runs node.json's services[NAME]
+                               [action] (one /service at a time) and answers its exit code, seconds and output's tail;
+                               404 without that service, 400 without that action
 The shipped model files keep every offset of the originals, so a node that holds only its layers' bytes (and
 every shard's header) loads them as from the whole file - tools/stage_ship.py sends only those.
 """
@@ -81,6 +88,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -227,10 +235,86 @@ def peer_name(sock: ssl.SSLSocket) -> str:
     return f"{cn} (SHA256:{hashlib.sha256(der).hexdigest()[:16]})"
 
 
+SERVICE_ACTIONS = ("start", "stop", "status")
+SERVICE_TIMEOUT_S = 300.0      # a service command's default limit ("timeout_s", at most SERVICE_TIMEOUT_MAX_S)
+SERVICE_TIMEOUT_MAX_S = 3600.0
+
+
+def check_services(value) -> dict:
+    """node.json's "services": {NAME: {action: [arg, ...], "timeout_s": S}} -> the same, checked (ValueError)."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("services must be an object")
+    out = {}
+    for name, s in value.items():
+        if not PLAIN_NAME.fullmatch(name) or not isinstance(s, dict):
+            raise ValueError(f"services: {name!r} must be a plain name with an object")
+        one = {}
+        for action in SERVICE_ACTIONS:
+            cmd = s.get(action)
+            if cmd is None:
+                continue
+            if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd)):
+                raise ValueError(f"services.{name}.{action} must be a list of strings")
+            one[action] = list(cmd)
+        if not one:
+            raise ValueError(f"services.{name} has none of {', '.join(SERVICE_ACTIONS)}")
+        t = s.get("timeout_s", SERVICE_TIMEOUT_S)
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= SERVICE_TIMEOUT_MAX_S:
+            raise ValueError(f"services.{name}.timeout_s must be 1..{SERVICE_TIMEOUT_MAX_S:g} s")
+        one["timeout_s"] = float(t)
+        out[name] = one
+    return out
+
+
+class Services:
+    """node.json's named commands, one run at a time.  The output goes to a temporary file, not a pipe: a command
+    that leaves a daemon behind (setsid nohup) would otherwise keep the pipe open and the answer would never come."""
+
+    def __init__(self, cfg: dict):
+        self.services = cfg.get("_services", {})
+        self.lock = threading.Lock()
+
+    def run(self, name, action) -> tuple[int, dict]:
+        s = self.services.get(name) if isinstance(name, str) else None
+        if s is None:
+            return 404, {"ok": False, "error": f"no service {name!r} in node.json"}
+        if action not in SERVICE_ACTIONS or action not in s:
+            return 400, {"ok": False, "error": f"service {name} has no action {action!r}"}
+        if not self.lock.acquire(timeout=s["timeout_s"]):
+            return 409, {"ok": False, "error": "another /service is still running"}
+        try:
+            t0 = time.perf_counter()
+            with tempfile.TemporaryFile() as out:
+                try:
+                    r = subprocess.run(s[action], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                       timeout=s["timeout_s"])
+                    rc, err = r.returncode, None
+                except subprocess.TimeoutExpired:
+                    rc, err = None, f"did not finish in {s['timeout_s']:g} s"
+                except OSError as e:
+                    rc, err = None, f"could not run: {e}"
+                out.seek(0)
+                text = out.read(4 << 20).decode("utf-8", errors="replace")
+            body = {"ok": rc == 0, "name": name, "action": action, "rc": rc,
+                    "seconds": round(time.perf_counter() - t0, 2), "output": tail(text, 40)}
+            if err:
+                body["error"] = err
+            sys.stderr.write(f"stage_node: service {name} {action}: rc {rc}{f' ({err})' if err else ''}\n")
+            return 200, body
+        finally:
+            self.lock.release()
+
+
 def load_config(path: str) -> dict:
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     if cfg.get("token_file"):
         sys.stderr.write("stage_node: node.json's token_file is not used any more (tls_dir instead)\n")
+    try:
+        cfg["_services"] = check_services(cfg.get("services"))
+    except ValueError as e:
+        sys.exit(f"stage_node: node.json: {e}")
     d = tls_dir(cfg.get("tls_dir"), "stage_node")
     try:
         cfg["_tls"], cfg["_server_ctx"], cfg["_client_ctx"] = d, tls_context(d, True), tls_context(d, False)
@@ -840,7 +924,9 @@ class Body:
             pass
 
 
-def make_handler(cfg: dict, workers: Workers, store: Store):
+def make_handler(cfg: dict, workers: Workers, store: Store, services: Services | None = None):
+    services = services if services is not None else Services(cfg)
+
     class Handler(BaseHTTPRequestHandler):
         # HTTP/1.1, but only a /put answered ok (its body read whole) keeps the connection (the shipper's next piece
         # follows on it); every other answer closes it, as HTTP/1.0 did - no handler is left with an unread body before
@@ -973,6 +1059,9 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
                 self.reply(200, {"ok": True, "stopped": workers.stop(req.get("port"))})
             elif path == "/send":
                 self.reply(200, send_test(req["url"], int(req.get("mib", 64)), cfg["_client_ctx"]))
+            elif path == "/service":   # one of node.json's named commands (opt-in "services")
+                code, body = services.run(req.get("name"), req.get("action"))
+                self.reply(code, body)
             else:
                 self.reply(404, {"ok": False, "error": "unknown path"})
 

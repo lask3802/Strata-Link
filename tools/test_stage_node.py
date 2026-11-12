@@ -878,6 +878,73 @@ class ShipTest(unittest.TestCase):
 
 
 @unittest.skipIf(OPENSSL is None, "no openssl command to make the keys")
+class ServicesTest(unittest.TestCase):
+    """node.json's "services" (opt-in): only the configured argument lists run, by name and action, one at a time,
+    bounded; a command that leaves a daemon holding its output still answers."""
+
+    PY = sys.executable
+
+    def setUp(self):
+        self.err = io.StringIO()
+        self.quiet = mock.patch.object(sys, "stderr", self.err)
+        self.quiet.start()
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.quiet.stop()
+        self.tmp.cleanup()
+
+    def services(self, value) -> sn.Services:
+        return sn.Services({"_services": sn.check_services(value)})
+
+    def test_check(self):
+        self.assertEqual(sn.check_services(None), {})
+        ok = sn.check_services({"rx": {"start": ["a", "b"], "stop": ["c"], "timeout_s": 60}})
+        self.assertEqual(ok, {"rx": {"start": ["a", "b"], "stop": ["c"], "timeout_s": 60.0}})
+        self.assertEqual(sn.check_services({"rx": {"status": ["s"]}})["rx"]["timeout_s"], sn.SERVICE_TIMEOUT_S)
+        for bad in ([], {"r x": {"start": ["a"]}}, {"rx": ["a"]}, {"rx": {}}, {"rx": {"start": "a"}},
+                    {"rx": {"start": []}}, {"rx": {"start": ["a", 1]}}, {"rx": {"start": ["a"], "timeout_s": 0}},
+                    {"rx": {"start": ["a"], "timeout_s": 99999}}, {"rx": {"start": ["a"], "timeout_s": True}},
+                    {"../x": {"start": ["a"]}}):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                sn.check_services(bad)
+
+    def test_run_and_refusals(self):
+        s = self.services({"rx": {"start": [self.PY, "-c", "print('up'); print('second line')"],
+                                  "stop": [self.PY, "-c", "import sys; print('no'); sys.exit(4)"]}})
+        code, body = s.run("rx", "start")
+        self.assertEqual((code, body["ok"], body["rc"], body["output"]), (200, True, 0, ["up", "second line"]))
+        code, body = s.run("rx", "stop")
+        self.assertEqual((code, body["ok"], body["rc"], body["output"]), (200, False, 4, ["no"]))
+        self.assertEqual(s.run("rx", "status")[0], 400)          # not configured
+        self.assertEqual(s.run("rx", "kill")[0], 400)
+        self.assertEqual(s.run("other", "start")[0], 404)
+        self.assertEqual(s.run(None, "start")[0], 404)
+        self.assertEqual(self.services(None).run("rx", "start")[0], 404)
+
+    def test_timeout_and_a_missing_program(self):
+        s = self.services({"slow": {"start": [self.PY, "-c", "import time; time.sleep(30)"], "timeout_s": 1},
+                           "gone": {"start": [str(Path(self.tmp.name) / "missing")]}})
+        t0 = time.time()
+        code, body = s.run("slow", "start")
+        self.assertLess(time.time() - t0, 20)
+        self.assertEqual((code, body["ok"], body["rc"]), (200, False, None))
+        self.assertIn("did not finish", body["error"])
+        code, body = s.run("gone", "start")
+        self.assertEqual((body["ok"], body["rc"]), (False, None))
+        self.assertIn("could not run", body["error"])
+
+    def test_a_daemon_left_behind_does_not_hold_the_answer(self):
+        # the command starts a child that inherits its output and lives on (as `setsid nohup ... &` does), then ends
+        child = "import time; time.sleep(20)"
+        code = (f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}]); print('started')")
+        s = self.services({"d": {"start": [self.PY, "-c", code], "timeout_s": 15}})
+        t0 = time.time()
+        status, body = s.run("d", "start")
+        self.assertLess(time.time() - t0, 10)
+        self.assertEqual((status, body["ok"], body["output"]), (200, True, ["started"]))
+
+
 class AgentTlsTest(unittest.TestCase):
     """Who the agent takes: a PC whose certificate is its own or in its peers/, over TLS 1.3 - and who a client
     takes: an agent whose certificate it holds.  Everything else is refused before a request is read, and the agent
@@ -945,6 +1012,32 @@ class AgentTlsTest(unittest.TestCase):
         if "control: loaded" in r.stdout:
             self.skipTest("this Python's new contexts set their own security level: the host policy reaches none")
         self.assertEqual((r.returncode, r.stdout.split()), (0, ["control:", "refused", "loaded"]), r.stderr[-400:])
+
+    def test_service_over_https(self):
+        # /service through the agent's own handler: a peer runs a configured command; without services, 404
+        cfg = {"_tls": self.node, "bind": "127.0.0.1", "data_dir": self.tmp.name, "drop_cache": False,
+               "_services": sn.check_services({"rx": {"status": [sys.executable, "-c", "print('rx: not running')"]}})}
+        srv = sn.TlsServer(("127.0.0.1", 0), sn.make_handler(cfg, sn.Workers(cfg), sn.Store(cfg)),
+                           sn.tls_context(self.node, True))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def post(url, body):
+                r = urllib.request.Request(url + "/service", data=json.dumps(body).encode(), method="POST",
+                                           headers={"Content-Type": "application/json"})
+                try:
+                    with sn.https_opener(sn.tls_context(self.main, False)).open(r, timeout=30) as resp:
+                        return resp.status, json.load(resp)
+                except urllib.error.HTTPError as e:
+                    with e:
+                        return e.code, json.load(e)
+            url = f"https://127.0.0.1:{srv.server_address[1]}"
+            code, body = post(url, {"name": "rx", "action": "status"})
+            self.assertEqual((code, body["ok"], body["output"]), (200, True, ["rx: not running"]))
+            self.assertEqual(post(url, {"name": "rx", "action": "start"})[0], 400)
+            self.assertEqual(post(self.url, {"name": "rx", "action": "status"})[0], 404)   # this agent has none
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_a_peer_is_served_and_named(self):
         self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})
