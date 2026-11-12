@@ -272,7 +272,7 @@ class ModelControl(Base):
         seen = {}
 
         def popen(cmd, **kw):
-            seen.update(kw)
+            seen.update(kw, switching=dict(self.svc.switching or {}))   # already set: no request slips in before
             return real(cmd, **kw)
         with mock.patch.object(server.subprocess, "Popen", popen):
             self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 202)
@@ -281,6 +281,7 @@ class ModelControl(Base):
         else:
             self.assertIs(seen.get("start_new_session"), True)
         self.assertIs(seen.get("close_fds"), True)
+        self.assertEqual(seen["switching"].get("to"), "deepseek")
         self.assertTrue(wait_for(lambda: self.svc.switching is None))
 
     def test_a_command_that_cannot_run(self):

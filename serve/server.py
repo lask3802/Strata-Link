@@ -5973,13 +5973,17 @@ class Service:
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
                     return 409, {"error": {"message": "a request is running or queued"}}
-            if self.switching:
-                return 409, {"error": {"message": f"a switch to {self.switching['to']} is under way"}}
+                if self.switching:
+                    return 409, {"error": {"message": f"a switch to {self.switching['to']} is under way"}}
+                # set before the command starts, in the same lock as the check: a parallel request (it counts itself
+                # queued under this lock) either is refused above or sees the switch and gets 503
+                self.switching = {"to": target, "at": time.time(), "pid": None}
             cmd = [*mc["switch"], target]
             log = mc.get("log")
             try:
                 out = open(log, "ab") if log else subprocess.DEVNULL
             except OSError as e:
+                self.switching = None
                 return 500, {"error": {"type": "server_error", "message": f"the switch log cannot be opened: {e}"}}
             try:
                 kw = {"start_new_session": True} if os.name != "nt" else \
@@ -5988,11 +5992,12 @@ class Service:
                 p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                      close_fds=True, **kw)
             except OSError as e:
+                self.switching = None
                 return 500, {"error": {"type": "server_error", "message": f"the switch command could not run: {e}"}}
             finally:
                 if log and out is not subprocess.DEVNULL:
                     out.close()
-            self.switching = {"to": target, "at": time.time(), "pid": p.pid}
+            self.switching = {"to": target, "at": self.switching["at"], "pid": p.pid}
             print(f"[strata] switching this port to {target}: {' '.join(map(str, cmd))} (pid {p.pid})", flush=True)
             threading.Thread(target=self._switch_reap, args=(p,), daemon=True).start()
             return 202, {"status": "switching", "to": target}
