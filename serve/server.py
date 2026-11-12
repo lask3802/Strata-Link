@@ -345,6 +345,10 @@ STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
+# "session_on_unload" (opt-in): the file the conversation is saved to before an unload, in slot_save_path, and how long
+# that save may take before the unload goes on without it (the engine is ended then: it was being stopped anyway)
+UNLOAD_SESSION_FILE = "unload-session.bin"
+UNLOAD_SESSION_WAIT_S = 120.0
 # ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto, issue
 # #282), and the slowest PCs read ~100 tok/s, so a first chunk can take minutes before the first line.  Until the first
 # PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
@@ -3074,11 +3078,11 @@ class StrataEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, deadline: float | None = None) -> dict:
         with self._exclusive_control():
-            return self._session_file(action, path)
+            return self._session_file(action, path, deadline)
 
-    def _session_file(self, action: str, path: str) -> dict:
+    def _session_file(self, action: str, path: str, deadline: float | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -3089,7 +3093,9 @@ class StrataEngine:
         block of the file moved, at most 16 MiB) counts only when its numbers are.  `SWAIT <phase> <seconds>` announces
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
-        that never ends is still ended."""
+        that never ends is still ended.  `deadline` (time.monotonic(); None: none): no answer by then ends the engine
+        (EngineDied) - the two sides cannot be put back in step in the middle of a file, so only a caller that stops
+        the engine next passes one (session_on_unload)."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
@@ -3121,11 +3127,17 @@ class StrataEngine:
         while True:
             limit = max(silence, allow)
             left = limit - (time.monotonic() - heard) if silence > 0 else None
+            if deadline is not None:
+                cap = deadline - time.monotonic()
+                left = cap if left is None else min(left, cap)
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
                 line = self.lines.get(timeout=left)
             except queue.Empty:
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.end_for_restart()
+                    raise EngineDied(f"the session {action} did not finish in time; the server ended the engine") from None
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
             if line is None:
@@ -5136,6 +5148,11 @@ class Service:
         self.after_unload = None
         self.after_unload_timeout_s = 300.0
         self.after_unload_result = None                  # the last run: None, "ok" or why it failed
+        # (opt-in) "session_on_unload": an unload (POST /unload, the Monitor's Unload, the idle unload) saves the
+        # conversation to slot_save_path first, and the next load restores it (restore_after_load)
+        self.session_on_unload = False
+        self.session_on_unload_wait_s = UNLOAD_SESSION_WAIT_S
+        self.session_on_unload_said = False              # "ignored with parallel requests" logged once
         # (opt-in) "model_control": the Monitor's model card - which model this server runs and which others the
         # machine can serve on this port instead; a switch runs the configured command, which stops this server
         self.model_control = None
@@ -5158,6 +5175,7 @@ class Service:
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
+        self.restore_after_load_from = None               # (or session_on_unload: "the unload", for the log line)
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
@@ -5660,7 +5678,7 @@ class Service:
                 raise EngineDied(f"the engine could not be started: {e}") from e
             raise
         print("[strata] the engine is running again", flush=True)
-        if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
+        if self.restore_after_load:                      # an image job or an unload saved it: the conversation comes back
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
@@ -5901,6 +5919,7 @@ class Service:
                 return "busy"
             if self.switching:                          # model_control: the switch command stops it (its own way)
                 return "busy"
+            self._save_before_unload()
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -5911,6 +5930,38 @@ class Service:
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def _save_before_unload(self) -> None:
+        """session_on_unload (opt-in): the conversation the engine holds, saved to slot_save_path/unload-session.bin
+        before the engine stops; the next load restores it (ensure_loaded -> restore_after_load) and deletes the file.
+        The caller holds the FIFO.  It never stops the unload: a failure (nothing to save, short of RAM or disk, an
+        engine that cannot save, a remote stage whose worker keeps no session files) is one log line, and a save not
+        done in session_on_unload_wait_s ends the engine (the unload was about to stop it)."""
+        if not self.session_on_unload or not self.slot_save_path or not hasattr(self.engine, "session_file"):
+            return
+        if getattr(self.engine, "batch", 0):            # parallel requests: no session files (slot_action's reason)
+            if not self.session_on_unload_said:
+                self.session_on_unload_said = True
+                print("[strata] session_on_unload is ignored: this engine runs parallel requests", flush=True)
+            return
+        path = os.path.join(self.slot_save_path, UNLOAD_SESSION_FILE)
+        with self.status_lock:
+            self.status.update(busy=True, phase="saving the session", started=time.time(), first_token=None,
+                               prompt_tokens=None, generated=None, max_tokens=None)
+        try:
+            r = self.engine.session_file("save", path, deadline=time.monotonic() + self.session_on_unload_wait_s)
+        except Exception as e:                          # noqa: BLE001 - the unload goes on without the conversation
+            print(f"[strata] the conversation was not saved before the unload ({e}); the next request reads its "
+                  "prompt again", flush=True)
+            with contextlib.suppress(OSError):          # (an older file, or one a failed save published: not restored)
+                os.unlink(path)
+            return
+        finally:
+            with self.status_lock:
+                self.status["busy"] = False
+        self.restore_after_load, self.restore_after_load_from = path, "the unload"
+        print(f"[strata] the conversation ({r.get('tokens')} tokens, {r.get('bytes')} bytes) saved in "
+              f"{float(r.get('ms') or 0) / 1000:.1f} s before the unload; the next load restores it", flush=True)
 
     def run_after_unload(self) -> None:
         """The after_unload command (opt-in), once the engine has stopped.  Its failure is logged and kept in
@@ -10918,6 +10969,20 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    sou = cfg.get("session_on_unload", False)           # opt-in: the conversation kept across an unload
+    if not isinstance(sou, bool):
+        raise SystemExit(f"[strata] config \"session_on_unload\" must be true or false, not {sou!r}")
+    if sou and not svc.slot_save_path:
+        raise SystemExit("[strata] config \"session_on_unload\" needs \"slot_save_path\" (the folder the "
+                         "conversation is saved in)")
+    if sou and parallel_slots(cfg):
+        svc.session_on_unload_said = True
+        print("[strata] session_on_unload is ignored: parallel requests (\"parallel\" / --batch) keep no session "
+              "files", flush=True)
+    elif sou:
+        svc.session_on_unload = True
+        print(f"[strata] session_on_unload on: an unload saves the conversation to {svc.slot_save_path}"
+              f"{os.sep}{UNLOAD_SESSION_FILE} first, and the next load restores it", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")

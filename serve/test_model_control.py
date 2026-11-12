@@ -302,7 +302,8 @@ class ModelControl(Base):
 
 class MainReadsTheConfig(unittest.TestCase):
     """server.main: the run config's after_unload, after_unload_timeout_s and model_control reach the Service, a bad
-    model_control stops the start, --offline refuses both."""
+    model_control stops the start, --offline refuses both; session_on_unload (serve/test_session_on_unload.py) needs
+    slot_save_path and is off with parallel requests."""
 
     def start(self, extra, argv=()):
         from unittest import mock
@@ -352,6 +353,21 @@ class MainReadsTheConfig(unittest.TestCase):
     def test_a_bad_timeout_keeps_the_default(self):
         for bad in ("soon", -5, "inf", "nan", 1e300):
             self.assertEqual(self.start({"after_unload_timeout_s": bad}).after_unload_timeout_s, 300.0, bad)
+
+    def test_session_on_unload(self):
+        # opt-in; it needs slot_save_path, is true or false, and is ignored with parallel requests
+        save = tempfile.mkdtemp()
+        self.assertFalse(self.start({"slot_save_path": save}).session_on_unload)
+        self.assertTrue(self.start({"slot_save_path": save, "session_on_unload": True}).session_on_unload)
+        self.assertFalse(self.start({"slot_save_path": save, "session_on_unload": False}).session_on_unload)
+        with self.assertRaises(SystemExit):
+            self.start({"session_on_unload": True})
+        for bad in ("yes", 1, None):
+            with self.assertRaises(SystemExit):
+                self.start({"slot_save_path": save, "session_on_unload": bad})
+        svc = self.start({"slot_save_path": save, "session_on_unload": True, "parallel": 2})
+        self.assertFalse(svc.session_on_unload)
+        self.assertTrue(svc.session_on_unload_said)
 
     def test_a_bad_model_control_stops_the_start(self):
         with self.assertRaises(SystemExit):

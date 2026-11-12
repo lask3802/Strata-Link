@@ -463,6 +463,7 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
     elif policy == "unload" and restore:
         if restore != "unloaded":
             svc.restore_after_load = restore         # Service.ensure_loaded restores it after the next start
+            svc.restore_after_load_from = None
         if gen.reload == "eager":
             try:
                 svc.ensure_loaded()                  # the caller still holds the FIFO
@@ -471,16 +472,19 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
 
 
 def restore_session(svc) -> None:
-    """After an engine start: restore the conversation an image job saved before it unloaded the engine."""
+    """After an engine start: restore the conversation an image job (or session_on_unload) saved before it unloaded
+    the engine."""
     path = getattr(svc, "restore_after_load", None)
     if not path:
         return
+    what = getattr(svc, "restore_after_load_from", None) or "the image job"
     svc.restore_after_load = None
+    svc.restore_after_load_from = None
     try:
         r = svc.engine.session_file("restore", path)
-        print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
+        print(f"[strata] the conversation from before {what} is back ({r.get('tokens')} tokens)", flush=True)
     except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
-        print(f"[strata] the conversation from before the image job was not restored ({e}); the next request "
+        print(f"[strata] the conversation from before {what} was not restored ({e}); the next request "
               "reads its prompt again", flush=True)
     finally:
         with contextlib.suppress(OSError):
