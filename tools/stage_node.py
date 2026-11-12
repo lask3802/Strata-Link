@@ -282,21 +282,36 @@ class Services:
             return 404, {"ok": False, "error": f"no service {name!r} in node.json"}
         if action not in SERVICE_ACTIONS or action not in s:
             return 400, {"ok": False, "error": f"service {name} has no action {action!r}"}
-        if not self.lock.acquire(timeout=s["timeout_s"]):
+        # not queued: a caller that gave up must not have its start or stop run later, after it went on
+        if not self.lock.acquire(blocking=False):
             return 409, {"ok": False, "error": "another /service is still running"}
         try:
             t0 = time.perf_counter()
             with tempfile.TemporaryFile() as out:
                 try:
-                    r = subprocess.run(s[action], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                       timeout=s["timeout_s"])
-                    rc, err = r.returncode, None
-                except subprocess.TimeoutExpired:
-                    rc, err = None, f"did not finish in {s['timeout_s']:g} s"
+                    # its own process group: a timeout ends what it started and still waits for (not a daemon it
+                    # detached with setsid, which has a session of its own)
+                    kw = {"start_new_session": True} if os.name != "nt" else \
+                        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                    p = subprocess.Popen(s[action], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **kw)
+                    try:
+                        rc, err = p.wait(timeout=s["timeout_s"]), None
+                    except subprocess.TimeoutExpired:
+                        rc, err = None, f"did not finish in {s['timeout_s']:g} s"
+                        try:
+                            if os.name != "nt":
+                                os.killpg(p.pid, signal.SIGKILL)
+                            else:
+                                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True,
+                                               timeout=30)
+                        except (OSError, subprocess.SubprocessError):
+                            p.kill()
+                        p.wait()
                 except OSError as e:
                     rc, err = None, f"could not run: {e}"
-                out.seek(0)
-                text = out.read(4 << 20).decode("utf-8", errors="replace")
+                size = out.seek(0, os.SEEK_END)                  # the tail: the last 4 MiB, not the first
+                out.seek(max(0, size - (4 << 20)))
+                text = out.read().decode("utf-8", errors="replace")
             body = {"ok": rc == 0, "name": name, "action": action, "rc": rc,
                     "seconds": round(time.perf_counter() - t0, 2), "output": tail(text, 40)}
             if err:

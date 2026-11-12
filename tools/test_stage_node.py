@@ -877,7 +877,6 @@ class ShipTest(unittest.TestCase):
         self.assertGreaterEqual(live[1], 3, "the pieces did not overlap")
 
 
-@unittest.skipIf(OPENSSL is None, "no openssl command to make the keys")
 class ServicesTest(unittest.TestCase):
     """node.json's "services" (opt-in): only the configured argument lists run, by name and action, one at a time,
     bounded; a command that leaves a daemon holding its output still answers."""
@@ -934,6 +933,37 @@ class ServicesTest(unittest.TestCase):
         self.assertEqual((body["ok"], body["rc"]), (False, None))
         self.assertIn("could not run", body["error"])
 
+    def test_one_at_a_time_and_a_second_is_refused_at_once(self):
+        s = self.services({"slow": {"start": [self.PY, "-c", "import time; time.sleep(3)"], "timeout_s": 30}})
+        t = threading.Thread(target=s.run, args=("slow", "start"))
+        t.start()
+        try:
+            deadline = time.time() + 10
+            while not s.lock.locked() and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(s.lock.locked())
+            t0 = time.time()
+            code, body = s.run("slow", "start")
+            self.assertLess(time.time() - t0, 1, "a second /service waited instead of being refused")
+            self.assertEqual((code, body["ok"]), (409, False))
+        finally:
+            t.join()
+
+    def test_a_timeout_ends_what_the_command_waits_for_too(self):
+        mark = Path(self.tmp.name) / "late"
+        child = f"import time; time.sleep(3); open({str(mark)!r}, 'w').close()"
+        code = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+        s = self.services({"w": {"start": [self.PY, "-c", code], "timeout_s": 1}})
+        self.assertIn("did not finish", s.run("w", "start")[1]["error"])
+        time.sleep(5)
+        self.assertFalse(mark.exists(), "the command's child outlived its timeout")
+
+    def test_the_output_is_its_tail(self):
+        # more than the 4 MiB read back: the last lines are what is shown
+        code = "import sys; sys.stdout.write(''.join('%015d\\n' % i for i in range(400000)))"
+        s = self.services({"loud": {"start": [self.PY, "-c", code]}})
+        self.assertEqual(s.run("loud", "start")[1]["output"][-1], "%015d" % 399999)
+
     def test_a_daemon_left_behind_does_not_hold_the_answer(self):
         # the command starts a child that inherits its output and lives on (as `setsid nohup ... &` does), then ends
         child = "import time; time.sleep(20)"
@@ -945,6 +975,7 @@ class ServicesTest(unittest.TestCase):
         self.assertEqual((status, body["ok"], body["output"]), (200, True, ["started"]))
 
 
+@unittest.skipIf(OPENSSL is None, "no openssl command to make the keys")
 class AgentTlsTest(unittest.TestCase):
     """Who the agent takes: a PC whose certificate is its own or in its peers/, over TLS 1.3 - and who a client
     takes: an agent whose certificate it holds.  Everything else is refused before a request is read, and the agent

@@ -486,7 +486,8 @@ python3 tools/stage_node.py node.json
 - `POST /service` (`{"name": NAME, "action": "start" | "stop" | "status"}`, opt-in): runs one of node.json's
   `"services"` - `{"NAME": {"start": [ARG, ...], "stop": [...], "status": [...], "timeout_s": 300}}` - and answers its
   exit code, seconds and the last 40 lines of its output. Only those argument lists run (no shell, nothing taken from
-  the request), one `/service` at a time, at most `timeout_s` (1 to 3600 s). For another engine's helper on this PC
+  the request), one `/service` at a time (a second one meanwhile answers **409** at once), at most `timeout_s` (1 to
+  3600 s; then the command and what it waits for are ended). For another engine's helper on this PC
   that a main process elsewhere switches to, for example DeepSeek's expert server behind a server's `model_control`
   (DETAILS.md, "Sharing the GPU"). A command that leaves a daemon behind (`setsid nohup`) still returns: the output is
   read from a file, not a pipe. A daemon it starts runs in the agent's service, so restarting the agent's unit ends it.
