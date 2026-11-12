@@ -1178,9 +1178,13 @@ bool StageClient::session_call_(StageMsg type, StageMsg want, int64_t a, int64_t
 }
 
 bool StageClient::session_put(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, int64_t& bytes,
-                              std::string& err, int wait_s) {
+                              bool& missing, std::string& err, int wait_s) {
     bytes = 0;
-    return session_call_(StageMsg::SessionPut, StageMsg::SessionPutOk, ckpt_id, L, token, Lc, {}, bytes, err, wait_s);
+    missing = false;
+    if (session_call_(StageMsg::SessionPut, StageMsg::SessionPutOk, ckpt_id, L, token, Lc, {}, bytes, err, wait_s))
+        return true;
+    missing = connected() && err.rfind(std::string("remote stage (worker): ") + kStageCkptMissing, 0) == 0;
+    return false;
 }
 
 bool StageClient::session_get(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc,
@@ -2101,8 +2105,8 @@ int serve_stage(const std::string& bind_addr, int port, std::shared_ptr<TlsCrede
             }
             case StageMsg::SessionGet: {
                 // the session is replaced, but only once the whole file has passed its checks: a failed Commit or
-                // position table is this restore's error (kept pending, as at a SessionPut: the main process keeps its
-                // session when the restore fails before anything was written)
+                // position table is this restore's error, not the missing one (the main process ends its engine).  The
+                // Commit's is reported here and dropped; the position table's stays pending (its request's)
                 std::string e;
                 if (!replies_out()) { keep = false; break; }
                 if (!pending_err.empty() || !pos_err.empty()) {

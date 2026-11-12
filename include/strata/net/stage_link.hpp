@@ -253,9 +253,10 @@ public:
     bool park_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
     /// Session files (a worker whose hello lists kStageCapSession): the worker writes its half of the session at L
     /// (and its checkpoint part `ckpt_id`, saved at Lc; 0: none) to its disk under `token`; `bytes`: what it wrote.
-    /// An error from the worker leaves its session and stores as they were.  `wait_s` > 0: the reply may take that
-    /// long (else STRATA_REMOTE_TIMEOUT_S, as every reply); the link counts as lost after it.
-    bool session_put(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, int64_t& bytes,
+    /// An error from the worker leaves its session and stores as they were; `missing` (with false): the worker does
+    /// not hold checkpoint part `ckpt_id` (the caller may save again without a checkpoint).  `wait_s` > 0: the reply
+    /// may take that long (else STRATA_REMOTE_TIMEOUT_S, as every reply); the link counts as lost after it.
+    bool session_put(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, int64_t& bytes, bool& missing,
                      std::string& err, int wait_s = 0);
     /// The worker reads its half under `token` back (the whole file checked before it writes anything): its session
     /// at L, the checkpoint at Lc kept under `ckpt_id` (0: none), its stores pruned to `keep`.  `missing` (with

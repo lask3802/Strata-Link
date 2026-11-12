@@ -4235,6 +4235,11 @@ int main(int argc, char** argv) {
                              "main process writes its own half where SAVE names)\n");
         return 2;
     }
+    if (o.stage_session_keep_given && o.stage_session_dir.empty()) {
+        std::fprintf(stderr, "strata generate: --stage-session-keep needs --stage-session-dir (the folder whose session "
+                             "files it keeps)\n");
+        return 2;
+    }
     if (o.stage_session_keep < 1 || o.stage_session_keep > 1000000) {
         std::fprintf(stderr, "strata generate: --stage-session-keep needs 1 to 1000000\n");
         return 2;
@@ -4288,11 +4293,18 @@ int main(int argc, char** argv) {
         }
         // session files (docs/remote-stage/SESSIONS.md): the worker's folder, absolute and there before the model loads
         if (stage_worker && !o.stage_session_dir.empty()) {
-            std::string dir_err;
-            if (!strata::core::stage_session_dir_prepare(o.stage_session_dir, dir_err)) {
+            std::string dir_err, dir_warn;
+            size_t temps = 0;
+            if (!strata::core::stage_session_dir_prepare(o.stage_session_dir, dir_err, &temps, &dir_warn)) {
                 std::fprintf(stderr, "strata generate: remote stage: %s\n", dir_err.c_str());
                 return 2;
             }
+            if (temps)
+                std::fprintf(stderr, "strata generate: remote stage: removed %zu temporary file%s a save ended in the "
+                                     "middle of its write left in %s\n", temps, temps == 1 ? "" : "s",
+                             o.stage_session_dir.c_str());
+            if (!dir_warn.empty())
+                std::fprintf(stderr, "strata generate: remote stage: session files: %s\n", dir_warn.c_str());
             std::fprintf(stderr, "strata generate: remote stage: session files' worker halves in %s (the %lld newest "
                                  "kept)\n", o.stage_session_dir.c_str(), (long long) o.stage_session_keep);
         }
@@ -15564,8 +15576,13 @@ int main(int argc, char** argv) {
                         } catch (const std::bad_alloc&) {
                             return missing("not enough RAM to read it");
                         }
-                        if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess)
-                            return missing(std::string("before the restore: ") + cudaGetErrorString(se));
+                        if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                            // a device that failed before the restore: its session is not trusted (as a ParkRestore)
+                            e = std::string("stage worker: a session file's restore failed: before it: ") +
+                                cudaGetErrorString(se);
+                            std::fprintf(stderr, "strata stage worker: session file not restored: %s\n", e.c_str());
+                            return false;
+                        }
                         std::string why;
                         wk_blocking("transfer", (uint64_t) L * 16384);
                         const auto r = strata::core::conversation_part_restore(img.kv, img.state, ss, g, (size_t) L, why);
@@ -15574,16 +15591,23 @@ int main(int argc, char** argv) {
                             e = "stage worker: a session file's restore failed: " + why;
                             return false;
                         }
-                        // the checkpoint under the main process's new id, then only what it holds
-                        if (ckpt_id != 0) {
-                            strata::net::StageCkptStore::Part p;
-                            p.L = Lc;
-                            p.state = std::move(img.ckpt);
-                            ckpt_store.put(ckpt_id, std::move(p), keep);
-                        } else {
-                            ckpt_store.prune(keep);
+                        // the checkpoint under the main process's new id, then only what it holds (the session is
+                        // restored: a failure here is an error the main process answers by ending its engine)
+                        try {
+                            if (ckpt_id != 0) {
+                                strata::net::StageCkptStore::Part p;
+                                p.L = Lc;
+                                p.state = std::move(img.ckpt);
+                                ckpt_store.put(ckpt_id, std::move(p), keep);
+                            } else {
+                                ckpt_store.prune(keep);
+                            }
+                            park_store.prune(keep);
+                        } catch (const std::bad_alloc&) {
+                            e = "stage worker: a session file's restore failed: out of memory for its checkpoint";
+                            std::fprintf(stderr, "strata stage worker: session file not restored: %s\n", e.c_str());
+                            return false;
                         }
-                        park_store.prune(keep);
                         std::fprintf(stderr, "strata stage worker: session file restored: %lld tokens (checkpoint "
                                              "%lld) from %s in %.0f ms\n", (long long) L, (long long) Lc, path.c_str(),
                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -17369,8 +17393,21 @@ int main(int argc, char** argv) {
                             const auto tw = Clock::now();
                             int64_t wbytes = 0;
                             std::string we;
-                            if (!remote_link.session_put(ckpt_id, (int64_t) live.size(), worker_token, Lc, wbytes, we,
-                                                         wait)) {
+                            bool part_missing = false;
+                            bool put = remote_link.session_put(ckpt_id, (int64_t) live.size(), worker_token, Lc, wbytes,
+                                                               part_missing, we, wait);
+                            if (!put && part_missing && ckpt_id != 0) {
+                                // the worker no longer holds the checkpoint's part: the file is saved without a
+                                // checkpoint (a restore reads the session at L whole; edits further back read again)
+                                std::fprintf(stderr, "strata serve: remote stage: the worker does not hold checkpoint "
+                                                     "%lld's part (%s): the session file is saved without a checkpoint\n",
+                                             (long long) ckpt_id, we.c_str());
+                                disk_checks.clear();
+                                we.clear();
+                                put = remote_link.session_put(0, (int64_t) live.size(), worker_token, 0, wbytes,
+                                                              part_missing, we, wait);
+                            }
+                            if (!put) {
                                 refuse("the remote stage did not save its half: " + we, worker_error(we));
                                 continue;
                             }
@@ -17497,11 +17534,15 @@ int main(int argc, char** argv) {
                                 refuse("the link to the remote stage was lost while it read its half (" + we + "); the "
                                        "next request connects again", strata::core::SessionError::io);
                             } else {
-                                // the worker's session is lost (its stores are as they were): the live session here is
-                                // not continued; the next request reads from a checkpoint or from token 0
-                                live_ok = false;
-                                refuse("the remote stage failed to restore its half (" + we + "); the live session "
-                                       "is dropped", strata::core::SessionError::io);
+                                // the worker may have written part of its cells [0, L) before it failed: a checkpoint
+                                // here restores only the running state, so no request may go on from what is left - the
+                                // engine stops (the server starts it again), as after a failed ParkRestore
+                                std::fprintf(stderr, "strata serve: session restore %s: the remote stage failed: %s\n",
+                                             path.c_str(), we.c_str());
+                                std::printf("FATAL the remote stage failed to restore its half of the session file "
+                                            "(its session is lost): %s\n", we.c_str());
+                                std::fflush(stdout);
+                                return 1;
                             }
                             continue;
                         }
@@ -17528,7 +17569,13 @@ int main(int argc, char** argv) {
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
-                    if (remote_main && !checks.empty()) checks[0].remote_id = remote_new_id;   // (the worker's part)
+                    if (remote_main) {
+                        if (!checks.empty()) checks[0].remote_id = remote_new_id;   // (the worker's part)
+                        // the worker holds this session now, also when the link was made again before it, and no
+                        // pipelined window of an earlier request is left: neither may drop or refuse it later
+                        remote_fresh = false;
+                        pl_drain_err.clear();
+                    }
                     cvec_cached = image.cvec;
                     live_ok = true;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)

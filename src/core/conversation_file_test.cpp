@@ -1052,6 +1052,47 @@ int main() {
             check(!stage_session_dir_prepare(f, de) && de.find("not a folder") != std::string::npos,
                   "session dir: a file is refused");
         }
+        // a save ended in the middle of its write leaves its temporary file: the worker's start removes it - only
+        // that exact name, a regular file, and one not written to for the stale time (another worker may be writing)
+        {
+            const fs::path td = dir / "temps";
+            fs::create_directories(td);
+            const std::string half = stage_session_file_name(SessionToken{0xabc, 0xdef});
+            const std::string stale = "." + half + ".0123456789abcdef.tmp", fresh = "." + half + ".fedcba9876543210.tmp";
+            const auto old = fs::file_time_type::clock::now() - std::chrono::hours(2);
+            std::vector<std::string> others = {"." + half + ".AAAAAAAAAAAAAAAA.tmp", "." + half + ".0123456789abcdef.tmpx",
+                                               "." + half + ".0123456789abcde.tmp", ".notes.0123456789abcdef.tmp",
+                                               half, "keep.txt"};
+            for (const auto& n : others) spit(td / n, std::vector<char>(5, 't'));
+            spit(td / stale, std::vector<char>(5, 't'));
+            spit(td / fresh, std::vector<char>(5, 't'));
+            for (const auto& n : others) fs::last_write_time(td / n, old);
+            fs::last_write_time(td / stale, old);
+            const std::string as_dir = "." + stage_session_file_name(SessionToken{1, 1}) + ".1111111111111111.tmp";
+            fs::create_directories(td / as_dir);
+            fs::last_write_time(td / as_dir, old);
+            const fs::path target = dir / "temp-target.bin";
+            spit(target, std::vector<char>(5, 'x'));
+            const std::string as_link = "." + stage_session_file_name(SessionToken{2, 2}) + ".2222222222222222.tmp";
+            std::error_code lec;
+            fs::create_symlink(target, td / as_link, lec);
+            std::string d = td.string(), de, warn;
+            size_t removed = 9;
+            const bool prep = stage_session_dir_prepare(d, de, &removed, &warn);
+            if (!prep || removed != 1 || !warn.empty())
+                std::fprintf(stderr, "  dir_prepare: %d, %zu removed, warning %s, error %s\n", (int) prep, removed,
+                             warn.c_str(), de.c_str());
+            check(prep && removed == 1 && warn.empty() &&
+                      !fs::exists(td / stale),
+                  "temporary files: the stale one of a worker half's exact name removed");
+            bool kept = fs::exists(td / fresh) && fs::is_directory(td / as_dir) && fs::exists(target);
+            for (const auto& n : others) kept = kept && fs::exists(td / n);
+            check(kept, "temporary files: a fresh one, other names, a folder and a link's target are kept");
+            if (!lec) check(fs::is_symlink(td / as_link), "temporary files: a link of that name is kept");
+            std::string again = td.string();
+            check(stage_session_dir_prepare(again, de, &removed, &warn, 0) && removed == 1 && !fs::exists(td / fresh),
+                  "temporary files: with no stale time the fresh one goes too");
+        }
     }
 
     fs::remove_all(dir);

@@ -1464,15 +1464,25 @@ std::string u8_string(const std::filesystem::path& p) {
     const std::u8string u = p.u8string();
     return std::string(u.begin(), u.end());
 }
+bool lower_hex(const std::string& s, size_t at, size_t n) {
+    for (size_t i = at; i < at + n; ++i) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
 bool stage_session_name(const std::string& name) {
     static const std::string pre = "stage-session-", post = ".bin";
     if (name.size() != pre.size() + 32 + post.size() || name.compare(0, pre.size(), pre) != 0 ||
         name.compare(pre.size() + 32, post.size(), post) != 0) return false;
-    for (size_t i = pre.size(); i < pre.size() + 32; ++i) {
-        const char c = name[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-    }
-    return true;
+    return lower_hex(name, pre.size(), 32);
+}
+// the temporary name a worker half's write uses (temp_name of a stage-session name): .<that name>.<16 hex>.tmp
+bool stage_session_temp_name(const std::string& name) {
+    static const size_t leaf = 14 + 32 + 4;   // stage-session-<32 hex>.bin
+    if (name.size() != 1 + leaf + 1 + 16 + 4 || name[0] != '.' || !stage_session_name(name.substr(1, leaf)) ||
+        name[1 + leaf] != '.' || name.compare(1 + leaf + 1 + 16, 4, ".tmp") != 0) return false;
+    return lower_hex(name, 1 + leaf + 1, 16);
 }
 } // namespace
 
@@ -1518,7 +1528,10 @@ size_t stage_session_prune(const std::string& dir, size_t keep, const std::strin
     return removed;
 }
 
-bool stage_session_dir_prepare(std::string& dir, std::string& error) {
+bool stage_session_dir_prepare(std::string& dir, std::string& error, size_t* removed, std::string* warning,
+                               int64_t stale_s) {
+    if (removed) *removed = 0;
+    if (warning) warning->clear();
     if (dir.empty()) { error = "--stage-session-dir: an empty path"; return false; }
     std::error_code ec;
     const std::filesystem::path p = std::filesystem::absolute(u8_path(dir), ec);
@@ -1536,6 +1549,29 @@ bool stage_session_dir_prepare(std::string& dir, std::string& error) {
     } else if (!std::filesystem::is_directory(p, ec) || ec) {
         error = "--stage-session-dir " + dir + ": not a folder";
         return false;
+    } else {
+        // a save ended in the middle of its write (the process killed) leaves its temporary file: up to a whole half
+        std::vector<std::filesystem::path> stale;
+        const auto now = std::filesystem::file_time_type::clock::now();
+        std::filesystem::directory_iterator it(p, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            if (!stage_session_temp_name(u8_string(it->path().filename()))) continue;
+            std::error_code e2;
+            const auto st = it->symlink_status(e2);
+            if (e2 || !std::filesystem::is_regular_file(st)) continue;
+            const auto at = it->last_write_time(e2);
+            if (e2 || now - at < std::chrono::seconds(stale_s)) continue;
+            stale.push_back(it->path());
+        }
+        for (const auto& f : stale) {
+            std::error_code e2;
+            if (std::filesystem::remove(f, e2)) {
+                if (removed) ++*removed;
+            } else if (e2 && warning) {
+                *warning += (warning->empty() ? "" : "; ") + std::string("cannot remove ") +
+                            u8_string(f.filename()) + ": " + e2.message();
+            }
+        }
     }
     dir = u8_string(p);
     return true;

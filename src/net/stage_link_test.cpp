@@ -688,9 +688,84 @@ std::string key_folder(const char* name, EVP_PKEY* key, X509* cert, const std::v
     return d.string();
 }
 #endif
+// 19's slow reply, in a process of its own (`stage_link_test --slow-reply`): STRATA_REMOTE_TIMEOUT_S is read once per
+// process, so it is set to 1 here before any link exists, and a worker's session handler takes 2 s.  A SessionGet
+// allowed 30 s waits for it; one with no allowance is a lost link at the socket's 1 s.  0 when both hold.
+int slow_reply_child() {
+#if defined(_WIN32)
+    _putenv_s("STRATA_REMOTE_TIMEOUT_S", "1");
+#else
+    setenv("STRATA_REMOTE_TIMEOUT_S", "1", 1);
+#endif
+    g_tmp = std::filesystem::temp_directory_path() / ("stage_link_slow_" + std::to_string(std::random_device{}()));
+    g_cred = load_key(make_key("slow"));
+    if (g_cred == nullptr) return 1;
+    std::vector<float> run_in((size_t) (kMaxT * kHbf)), run_out(run_in.size());
+    std::vector<float> pf_in0((size_t) (kChunk * kD)), pf_in1(pf_in0.size()), pf_out0(pf_in0.size()),
+        pf_out1(pf_in0.size());
+    StageBuffers buf;
+    buf.run_in = run_in.data();
+    buf.run_out = run_out.data();
+    buf.run_floats = run_in.size();
+    buf.pf_in[0] = pf_in0.data();
+    buf.pf_in[1] = pf_in1.data();
+    buf.pf_out[0] = pf_out0.data();
+    buf.pf_out[1] = pf_out1.data();
+    buf.pf_floats = pf_in0.size();
+    buf.handoff_floats = kHbf;
+    buf.pf_row_floats = kD;
+    StageHandlers h;
+    h.hello = [](const StageHello&, StageHello& m, std::string&) {
+        m = hello_of();
+        m.row_formats |= kStageCapSession;
+        return true;
+    };
+    h.session_get = [](int64_t, int64_t, const StageToken&, int64_t, const std::vector<int64_t>&, std::string&) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        return true;
+    };
+    int fails = 0;
+    {
+        Worker wk;
+        if (!wk.start(h, buf)) return 1;
+        Client c;
+        StageHello mine = hello_of(), peer;
+        mine.row_formats |= kStageCapSession;
+        std::string err;
+        bool missing = false;
+        const StageToken t{1, 2};
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool waited = c.connect(wk.where, mine, peer, err) && c.session_get(0, 5, t, 0, {}, missing, err, 30) &&
+                            std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(1900);
+        if (!waited) { std::printf("  slow reply: a SessionGet allowed 30 s failed: %s FAIL\n", err.c_str()); ++fails; }
+        c.close();
+        Client d;
+        err.clear();
+        const bool cut = d.connect(wk.where, mine, peer, err) && !d.session_get(0, 5, t, 0, {}, missing, err) &&
+                         stage_link_lost(err);
+        if (!cut) { std::printf("  slow reply: one with no allowance did not time out at 1 s (%s) FAIL\n", err.c_str()); ++fails; }
+        d.close();
+        wk.stop();
+    }
+    std::error_code rm;
+    std::filesystem::remove_all(g_tmp, rm);
+    return fails == 0 ? 0 : 1;
+}
+
+// this program's own path, to run it again as a child
+std::string self_path(const char* argv0) {
+#if defined(_WIN32)
+    char p[32768];
+    const DWORD n = GetModuleFileNameA(nullptr, p, (DWORD) sizeof p);
+    if (n > 0 && n < sizeof p) return std::string(p, n);
+#endif
+    return argv0;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--slow-reply") == 0) return slow_reply_child();
+    const std::string self = self_path(argv[0]);
     std::printf("stage_link_test\n");
     set_takeover("1");   // (section 8: before the first worker reads it)
     if (!stage_tls_available()) {   // (a build without OpenSSL: the remote stage refuses to start)
@@ -2342,7 +2417,7 @@ int main() {
         StageToken seen_token{};
         int64_t seen_lc = -1, seen_ckpt = -1;
         std::vector<int64_t> seen_keep;
-        std::atomic<bool> put_fail{false}, get_fail{false};
+        std::atomic<bool> put_fail{false}, get_fail{false}, part_gone{false};
         StageHandlers hs = h;
         hs.hello = [&](const StageHello&, StageHello& m, std::string&) {
             m = hello_of();
@@ -2360,6 +2435,10 @@ int main() {
             seen_token = t;
             seen_lc = Lc;
             seen_ckpt = ckpt_id;
+            if (part_gone.load() && ckpt_id != 0) {   // (the store no longer holds the checkpoint's part)
+                e = std::string(kStageCkptMissing) + std::to_string(ckpt_id);
+                return false;
+            }
             if (put_fail.load()) {
                 e = "storage: the disk is full (test)";
                 return false;
@@ -2421,35 +2500,41 @@ int main() {
             return sc.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
                    sc.prefill_recv(back.data(), (size_t) kD, kChunk, 0, err) && back == rows;
         };
-        const StageToken t1{0x8000000000000001ull, 0x7fffffff00000002ull}, t2{3, 4}, none{};
+        const StageToken t1{0x8000000000000001ull, 0x7fffffff00000002ull}, t2{3, 4}, t3{5, 6}, none{};
         int64_t bytes = 0;
         err.clear();
         check(sc.connect(wks.where, saving, sp, err) && (sp.row_formats & kStageCapSession) != 0,
               "a worker that keeps session files lists kStageCapSession in its hello");
-        check(sc.reset({}, err) && !sc.session_put(0, 0, t1, 0, bytes, err) && contains(err, "an empty session") &&
+        check(sc.reset({}, err) && !sc.session_put(0, 0, t1, 0, bytes, missing, err) && contains(err, "an empty session") &&
                   sc.connected(),
               "a session file of no tokens is a state error (the link stays)");
-        check(schunk() && !sc.session_put(0, 3, t1, 0, bytes, err) && contains(err, "session is at 8"),
+        check(schunk() && !sc.session_put(0, 3, t1, 0, bytes, missing, err) && contains(err, "session is at 8"),
               "a session file where the worker's session is not is a state error");
-        check(!sc.session_put(0, kChunk, none, 0, bytes, err) && contains(err, "without a token"),
+        check(!sc.session_put(0, kChunk, none, 0, bytes, missing, err) && contains(err, "without a token"),
               "a session file without a token is refused");
-        check(!sc.session_put(5, kChunk, t1, 0, bytes, err) && contains(err, "checkpoint at 0 (part 5)") &&
-                  !sc.session_put(0, kChunk, t1, 4, bytes, err) && !sc.session_put(5, kChunk, t1, kChunk + 1, bytes, err) &&
-                  !sc.session_put(5, kChunk, t1, -1, bytes, err),
+        check(!sc.session_put(5, kChunk, t1, 0, bytes, missing, err) && contains(err, "checkpoint at 0 (part 5)") &&
+                  !sc.session_put(0, kChunk, t1, 4, bytes, missing, err) && !sc.session_put(5, kChunk, t1, kChunk + 1, bytes, missing, err) &&
+                  !sc.session_put(5, kChunk, t1, -1, bytes, missing, err),
               "a checkpoint part without a length, a length without a part, one past L or below 0: refused");
         {
             std::lock_guard<std::mutex> lk(sm);
             check(halves.empty(), "... none of them reached the handler");
         }
-        check(sc.session_put(5, kChunk, t1, 4, bytes, err) && bytes == 0x123456789ll && seen(t1, 4, 5),
+        check(sc.session_put(5, kChunk, t1, 4, bytes, missing, err) && bytes == 0x123456789ll && seen(t1, 4, 5),
               "SessionPut carries the token (both words, high bits set), Lc and the part's id whole; the bytes back");
         check(sc.ckpt_save(6, kChunk, {6}, stored, err) && stored,
               "a SessionPut does not move the worker's session: a checkpoint at L is stored after it");
         put_fail = true;
-        check(!sc.session_put(0, kChunk, t2, 0, bytes, err) && contains(err, "the disk is full (test)") &&
-                  sc.connected() && sc.ckpt_save(7, kChunk, {6, 7}, stored, err) && stored,
-              "a worker's write error comes back as an error, the link and the session kept");
+        check(!sc.session_put(0, kChunk, t2, 0, bytes, missing, err) && contains(err, "the disk is full (test)") &&
+                  !missing && sc.connected() && sc.ckpt_save(7, kChunk, {6, 7}, stored, err) && stored,
+              "a worker's write error comes back as an error (not the missing part), the link and the session kept");
         put_fail = false;
+        part_gone = true;
+        check(!sc.session_put(5, kChunk, t3, 4, bytes, missing, err) && missing && sc.connected(),
+              "a checkpoint part the worker no longer holds is the missing case (the main process saves without it)");
+        check(sc.session_put(0, kChunk, t3, 0, bytes, missing, err) && !missing && seen(t3, 0, 0),
+              "... and the save without a checkpoint goes through, on the same link");
+        part_gone = false;
         // SessionGet
         std::vector<int64_t> wide;
         for (int64_t i = 1; i <= 200; ++i) wide.push_back(i * 1000);
@@ -2487,7 +2572,7 @@ int main() {
         fail_positions = true;
         err.clear();
         bool sent_s = sc.positions(one_s, 1, err);
-        check(sent_s && !sc.session_put(0, kChunk, t2, 0, bytes, err) && contains(err, "the positions failed (test)"),
+        check(sent_s && !sc.session_put(0, kChunk, t2, 0, bytes, missing, err) && contains(err, "the positions failed (test)"),
               "a failed Positions comes back on a SessionPut");
         fail_positions = false;
         check(!sc.session_get(0, kChunk, t1, 0, {}, missing, err) && !missing &&
@@ -2498,9 +2583,9 @@ int main() {
         fail_commit = true;
         sent_s = sc.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
                  sc.commit(1, err);
-        check(sent_s && !sc.session_put(0, kChunk + 1, t2, 0, bytes, err) && contains(err, "a commit failed (test)"),
+        check(sent_s && !sc.session_put(0, kChunk + 1, t2, 0, bytes, missing, err) && contains(err, "a commit failed (test)"),
               "a failed Commit comes back on the next SessionPut (nothing written)");
-        check(!sc.session_put(0, kChunk + 1, t2, 0, bytes, err) && contains(err, "a commit failed (test)"),
+        check(!sc.session_put(0, kChunk + 1, t2, 0, bytes, missing, err) && contains(err, "a commit failed (test)"),
               "... and stays pending: a save replaces no session, so the next request must still find it");
         err.clear();
         check(!(sc.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
@@ -2515,12 +2600,23 @@ int main() {
               "a failed Commit comes back on a SessionGet too (not the missing-id error)");
         fail_commit = false;
         // a reply allowed longer than the socket's time-out: waited for, then read as any other
-        check(sc.reset({}, err) && schunk() && sc.session_put(0, kChunk, t2, 0, bytes, err, 100000) &&
+        check(sc.reset({}, err) && schunk() && sc.session_put(0, kChunk, t2, 0, bytes, missing, err, 100000) &&
                   bytes == 0x123456789ll && sc.session_get(0, kChunk, t2, 0, {}, missing, err, 100000) && !missing &&
                   sc.alive(err),
               "wait_s past STRATA_REMOTE_TIMEOUT_S: both replies come back, the link in step");
         sc.close();
         wks.stop();
+        // ... and one that comes after the socket's own time-out: in a process of its own (slow_reply_child)
+        {
+#if defined(_WIN32)
+            const std::string cmd = "\"\"" + self + "\" --slow-reply\"";   // (cmd.exe drops the outer quotes)
+#else
+            const std::string cmd = "'" + self + "' --slow-reply";
+#endif
+            std::fflush(stdout);
+            check(std::system(cmd.c_str()) == 0,
+                  "a reply 2 s late with STRATA_REMOTE_TIMEOUT_S=1: waited for with wait_s 30, a lost link without it");
+        }
 
         // a worker without the session handlers (an older build, or one without --stage-session-dir)
         Worker wkn;
@@ -2531,7 +2627,7 @@ int main() {
         err.clear();
         check(sc.connect(wkn.where, saving, sp, err) && (sp.row_formats & kStageCapSession) == 0,
               "a worker without the session handlers does not list the bit");
-        check(sc.reset({}, err) && schunk() && !sc.session_put(0, kChunk, t1, 0, bytes, err) &&
+        check(sc.reset({}, err) && schunk() && !sc.session_put(0, kChunk, t1, 0, bytes, missing, err) &&
                   contains(err, "keeps no session files") && sc.connected(),
               "a SessionPut to it is an error, the link kept");
         check(!sc.session_get(0, kChunk, t1, 0, {}, missing, err) && !missing && contains(err, "keeps no session"),

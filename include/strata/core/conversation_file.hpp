@@ -298,7 +298,13 @@ uint64_t stage_session_max_file_bytes(const SessionReadLimits& limits);
 // removed - never `keep_name`, which counts as the newest.  Other names are not touched.  Returns how many it removed;
 // a file it could not remove is named in `error` (and the rest are still tried).
 size_t stage_session_prune(const std::string& dir, size_t keep, const std::string& keep_name, std::string& error);
-// --stage-session-dir: `dir` made absolute (UTF-8) and created, mode 0700 on POSIX, when it is missing.
-bool stage_session_dir_prepare(std::string& dir, std::string& error);
+// --stage-session-dir: `dir` made absolute (UTF-8) and created, mode 0700 on POSIX, when it is missing.  In a folder
+// that exists, the temporary files a worker's save left when it was ended in the middle of a write are removed: only
+// regular files (a link is not followed) of the exact name a worker half's write uses
+// (.stage-session-<32 hex>.bin.<16 hex>.tmp), and only those not written to for `stale_s` seconds (another worker
+// sharing the folder may be writing one now).  `removed` (optional): how many; one it could not remove is a line in
+// `warning`, not a failure.
+bool stage_session_dir_prepare(std::string& dir, std::string& error, size_t* removed = nullptr,
+                               std::string* warning = nullptr, int64_t stale_s = 600);
 
 } // namespace strata::core
