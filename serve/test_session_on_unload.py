@@ -89,6 +89,30 @@ class SessionOnUnload(unittest.TestCase):
         self.assertIsNone(self.svc.restore_after_load)
         self.assertFalse(os.path.exists(self.path), "the file is deleted once restored")
 
+    def test_a_restore_that_ends_the_engine_is_followed_by_a_fresh_start(self):
+        # a remote main whose restore failed after the device state was changed: that engine is ended, and the
+        # request that loaded it gets a new one (without the old cache), not the ended one
+        self.assertEqual(self.svc.unload(), "unloaded")
+        starts = []
+        real = self.engine.restart
+
+        def restart():
+            real()
+            starts.append(self.engine.proc)
+            self.engine.script = None if len(starts) > 1 else [
+                "SESSION 268435456 1198691396\n",
+                "FATAL restoring the session file failed after the device state was changed: copy\n"]
+        self.engine.restart = restart
+        with self.svc.fifo:
+            self.svc.ensure_loaded()
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[0].sent, [f"RESTORE {self.path}\n"])
+        self.assertTrue(starts[0].killed, "the engine the restore ended")
+        self.assertEqual(starts[1].sent, [], "nothing restored into the new one")
+        self.assertTrue(self.svc.loaded())
+        self.assertIsNone(self.svc.restore_after_load)
+        self.assertFalse(os.path.exists(self.path))
+
     def test_an_older_file_is_replaced(self):
         Path(self.path).write_bytes(b"old")
         self.assertEqual(self.svc.unload(), "unloaded")

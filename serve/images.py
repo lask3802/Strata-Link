@@ -483,7 +483,8 @@ def restore_session(svc) -> None:
     try:
         r = svc.engine.session_file("restore", path)
         print(f"[strata] the conversation from before {what} is back ({r.get('tokens')} tokens)", flush=True)
-    except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
+    except Exception as e:                           # noqa: BLE001 - the engine runs without the old cache (or was
+        #                                              ended by a FATAL restore: ensure_loaded starts it again)
         print(f"[strata] the conversation from before {what} was not restored ({e}); the next request "
               "reads its prompt again", flush=True)
     finally:

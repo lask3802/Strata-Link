@@ -5683,6 +5683,16 @@ class Service:
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job or an unload saved it: the conversation comes back
             images_api.restore_session(self)
+            if not self.loaded():
+                # a restore that ended the engine (a FATAL: it failed after the device state was changed): the request
+                # that loaded it gets a fresh engine, without the old cache, not the one that was ended
+                print("[strata] the engine was ended by the restore; starting it again without the old cache ...",
+                      flush=True)
+                try:
+                    self.engine.restart()
+                except OSError as e:
+                    raise EngineDied(f"the engine could not be started: {e}") from e
+                print("[strata] the engine is running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self._engine_vram(self.vram_reserve)

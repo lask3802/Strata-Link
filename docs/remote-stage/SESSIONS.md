@@ -116,8 +116,8 @@ is not kept: the file then has no checkpoint.
 |---|---|---|
 | the worker has no such half, or its half fails a check | invalid (400) | both sides as they were |
 | the link is lost | io (500) | the next request connects again |
-| the worker fails after its checks (its device, its transfer, its checkpoint store), or a failed Commit was pending | the engine ends (`FATAL`, 500) | the server ends it at once (a main process still freeing its RAM takes no request) and the next request starts it again and reads its prompt from token 0. The worker may have written part of its cells: a checkpoint restores only the running state, so nothing may go on from what is left (as after a failed `ParkRestore`) |
-| the main file is a one-GPU file, has more than one checkpoint, or holds no tokens | invalid (400) | as it was |
+| the worker fails after its checks (its device, its transfer, its checkpoint store), or a failed Commit was pending | the engine ends (`FATAL`, 500) | the server ends it at once (a main process still freeing its RAM takes no request) and the next request starts it again and reads its prompt from token 0 (a restore right after a load: the request that loaded it gets the new engine at once). The worker may have written part of its cells: a checkpoint restores only the running state, so nothing may go on from what is left (as after a failed `ParkRestore`) |
+| the main file is a one-GPU file, has more than one checkpoint, holds no tokens, or its checkpoint is past its tokens | invalid (400) | as it was |
 
 ## The server: `"session_on_unload"`
 
@@ -216,6 +216,8 @@ Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1
   the config keys (`session_on_unload` needs `slot_save_path`, true or false, off with `"parallel"`;
   `session_on_unload_timeout_s` within (0, 3600], else the default: 0, true, false, text, 4000).
 - `test_slots`: a `FATAL` during a restore ends the engine at once (not alive; the next request starts it again).
+- `test_session_on_unload`: a restore after a load that ends the engine is followed by a new start in the same
+  request, with nothing restored into it.
 - `tools/test_stage_node.py` (`SessionDirTest`): the worker's argv exactly, without the field (also with a folder in
   node.json, and with extra flags), with it, with the keep (before the extra flags); refused without a folder or with
   a field that is not true or false, nothing started; `--stage-session-dir` is not an extra a `/start` may add;
@@ -242,7 +244,7 @@ Not run:
 - `conversation_part_sources` (the worker's state and K/V gathered for the file) needs a device: not run.
 - A Linux (GCC) build of this change, and so the checks that run only there (the files' mode 0600, the folder's 0700).
 - The main process's resend without a checkpoint, its `FATAL` after a failed `SessionGet`, its refusal of a file
-  with no tokens before `SessionGet` and its clearing of the link-made-again and pipelined-window state after a
+  with no tokens or a checkpoint past its tokens before `SessionGet` and its clearing of the link-made-again and pipelined-window state after a
   restore (all in `generate.cpp`): checked by review only.
 - The keep-N rule's link check: this Windows PC may not make symbolic links, so it was skipped, and the fix it guards
   (links not followed) was not seen to fail without it.

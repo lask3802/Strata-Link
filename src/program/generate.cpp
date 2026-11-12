@@ -17521,6 +17521,10 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         const int64_t Lc = image.checkpoints.empty() ? 0 : (int64_t) image.checkpoints[0].ids.size();
+                        if (Lc > (int64_t) image.live.ids.size()) {   // (the worker would refuse it too, ending this one)
+                            refuse("the file's checkpoint is longer than its conversation");
+                            continue;
+                        }
                         if (Lc > 0 && remote_ckpt_id == INT32_MAX) {
                             refuse("the remote stage's checkpoint ids are used up", strata::core::SessionError::memory);
                             continue;
