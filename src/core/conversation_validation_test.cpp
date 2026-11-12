@@ -1,13 +1,16 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_file.hpp"
 #include "conversation_copy.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <cstring>
@@ -207,6 +210,58 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
             reject_part(torn, no_ids, 9, "a park's corrupted K/V rejected before the first write");
             check(!conversation_part_validate(image.kv,no_ids,ss,g,9,error), "a park with the draft layer rejected");
         }
+    }
+    // a remote stage worker's half of a session file (docs/remote-stage/SESSIONS.md): the read limits at L are this
+    // carve's exact sizes, so the half of this session reads back and one of another length or carve does not
+    {
+        std::vector<ConversationKv> part_kv(image.kv.begin(), image.kv.end() - 1);
+        check(conversation_checkpoint_validate(no_ids,ss,g,9,error) && conversation_checkpoint_validate(no_ids,ss,g,5,error),
+              "a worker's state (no ids) validates at an explicit length");
+        check(!conversation_checkpoint_validate(image.live,ss,g,5,error) && conversation_checkpoint_validate(image.live,ss,g,9,error),
+              "a state with ids validates only at its own length");
+        check(!conversation_checkpoint_validate(no_ids,ss,g,97,error), "a length past the cells rejected");
+        auto short_state = no_ids; short_state.gdn.pop_back();
+        check(!conversation_checkpoint_validate(short_state,ss,g,9,error), "a bad running state rejected");
+        SessionReadLimits lim;
+        lim.max_file_bytes = 123456789;
+        check(conversation_part_read_limits(lim,ss,g,9,error) && lim.max_kv_layers == part_kv.size() &&
+                  lim.max_kv_bytes.size() == part_kv.size() && lim.max_tokens == 0 && lim.geometry &&
+                  *lim.geometry == image.geometry && lim.layer_range &&
+                  *lim.layer_range == std::make_pair(ss.layer_lo, ss.layer_hi) && lim.max_file_bytes == 123456789,
+              "a worker half's read limits without CUDA (the caller's own fields kept)");
+        StageSessionImage w;
+        w.head.token = {1, 2};
+        w.head.geometry = image.geometry;
+        w.head.layer_lo = ss.layer_lo; w.head.layer_hi = ss.layer_hi;
+        w.head.tokens = 9; w.head.ckpt_tokens = 5;
+        w.state = no_ids; w.ckpt = no_ids; w.kv = part_kv;
+        const SessionFileIdentity id{7, 8};
+        const std::string path = (std::filesystem::temp_directory_path() / ("strata-stage-half-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin")).string();
+        size_t bytes = 0;
+        check(stage_session_write(path, w, nullptr, id, bytes, error), "a worker half written");
+        StageSessionImage back;
+        check(stage_session_read(path, id, w.head, back, bytes, error, lim) &&
+                  conversation_part_validate(back.kv,back.state,ss,g,9,error) &&
+                  conversation_checkpoint_validate(back.ckpt,ss,g,5,error),
+              "it reads back within this session's limits and validates");
+        StageSessionHead later = w.head;
+        later.tokens = 10;
+        check(!stage_session_read(path, id, later, back, bytes, error, lim), "another length refused");
+        if (!zero_qsa) {
+            SessionState stage = ss;   // the carve of a stage owning layers [4, 8), as above
+            stage.layer_lo = 4; stage.gdn_alloc = 3; stage.qsa_ord0 = 1; stage.qsa_alloc = 1;
+            SessionReadLimits carved;
+            check(conversation_part_read_limits(carved,stage,g,9,error) && carved.max_kv_layers == 1 &&
+                      !stage_session_read(path, id, w.head, back, bytes, error, carved),
+                  "the limits of another carve refuse it (its running state and K/V are larger)");
+            w.kv = image.kv;   // (the draft layer too: one layer more than this carve owns)
+            check(stage_session_write(path, w, nullptr, id, bytes, error) &&
+                      !stage_session_read(path, id, w.head, back, bytes, error, lim),
+                  "a half with more K/V layers than this carve owns refused");
+        }
+        std::error_code rm;
+        std::filesystem::remove(path, rm);
     }
 #if defined(CONVERSATION_TEST_TRANSFERS)
     auto reset = [&] {

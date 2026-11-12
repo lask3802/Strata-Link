@@ -71,6 +71,15 @@
 //      no position is trusted; a failed Positions comes back on a ParkRestore, a failed Commit on a ParkSave and is
 //      dropped by a ParkRestore; a disconnect drops the parks; a worker without the handlers lists no bit, answers
 //      both messages with an error that is not the missing-id one and still reads at most 64 ids.
+//  19. session files (docs/remote-stage/SESSIONS.md): a worker with the session handlers lists kStageCapSession;
+//      SessionPut only where the session is, never empty, never without a token, its checkpoint's id and length
+//      both or neither (0 <= Lc <= L), the token, Lc, id and bytes carried whole, and it does not move the session;
+//      a worker's error comes back, the link and session kept; SessionGet carries a keep[] of up to kStageKeepMax
+//      ids (one more is a malformed message, the link in step), puts the session at L; a half the worker does not
+//      hold, or one that fails its checks, is the missing-id error and leaves the session where it was, any other
+//      failure is not and no position is trusted after it; a failed Positions or Commit comes back on both; a
+//      reply allowed longer than STRATA_REMOTE_TIMEOUT_S is read as any other; a worker without the handlers lists
+//      no bit, answers both with an error that is not the missing-id one and reads at most 64 ids.
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
@@ -88,6 +97,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -2321,6 +2331,216 @@ int main() {
         check(!pc.reset(over64, err) && contains(err, "bad checkpoint list"),
               "it reads at most 64 ids in a keep[], as before");
         pc.close();
+        wkn.stop();
+    }
+
+    // 19. session files (docs/remote-stage/SESSIONS.md): SessionPut / SessionGet over the link
+    {
+        struct Half { int64_t L, Lc; };
+        std::mutex sm;
+        std::map<StageToken, Half> halves;   // the worker's disk
+        StageToken seen_token{};
+        int64_t seen_lc = -1, seen_ckpt = -1;
+        std::vector<int64_t> seen_keep;
+        std::atomic<bool> put_fail{false}, get_fail{false};
+        StageHandlers hs = h;
+        hs.hello = [&](const StageHello&, StageHello& m, std::string&) {
+            m = hello_of();
+            m.row_formats |= kStageCapPark | kStageCapSession;
+            return true;
+        };
+        hs.park_save = [&](int64_t, int64_t, const std::vector<int64_t>&, std::string&) -> int { return 0; };
+        hs.park_restore = [&](int64_t id, int64_t, const std::vector<int64_t>&, std::string& e) {
+            e = std::string(kStageCkptMissing) + "parked conversation " + std::to_string(id);
+            return false;
+        };
+        hs.session_put = [&](int64_t ckpt_id, int64_t L, const StageToken& t, int64_t Lc, int64_t& bytes,
+                             std::string& e) {
+            std::lock_guard<std::mutex> lk(sm);
+            seen_token = t;
+            seen_lc = Lc;
+            seen_ckpt = ckpt_id;
+            if (put_fail.load()) {
+                e = "storage: the disk is full (test)";
+                return false;
+            }
+            halves[t] = {L, Lc};
+            bytes = 0x123456789ll;   // (more than 32 bits)
+            return true;
+        };
+        hs.session_get = [&](int64_t ckpt_id, int64_t L, const StageToken& t, int64_t Lc,
+                             const std::vector<int64_t>& keep, std::string& e) {
+            std::lock_guard<std::mutex> lk(sm);
+            seen_token = t;
+            seen_lc = Lc;
+            seen_ckpt = ckpt_id;
+            seen_keep = keep;
+            const auto it = halves.find(t);
+            // as the engine's: whatever fails before the session is written is the missing case
+            if (it == halves.end() || it->second.L != L || it->second.Lc != Lc) {
+                e = std::string(kStageCkptMissing) + "session file: none at this length (test)";
+                return false;
+            }
+            if (get_fail.load()) {
+                e = "the restore failed half way (test)";
+                return false;
+            }
+            std::lock_guard<std::mutex> lw(w.mu);
+            if (ckpt_id != 0) {
+                StageCkptStore::Part p;
+                p.L = Lc;
+                w.store.put(ckpt_id, std::move(p), keep);
+            } else {
+                w.store.prune(keep);
+            }
+            return true;
+        };
+        auto seen = [&](const StageToken& t, int64_t lc, int64_t ckpt) {
+            std::lock_guard<std::mutex> lk(sm);
+            return seen_token == t && seen_lc == lc && seen_ckpt == ckpt;
+        };
+        auto keep_seen = [&](const std::vector<int64_t>& k) {
+            std::lock_guard<std::mutex> lk(sm);
+            return seen_keep == k;
+        };
+        worker_vision = 1;
+        fail_commit = false;
+        fail_positions = false;
+        Worker wks;
+        if (!wks.start(hs, buf)) {
+            std::printf("stage_link_test: no loopback port to listen on\n");
+            return 1;
+        }
+        Client sc;
+        StageHello sp;
+        StageHello saving = hello_of();
+        saving.ckpt_max = 4;
+        saving.row_formats |= kStageCapPark | kStageCapSession;
+        auto schunk = [&] {
+            std::fill(back.begin(), back.end(), 0.0f);
+            return sc.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
+                   sc.prefill_recv(back.data(), (size_t) kD, kChunk, 0, err) && back == rows;
+        };
+        const StageToken t1{0x8000000000000001ull, 0x7fffffff00000002ull}, t2{3, 4}, none{};
+        int64_t bytes = 0;
+        err.clear();
+        check(sc.connect(wks.where, saving, sp, err) && (sp.row_formats & kStageCapSession) != 0,
+              "a worker that keeps session files lists kStageCapSession in its hello");
+        check(sc.reset({}, err) && !sc.session_put(0, 0, t1, 0, bytes, err) && contains(err, "an empty session") &&
+                  sc.connected(),
+              "a session file of no tokens is a state error (the link stays)");
+        check(schunk() && !sc.session_put(0, 3, t1, 0, bytes, err) && contains(err, "session is at 8"),
+              "a session file where the worker's session is not is a state error");
+        check(!sc.session_put(0, kChunk, none, 0, bytes, err) && contains(err, "without a token"),
+              "a session file without a token is refused");
+        check(!sc.session_put(5, kChunk, t1, 0, bytes, err) && contains(err, "checkpoint at 0 (part 5)") &&
+                  !sc.session_put(0, kChunk, t1, 4, bytes, err) && !sc.session_put(5, kChunk, t1, kChunk + 1, bytes, err) &&
+                  !sc.session_put(5, kChunk, t1, -1, bytes, err),
+              "a checkpoint part without a length, a length without a part, one past L or below 0: refused");
+        {
+            std::lock_guard<std::mutex> lk(sm);
+            check(halves.empty(), "... none of them reached the handler");
+        }
+        check(sc.session_put(5, kChunk, t1, 4, bytes, err) && bytes == 0x123456789ll && seen(t1, 4, 5),
+              "SessionPut carries the token (both words, high bits set), Lc and the part's id whole; the bytes back");
+        check(sc.ckpt_save(6, kChunk, {6}, stored, err) && stored,
+              "a SessionPut does not move the worker's session: a checkpoint at L is stored after it");
+        put_fail = true;
+        check(!sc.session_put(0, kChunk, t2, 0, bytes, err) && contains(err, "the disk is full (test)") &&
+                  sc.connected() && sc.ckpt_save(7, kChunk, {6, 7}, stored, err) && stored,
+              "a worker's write error comes back as an error, the link and the session kept");
+        put_fail = false;
+        // SessionGet
+        std::vector<int64_t> wide;
+        for (int64_t i = 1; i <= 200; ++i) wide.push_back(i * 1000);
+        wide.push_back(11);
+        check(sc.reset({}, err) && sc.session_get(11, kChunk, t1, 4, wide, missing, err) && !missing &&
+                  seen(t1, 4, 11) && keep_seen(wide),
+              "SessionGet carries the token, Lc, the new id and a keep[] of 201 ids whole to a worker that parks");
+        check(sc.ckpt_save(12, kChunk, {11, 12}, stored, err) && stored,
+              "after a SessionGet the session is at L: a checkpoint there is stored");
+        check(sc.ckpt_restore(11, 4, {11}, missing, err), "... and the checkpoint the half carried is the new id's");
+        std::vector<int64_t> wider((size_t) kStageKeepMax + 1, 1);
+        check(!sc.session_get(11, kChunk, t1, 4, wider, missing, err) && !missing &&
+                  contains(err, "bad session file message") && sc.reset({}, err),
+              "a keep[] of more than 256 ids is a malformed message, the link stays in step");
+        check(!sc.session_get(0, kChunk, none, 0, {}, missing, err) && !missing && contains(err, "without a token") &&
+                  !sc.session_get(0, 0, t1, 0, {}, missing, err) && !missing &&
+                  !sc.session_get(11, kChunk, t1, 0, {}, missing, err) && !missing,
+              "a SessionGet without a token, of no tokens or with a part but no length: refused (not missing)");
+        check(schunk() && !sc.session_get(0, kChunk, t2, 0, {}, missing, err) && missing && sc.connected(),
+              "a half the worker does not hold is the missing-id error (the main process keeps its session)");
+        check(sc.ckpt_save(13, kChunk, {13}, stored, err) && stored,
+              "... and the worker's session is where it was: a checkpoint at its length is stored");
+        check(!sc.session_get(15, kChunk + 1, t1, 4, {}, missing, err) && missing,
+              "a half at another length is the missing case too (its checks come before any write)");
+        get_fail = true;
+        check(!sc.session_get(11, kChunk, t1, 4, {}, missing, err) && !missing &&
+                  contains(err, "half way (test)") && sc.connected(),
+              "a restore that fails after its checks is not the missing case");
+        get_fail = false;
+        check(!sc.ckpt_save(14, kChunk, {14}, stored, err) && contains(err, "session is at -1"),
+              "after it no position is trusted: a save is a state error");
+        // what a request left pending: a failed Positions or Commit is the session message's error
+        check(sc.reset({}, err) && schunk(), "a reset and a prompt again");
+        const int32_t one_s[3] = {5, 5, 5};
+        fail_positions = true;
+        err.clear();
+        bool sent_s = sc.positions(one_s, 1, err);
+        check(sent_s && !sc.session_put(0, kChunk, t2, 0, bytes, err) && contains(err, "the positions failed (test)"),
+              "a failed Positions comes back on a SessionPut");
+        fail_positions = false;
+        check(!sc.session_get(0, kChunk, t1, 0, {}, missing, err) && !missing &&
+                  contains(err, "the positions failed (test)"),
+              "... and again on a SessionGet after it (not the missing-id error)");
+        check(!sc.reset({}, err) && contains(err, "the positions failed (test)") && sc.reset({}, err) && schunk(),
+              "... and on the Reset after that, once: the link is usable after it");
+        fail_commit = true;
+        sent_s = sc.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
+                 sc.commit(1, err);
+        check(sent_s && !sc.session_put(0, kChunk + 1, t2, 0, bytes, err) && contains(err, "a commit failed (test)"),
+              "a failed Commit comes back on the next SessionPut (nothing written)");
+        check(!sc.session_put(0, kChunk + 1, t2, 0, bytes, err) && contains(err, "a commit failed (test)"),
+              "... and stays pending: a save replaces no session, so the next request must still find it");
+        err.clear();
+        check(!(sc.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
+                sc.prefill_recv(back.data(), (size_t) kD, kChunk, 0, err)) &&
+                  contains(err, "a commit failed (test)"),
+              "... a request going on from the live session gets it on its first message");
+        check(sc.reset({}, err) && schunk(), "a reset and a prompt again");
+        sent_s = sc.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
+                 sc.commit(1, err);
+        check(sent_s && !sc.session_get(11, kChunk, t1, 4, {}, missing, err) && !missing &&
+                  contains(err, "a commit failed (test)"),
+              "a failed Commit comes back on a SessionGet too (not the missing-id error)");
+        fail_commit = false;
+        // a reply allowed longer than the socket's time-out: waited for, then read as any other
+        check(sc.reset({}, err) && schunk() && sc.session_put(0, kChunk, t2, 0, bytes, err, 100000) &&
+                  bytes == 0x123456789ll && sc.session_get(0, kChunk, t2, 0, {}, missing, err, 100000) && !missing &&
+                  sc.alive(err),
+              "wait_s past STRATA_REMOTE_TIMEOUT_S: both replies come back, the link in step");
+        sc.close();
+        wks.stop();
+
+        // a worker without the session handlers (an older build, or one without --stage-session-dir)
+        Worker wkn;
+        if (!wkn.start(h, buf)) {
+            std::printf("stage_link_test: no loopback port to listen on\n");
+            return 1;
+        }
+        err.clear();
+        check(sc.connect(wkn.where, saving, sp, err) && (sp.row_formats & kStageCapSession) == 0,
+              "a worker without the session handlers does not list the bit");
+        check(sc.reset({}, err) && schunk() && !sc.session_put(0, kChunk, t1, 0, bytes, err) &&
+                  contains(err, "keeps no session files") && sc.connected(),
+              "a SessionPut to it is an error, the link kept");
+        check(!sc.session_get(0, kChunk, t1, 0, {}, missing, err) && !missing && contains(err, "keeps no session"),
+              "a SessionGet to it is an error that is not the missing-id one");
+        std::vector<int64_t> over64((size_t) kStageCkptMax + 1, 1);
+        check(!sc.session_get(0, kChunk, t1, 0, over64, missing, err) && contains(err, "bad session file message") &&
+                  sc.reset({}, err),
+              "it reads at most 64 ids in a SessionGet's keep[], the link in step");
+        sc.close();
         wkn.stop();
     }
     std::error_code rm;

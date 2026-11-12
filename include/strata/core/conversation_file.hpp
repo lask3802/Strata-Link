@@ -26,6 +26,15 @@ struct SessionFileIdentity {
     uint64_t model = 0, config = 0;
 };
 
+// A remote stage session (docs/remote-stage/SESSIONS.md): the 128-bit token that ties a remote main process's file to
+// its worker's half, kept on the worker's disk.  All zeros: no worker half (every file a one-GPU engine writes).
+using SessionToken = std::array<uint64_t, 2>;
+inline bool session_token_zero(const SessionToken& t) { return t[0] == 0 && t[1] == 0; }
+// a new random token, never all zeros
+SessionToken session_token_new();
+// 32 lowercase hex digits (t[0] first)
+std::string session_token_hex(const SessionToken& t);
+
 // Non-cryptographic 64-bit hash with xxHash64-style rounds (NOT the standard XXH64 stream): corruption and identity
 // checks, not adversarial input.  Streaming and one-shot agree.
 class SessionHasher {
@@ -119,6 +128,8 @@ enum class SessionError { none, invalid, storage, memory, io };
 const char* session_error_name(SessionError e);
 struct SessionStatus {
     SessionError error = SessionError::none;
+    // read with SessionReadLimits::worker_token: the token the file's header carries (all zeros: none)
+    SessionToken worker_token{};
     // write: the new file has replaced `path` (the rename happened).  Together with a failure: the file's bytes are
     // complete and flushed, but the folder flush after the rename failed, so the new name may not survive a power loss
     bool published = false;
@@ -151,6 +162,9 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // a remote main process's file: the token of its worker's half, in the header's reserved words (all zeros: the
+    // header as before).  A read that does not ask for a token (SessionReadLimits::worker_token) refuses such a file.
+    SessionToken worker_token{};
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -222,6 +236,9 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // a remote main process's read: a header whose reserved words hold a worker token is accepted, and the token is
+    // returned in SessionStatus::worker_token.  False (every other read): such a header is refused, as before.
+    bool worker_token = false;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -239,5 +256,49 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
+
+// ---- A remote stage worker's half of a session file (docs/remote-stage/SESSIONS.md): its own layers' K/V of cells
+// [0, L), its running state at L and, when the main process's file keeps a checkpoint at Lc, its running state at Lc.
+// One file per token, DIR/stage-session-<token hex>.bin on the worker's disk, written as session_file_write writes
+// (a temporary file beside it, mode 0600 on POSIX, flushed, renamed, the folder flushed).  Its own magic and format
+// (little-endian, as v1): header magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 token:u64[2]
+// header_hash:u64; payload geometry:i64[18] layer_lo:i64 layer_hi:i64 L:u64 Lc:u64, the state at L and (Lc > 0) the
+// state at Lc as a v1 checkpoint (no token ids), the K/V layers as in v1; trailer payload_hash:u64 end[8].
+struct StageSessionHead {
+    SessionToken token{};
+    std::array<int64_t, 18> geometry{};
+    int64_t layer_lo = 0, layer_hi = 0;
+    uint64_t tokens = 0;        // L
+    uint64_t ckpt_tokens = 0;   // Lc (0: no checkpoint)
+};
+struct StageSessionImage {
+    StageSessionHead head;
+    ConversationCheckpoint state;     // the running state at L (no ids)
+    ConversationCheckpoint ckpt;      // the running state at Lc (when Lc > 0)
+    std::vector<ConversationKv> kv;   // the owned attention layers' K/V of cells [0, L)
+};
+// "stage-session-<32 hex>.bin"
+std::string stage_session_file_name(const SessionToken& token);
+// Writes `image` (its K/V from `sources` when given, else from image.kv) to `path`.  Refused before any disk access:
+// a zero token, L < 1, Lc > L, a checkpoint state with Lc 0.
+bool stage_session_write(const std::string& path, const StageSessionImage& image,
+                         const std::vector<SessionKvSource>* sources, const SessionFileIdentity& id, size_t& bytes,
+                         std::string& error, const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+// Reads and checks the whole file before `image` is replaced: a regular file with one name, its size against
+// `limits` (stage_session_max_file_bytes), the header (magic, version, checksum, identity, `want.token`), the RAM
+// preflight, then the payload against `want` (geometry, layer range, L, Lc) and `limits` before each array is
+// allocated, and the payload's checksum.  `limits`: max_tokens bounds the state's token lists (0 for a worker's),
+// max_state_bytes and max_kv_bytes / max_kv_layers its arrays, admit / progress as for session_file_read.
+bool stage_session_read(const std::string& path, const SessionFileIdentity& id, const StageSessionHead& want,
+                        StageSessionImage& image, size_t& bytes, std::string& error,
+                        const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+// The largest worker file `limits` admit (UINT64_MAX when one of its bounds is open).
+uint64_t stage_session_max_file_bytes(const SessionReadLimits& limits);
+// The keep-N rule: in `dir`, the stage-session-<32 hex>.bin files beyond the `keep` newest (by modification time) are
+// removed - never `keep_name`, which counts as the newest.  Other names are not touched.  Returns how many it removed;
+// a file it could not remove is named in `error` (and the rest are still tried).
+size_t stage_session_prune(const std::string& dir, size_t keep, const std::string& keep_name, std::string& error);
+// --stage-session-dir: `dir` made absolute (UTF-8) and created, mode 0700 on POSIX, when it is missing.
+bool stage_session_dir_prepare(std::string& dir, std::string& error);
 
 } // namespace strata::core

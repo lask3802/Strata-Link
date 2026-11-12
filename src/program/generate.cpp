@@ -933,6 +933,12 @@ struct Options {
     /// docs/remote-stage/PARKING.md).  -1: half of the RAM available at the main process's hello, less its checkpoint
     /// share, at most 16 GiB; 0: no parking (the worker's hello does not list kStageCapPark)
     int64_t stage_park_mib = -1;
+    /// a worker: the folder it keeps its half of its main process's session files in (--stage-session-dir DIR;
+    /// docs/remote-stage/SESSIONS.md).  Empty: none (the worker's hello does not list kStageCapSession)
+    std::string stage_session_dir;
+    /// ... and how many of them it keeps (--stage-session-keep N, the newest; at least 1)
+    int64_t stage_session_keep = 4;
+    bool stage_session_keep_given = false;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1136,6 +1142,10 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --stage-park-mib N   a stage worker: RAM for a parking main process's parked conversations (default:\n"
                  "                       half the RAM available at its hello, up to 16384; 0 = none; docs/remote-stage/PARKING.md)\n"
+                 "  --stage-session-dir DIR  a stage worker: keep its half of the main process's session files (SAVE /\n"
+                 "                       RESTORE) in DIR (created 0700); without it a remote main refuses them\n"
+                 "                       (docs/remote-stage/SESSIONS.md)\n"
+                 "  --stage-session-keep N  a stage worker: keep the N newest of those files (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -3685,6 +3695,11 @@ int main(int argc, char** argv) {
         else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
         else if (a == "--stage-next") o.stage_next = next("--stage-next");
         else if (a == "--stage-park-mib") o.stage_park_mib = std::atoll(next("--stage-park-mib"));
+        else if (a == "--stage-session-dir") o.stage_session_dir = next("--stage-session-dir");
+        else if (a == "--stage-session-keep") {
+            o.stage_session_keep = std::atoll(next("--stage-session-keep"));
+            o.stage_session_keep_given = true;
+        }
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -4214,6 +4229,16 @@ int main(int argc, char** argv) {
     int64_t own_lo = 0, own_hi = -1;
     bool remote_park_asked = false;   // a remote main with --conversation-cache-mib N (docs/remote-stage/PARKING.md)
     std::shared_ptr<strata::net::TlsCredentials> stage_cred;   // remote stage: this PC's key and the certificates it accepts
+    // session files on a worker (docs/remote-stage/SESSIONS.md): a worker's options only
+    if ((!o.stage_session_dir.empty() || o.stage_session_keep_given) && !stage_worker) {
+        std::fprintf(stderr, "strata generate: --stage-session-dir and --stage-session-keep are a --stage-worker's (the "
+                             "main process writes its own half where SAVE names)\n");
+        return 2;
+    }
+    if (o.stage_session_keep < 1 || o.stage_session_keep > 1000000) {
+        std::fprintf(stderr, "strata generate: --stage-session-keep needs 1 to 1000000\n");
+        return 2;
+    }
     if (remote_main || stage_worker) {
         const char* why = nullptr;
         if (remote_main && stage_worker) why = "--remote-stage and --stage-worker exclude each other";
@@ -4260,6 +4285,16 @@ int main(int argc, char** argv) {
         if (stage_cred == nullptr) {
             std::fprintf(stderr, "strata generate: remote stage: %s\n", tls_err.c_str());
             return 2;
+        }
+        // session files (docs/remote-stage/SESSIONS.md): the worker's folder, absolute and there before the model loads
+        if (stage_worker && !o.stage_session_dir.empty()) {
+            std::string dir_err;
+            if (!strata::core::stage_session_dir_prepare(o.stage_session_dir, dir_err)) {
+                std::fprintf(stderr, "strata generate: remote stage: %s\n", dir_err.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "strata generate: remote stage: session files' worker halves in %s (the %lld newest "
+                                 "kept)\n", o.stage_session_dir.c_str(), (long long) o.stage_session_keep);
         }
         // conversation checkpoints hold only this process's layers: every prompt is read from token 0, unless the main
         // process is given --prompt-cache: then the worker keeps its layers' part of each checkpoint, saved at the
@@ -12466,6 +12501,9 @@ int main(int argc, char** argv) {
         // the cache but not restored yet (a root the cache no longer lists)
         bool remote_park_on = false;
         std::vector<int64_t> remote_park_extra;
+        // remote-stage session files (docs/remote-stage/SESSIONS.md): the worker of the current connection keeps its
+        // half of SAVE / RESTORE (its hello lists kStageCapSession; set at every connect)
+        bool remote_session_on = false;
         // every worker id the main process still holds, once each and in this order: `v` (a chain's checkpoint parts),
         // then the parked conversations' parks and parts, then remote_park_extra.  Without parks it is `v` as given.
         auto remote_roots = [&](std::vector<int64_t> v) {
@@ -14755,6 +14793,8 @@ int main(int argc, char** argv) {
                 said_parks = true;
             }
             remote_park_on = parks;
+            // session files (docs/remote-stage/SESSIONS.md): whether this worker keeps its half of them
+            remote_session_on = (remote_peer.row_formats & strata::net::kStageCapSession) != 0;
             return true;
         };
         if (stage_worker || remote_main) {
@@ -14784,6 +14824,13 @@ int main(int argc, char** argv) {
             const bool park_cap = stage_worker ? o.stage_park_mib != 0 && !stage_relay && stages.empty()
                                                : remote_park_asked;
             if (park_cap) me.row_formats |= strata::net::kStageCapPark;
+            // session files (docs/remote-stage/SESSIONS.md): a worker that keeps its half of them on its disk - as for
+            // parks, not a relay and not one whose layers are split over its own GPUs; parking itself may be off
+            const bool session_cap = stage_worker && !o.stage_session_dir.empty() && !stage_relay && stages.empty();
+            if (session_cap) me.row_formats |= strata::net::kStageCapSession;
+            if (stage_worker && !o.stage_session_dir.empty() && !session_cap)
+                std::fprintf(stderr, "strata stage worker: --stage-session-dir is not used by a relay or a worker "
+                                     "whose layers are split over its GPUs: it keeps no session files\n");
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -15364,6 +15411,182 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (bytes >> 20),
                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                                      park_store.size(), (unsigned long long) (park_store.bytes() >> 20));
+                        return true;
+                    };
+                }
+                // session files (docs/remote-stage/SESSIONS.md): this worker's half of its main process's SAVE /
+                // RESTORE, one file per token in --stage-session-dir; unset when its hello does not list the bit
+                if ((me.row_formats & strata::net::kStageCapSession) != 0) {
+                    // the watchdog: a file block moved is a beat; a step that blocks in one call gets its allowance
+                    auto wk_moving = [](uint64_t, uint64_t) { strata::core::progress_allow(0); };
+                    auto wk_blocking = [](const char*, uint64_t bytes) {
+                        strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+                    };
+                    // this worker's own identity: its model inputs and settings (as the main process's file has its own).
+                    // These lambdas are local to this block and the handlers outlive it: they are captured by value
+                    auto wk_identity = [&, wk_blocking](strata::core::SessionFileIdentity& id, std::string& e) -> bool {
+                        try {
+                            if (session_identity(id, e, [wk_blocking] { wk_blocking("fingerprint", 2u << 20); })) return true;
+                        } catch (const std::bad_alloc&) {
+                            e = "session identity: out of memory";
+                        } catch (const std::exception& ex) {
+                            e = std::string("session identity: ") + ex.what();
+                        }
+                        return false;
+                    };
+                    auto wk_path = [&](const strata::net::StageToken& token) {
+                        const std::string& d = o.stage_session_dir;
+                        const bool sep = !d.empty() && (d.back() == '/' || d.back() == '\\');
+                        return d + (sep ? "" : "/") + strata::core::stage_session_file_name(token);
+                    };
+                    hs.session_put = [&, wk_moving, wk_blocking, wk_identity, wk_path](int64_t ckpt_id, int64_t L,
+                                                                 const strata::net::StageToken& token, int64_t Lc,
+                                                                 int64_t& bytes, std::string& e) -> bool {
+                        const WkBusy busy("stage worker session save");
+                        const auto t0 = Clock::now();
+                        // the class of a failure first, so the main process answers its SERR with it
+                        auto failed = [&](strata::core::SessionError kind, const std::string& why) {
+                            e = std::string(strata::core::session_error_name(kind)) + ": " + why;
+                            std::fprintf(stderr, "strata stage worker: session file not saved: %s\n", e.c_str());
+                            return false;
+                        };
+                        if (!ver.wait_commit(e)) return failed(strata::core::SessionError::io, e);
+                        const strata::net::StageCkptStore::Part* part = nullptr;
+                        if (ckpt_id != 0) {
+                            part = ckpt_store.find(ckpt_id);
+                            if (part == nullptr) {
+                                e = strata::net::kStageCkptMissing + std::to_string(ckpt_id);
+                                return false;
+                            }
+                            if (part->L != Lc)
+                                return failed(strata::core::SessionError::invalid,
+                                              "checkpoint " + std::to_string(ckpt_id) + " was saved at " +
+                                                  std::to_string(part->L) + ", not at " + std::to_string(Lc));
+                        }
+                        strata::core::SessionFileIdentity id;
+                        if (!wk_identity(id, e)) return failed(strata::core::SessionError::io, e);
+                        const std::string path = wk_path(token);
+                        strata::core::SessionStatus st;
+                        size_t written = 0;
+                        try {
+                            if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess)
+                                return failed(strata::core::SessionError::io,
+                                              std::string("before a session file: ") + cudaGetErrorString(se));
+                            // the running state at L is copied (tens of MiB); the K/V goes from its authoritative pools
+                            // straight into the file, a 16 MiB block at a time (no host copy of it)
+                            strata::core::StageSessionImage img;
+                            std::vector<strata::core::SessionKvSource> sources;
+                            if (!strata::core::conversation_part_sources(sources, img.state, img.head, ss, g, (size_t) L, e))
+                                return failed(strata::core::SessionError::io, e);
+                            img.head.token = token;
+                            img.head.ckpt_tokens = (uint64_t) Lc;
+                            if (part != nullptr) img.ckpt = part->state;   // (a copy: the store keeps its part)
+                            strata::core::SessionWriteOptions wo;
+                            wo.min_free_bytes = (uint64_t) std::max<int64_t>(o.session_min_free_mib, 0) << 20;
+                            wo.progress = wk_moving;
+                            wo.phase = wk_blocking;
+                            if (!strata::core::stage_session_write(path, img, &sources, id, written, e, wo, &st))
+                                return failed(st.error == strata::core::SessionError::none ? strata::core::SessionError::io
+                                                                                            : st.error, e);
+                        } catch (const std::bad_alloc&) {
+                            return failed(strata::core::SessionError::memory, "not enough RAM to save the session");
+                        }
+                        if (st.dir_flush_unsupported)
+                            std::fprintf(stderr, "strata stage worker: this filesystem cannot flush a folder, so the "
+                                                 "new name is not flushed\n");
+                        // the keep-N rule: the newest stay, this one among them
+                        std::string pe;
+                        const size_t removed = strata::core::stage_session_prune(
+                            o.stage_session_dir, (size_t) o.stage_session_keep,
+                            strata::core::stage_session_file_name(token), pe);
+                        if (!pe.empty()) std::fprintf(stderr, "strata stage worker: session files: %s\n", pe.c_str());
+                        bytes = (int64_t) written;
+                        std::fprintf(stderr, "strata stage worker: session file saved: %lld tokens (checkpoint %lld), "
+                                             "%zu bytes to %s in %.0f ms%s\n", (long long) L, (long long) Lc, written,
+                                     path.c_str(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     removed ? (", " + std::to_string(removed) + " older removed").c_str() : "");
+                        return true;
+                    };
+                    hs.session_get = [&, wk_moving, wk_blocking, wk_identity, wk_path](int64_t ckpt_id, int64_t L,
+                                                                 const strata::net::StageToken& token, int64_t Lc,
+                                                                 const std::vector<int64_t>& keep,
+                                                                 std::string& e) -> bool {
+                        const WkBusy busy("stage worker session restore");
+                        const auto t0 = Clock::now();
+                        // everything before the first device write answers with the missing prefix: the main process
+                        // keeps its session and the server reads the next prompt from token 0
+                        auto missing = [&](const std::string& why) {
+                            e = std::string(strata::net::kStageCkptMissing) + "session file " +
+                                strata::core::session_token_hex(token) + ": " + why;
+                            std::fprintf(stderr, "strata stage worker: session file not restored: %s\n", e.c_str());
+                            return false;
+                        };
+                        if (!ver.wait_commit(e) || !refill(e)) return false;
+                        apply_pending(true);
+                        if (ckpt_id != 0 && !ckpt_store.admits(ckpt_id, keep))
+                            return missing("the checkpoint store is full (64 parts)");
+                        strata::core::SessionFileIdentity id;
+                        if (!wk_identity(id, e)) return missing(e);
+                        const std::string path = wk_path(token);
+                        strata::core::StageSessionImage img;
+                        try {
+                            strata::core::SessionReadLimits limits;
+                            limits.progress = wk_moving;
+                            const uint64_t floor = (uint64_t) std::max<int64_t>(o.conversation_cache_min_free_mib, 0) << 20;
+                            limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                                const auto mem = strata::core::sample_host_memory();
+                                const std::optional<uint64_t> avail =
+                                    mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                                if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                                why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                      std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                                      ram_note(mem) + ")";
+                                return false;
+                            };
+                            std::string why;
+                            if (!strata::core::conversation_part_read_limits(limits, ss, g, (size_t) L, why))
+                                return missing(why);
+                            strata::core::StageSessionHead want;
+                            want.token = token;
+                            want.layer_lo = ss.layer_lo;
+                            want.layer_hi = ss.layer_hi;
+                            want.tokens = (uint64_t) L;
+                            want.ckpt_tokens = (uint64_t) Lc;
+                            size_t read = 0;
+                            if (!strata::core::stage_session_read(path, id, want, img, read, why, limits))
+                                return missing(why);
+                            // the whole half against this session, still without a device write
+                            wk_blocking("validate", read);
+                            if (!strata::core::conversation_part_validate(img.kv, img.state, ss, g, (size_t) L, why))
+                                return missing(why);
+                            if (Lc > 0 && !strata::core::conversation_checkpoint_validate(img.ckpt, ss, g, (size_t) Lc, why))
+                                return missing(why);
+                        } catch (const std::bad_alloc&) {
+                            return missing("not enough RAM to read it");
+                        }
+                        if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess)
+                            return missing(std::string("before the restore: ") + cudaGetErrorString(se));
+                        std::string why;
+                        wk_blocking("transfer", (uint64_t) L * 16384);
+                        const auto r = strata::core::conversation_part_restore(img.kv, img.state, ss, g, (size_t) L, why);
+                        if (r == strata::core::ConversationRestore::invalid) return missing(why);   // nothing written
+                        if (r != strata::core::ConversationRestore::restored) {   // partly written: the session is lost
+                            e = "stage worker: a session file's restore failed: " + why;
+                            return false;
+                        }
+                        // the checkpoint under the main process's new id, then only what it holds
+                        if (ckpt_id != 0) {
+                            strata::net::StageCkptStore::Part p;
+                            p.L = Lc;
+                            p.state = std::move(img.ckpt);
+                            ckpt_store.put(ckpt_id, std::move(p), keep);
+                        } else {
+                            ckpt_store.prune(keep);
+                        }
+                        park_store.prune(keep);
+                        std::fprintf(stderr, "strata stage worker: session file restored: %lld tokens (checkpoint "
+                                             "%lld) from %s in %.0f ms\n", (long long) L, (long long) Lc, path.c_str(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                         return true;
                     };
                 }
@@ -17009,8 +17232,23 @@ int main(int argc, char** argv) {
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
-                // (a file would hold only this process's layers: the worker's part of a checkpoint stays there)
-                if (remote_main) { refuse("session files do not support --remote-stage"); continue; }
+                // (a file would hold only this process's layers: the worker's part of a checkpoint stays there) - unless
+                // the worker keeps its half on its own disk: its hello listed kStageCapSession (--stage-session-dir;
+                // docs/remote-stage/SESSIONS.md)
+                if (remote_main && !remote_session_on) { refuse("session files do not support --remote-stage"); continue; }
+                if (remote_main && save && !pl_drain_err.empty()) {   // (the worker's session is not confirmed then)
+                    refuse("the remote stage's last pipelined window failed (" + pl_drain_err + "): no session to save",
+                           strata::core::SessionError::io);
+                    continue;
+                }
+                if (remote_main) {   // (a link lost while idle: the next request connects again)
+                    std::string le;
+                    if (!remote_link.alive(le)) {
+                        refuse("the link to the remote stage is lost (" + le + "); the next request connects again",
+                               strata::core::SessionError::io);
+                        continue;
+                    }
+                }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -17028,6 +17266,39 @@ int main(int argc, char** argv) {
                     refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
                     continue;
                 }
+                // a remote main's file holds layers [0, K) only: bound to this split and this worker's layer range too
+                // (a file made for split K is refused at split K').  A one-GPU engine's identity is as before.
+                if (remote_main) {
+                    strata::core::SessionIdentityBuilder rb(0x52454d4f54453031ull);   // "REMOTE01"
+                    rb.u64("config", id.config);
+                    rb.i64("split", (int64_t) split_at[0]);
+                    rb.i64("worker.layer_begin", remote_peer.layer_begin);
+                    rb.i64("worker.layers", remote_peer.n_layers);
+                    id.config = rb.digest();
+                }
+                // the worker's half (SessionPut / SessionGet) is one message whose reply comes once the worker has
+                // written or read its file: announced as one blocking step, from a generous size (16 KiB a token,
+                // about twice the worker's own on the measured split, at session_phase_limit_s's 4 MiB/s) plus two
+                // minutes for its first fingerprint of its model files, at most an hour (the server's limit)
+                auto worker_wait = [&](uint64_t tokens) -> int {
+                    const uint64_t guess = tokens > (UINT64_MAX >> 15) ? UINT64_MAX : tokens * 16384 + (256u << 20);
+                    const int64_t s = std::min<int64_t>(3600, strata::core::session_phase_limit_s(guess) + 120);
+                    strata::core::progress_at("the remote stage's half of the session file");
+                    strata::core::progress_allow(s);
+                    std::printf("SWAIT worker %lld\n", (long long) s);
+                    std::fflush(stdout);
+                    return (int) s;
+                };
+                // a worker's error starts with its class (session_error_name) when it is a file's; the link's is io
+                auto worker_error = [](const std::string& e) {
+                    const std::string w = "remote stage (worker): ";
+                    if (e.rfind(w, 0) != 0) return strata::core::SessionError::io;
+                    const std::string m = e.substr(w.size());
+                    for (const auto k : {strata::core::SessionError::invalid, strata::core::SessionError::storage,
+                                         strata::core::SessionError::memory, strata::core::SessionError::io})
+                        if (m.rfind(std::string(strata::core::session_error_name(k)) + ": ", 0) == 0) return k;
+                    return strata::core::SessionError::invalid;   // (its position, a pending error, a missing part)
+                };
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
@@ -17084,6 +17355,30 @@ int main(int argc, char** argv) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
+                        // a remote main (docs/remote-stage/SESSIONS.md): the worker writes its half first, under a new
+                        // token, with its part of the checkpoint the file keeps (every checkpoint here has one; one
+                        // without goes to disk without a checkpoint); a failure there publishes nothing.  This file
+                        // records the token; a worker half whose main file then fails is an orphan its keep-N removes.
+                        strata::core::SessionToken worker_token{};
+                        if (remote_main) {
+                            if (!disk_checks.empty() && disk_checks[0].remote_id == 0) disk_checks.clear();
+                            const int64_t ckpt_id = disk_checks.empty() ? 0 : disk_checks[0].remote_id;
+                            const int64_t Lc = disk_checks.empty() ? 0 : (int64_t) disk_checks[0].ids.size();
+                            worker_token = strata::core::session_token_new();
+                            const int wait = worker_wait(live.size());
+                            const auto tw = Clock::now();
+                            int64_t wbytes = 0;
+                            std::string we;
+                            if (!remote_link.session_put(ckpt_id, (int64_t) live.size(), worker_token, Lc, wbytes, we,
+                                                         wait)) {
+                                refuse("the remote stage did not save its half: " + we, worker_error(we));
+                                continue;
+                            }
+                            std::fprintf(stderr, "strata serve: remote stage: the worker saved its half (%lld tokens, "
+                                                 "checkpoint %lld, %lld bytes) in %.1f ms\n", (long long) live.size(),
+                                         (long long) Lc, (long long) wbytes,
+                                         std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                        }
                         kept = disk_checks.size();
                         const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
                         strata::core::SavedConversation meta;
@@ -17100,6 +17395,7 @@ int main(int argc, char** argv) {
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                         wo.progress = moving;
                         wo.phase = blocking;
+                        wo.worker_token = worker_token;   // (all zeros without a remote stage: the header as before)
                         strata::core::SessionStatus st;
                         if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
                             refuse(err, st.error, st.published);
@@ -17119,6 +17415,7 @@ int main(int argc, char** argv) {
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
+                    strata::core::SessionToken worker_token{};   // a remote main's file: its worker half's
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
@@ -17141,11 +17438,13 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        limits.worker_token = remote_main;   // (only a remote main reads a header with a token)
                         strata::core::SessionStatus st;
                         if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
                             refuse(err, st.error);
                             continue;
                         }
+                        worker_token = st.worker_token;
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
                         continue;
@@ -17161,6 +17460,54 @@ int main(int argc, char** argv) {
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
+                    }
+                    // a remote main (docs/remote-stage/SESSIONS.md): the worker reads and checks its half whole and
+                    // puts it back before this side writes anything; its checkpoint part gets a new id (the file's
+                    // checkpoint becomes this chain's), and its stores keep only what this side holds after the
+                    // restore (the parked conversations, unless #879 drops them below).  Its half missing or failing
+                    // its check: refused, nothing written on either side.
+                    int32_t remote_new_id = 0;
+                    if (remote_main) {
+                        if (strata::core::session_token_zero(worker_token)) {
+                            refuse("the file has no remote stage half (it was not saved by a remote main process)");
+                            continue;
+                        }
+                        if (image.checkpoints.size() > 1) {
+                            refuse("a remote stage's session file holds one checkpoint at most");
+                            continue;
+                        }
+                        const int64_t Lc = image.checkpoints.empty() ? 0 : (int64_t) image.checkpoints[0].ids.size();
+                        if (Lc > 0 && remote_ckpt_id == INT32_MAX) {
+                            refuse("the remote stage's checkpoint ids are used up", strata::core::SessionError::memory);
+                            continue;
+                        }
+                        remote_new_id = Lc > 0 ? ++remote_ckpt_id : 0;
+                        std::vector<int64_t> keep;
+                        if (remote_new_id != 0) keep.push_back(remote_new_id);
+                        if (!nan_flush) keep = remote_roots(std::move(keep));
+                        const int wait = worker_wait(image.live.ids.size());
+                        const auto tw = Clock::now();
+                        bool missing = false;
+                        std::string we;
+                        if (!remote_link.session_get(remote_new_id, (int64_t) image.live.ids.size(), worker_token, Lc,
+                                                     keep, missing, we, wait)) {
+                            if (missing) {
+                                refuse("the remote stage does not hold its half of this file (" + we + ")");
+                            } else if (strata::net::stage_link_lost(we)) {
+                                refuse("the link to the remote stage was lost while it read its half (" + we + "); the "
+                                       "next request connects again", strata::core::SessionError::io);
+                            } else {
+                                // the worker's session is lost (its stores are as they were): the live session here is
+                                // not continued; the next request reads from a checkpoint or from token 0
+                                live_ok = false;
+                                refuse("the remote stage failed to restore its half (" + we + "); the live session "
+                                       "is dropped", strata::core::SessionError::io);
+                            }
+                            continue;
+                        }
+                        std::fprintf(stderr, "strata serve: remote stage: the worker restored its half (%zu tokens, "
+                                             "checkpoint %lld) in %.1f ms\n", image.live.ids.size(), (long long) Lc,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
                     }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
@@ -17181,6 +17528,7 @@ int main(int argc, char** argv) {
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+                    if (remote_main && !checks.empty()) checks[0].remote_id = remote_new_id;   // (the worker's part)
                     cvec_cached = image.cvec;
                     live_ok = true;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)

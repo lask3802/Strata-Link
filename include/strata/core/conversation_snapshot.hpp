@@ -128,6 +128,21 @@ bool conversation_part_validate(const std::vector<ConversationKv>& kv, const Con
                                 const SessionState& session, const ModelGeometry& g, size_t tokens,
                                 std::string& error);
 // (conversation_part_restore: below, after ConversationRestore)
+// A checkpoint's running state against this session at an explicit length `tokens` (a worker's part carries no ids;
+// one with ids must have exactly `tokens` of them).  No device access.
+bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, const SessionState& session,
+                                      const ModelGeometry& g, size_t tokens, std::string& error);
+// A remote stage worker's half of a session file (docs/remote-stage/SESSIONS.md): its running state at `tokens` copied
+// to `state`, one streamed K/V source per owned attention layer (conversation_kv_source, cells [0, tokens)), and in
+// `head` the geometry, the layer range and L.  Syncs the device first; the caller keeps the session untouched until the
+// file is written.  On a failure the outputs are as they were.
+bool conversation_part_sources(std::vector<SessionKvSource>& sources, ConversationCheckpoint& state,
+                               StageSessionHead& head, const SessionState& session, const ModelGeometry& g,
+                               size_t tokens, std::string& error);
+// The read limits of such a file for this session at exactly `tokens`: its layer range and geometry, the exact
+// running-state sizes, each owned layer's K/V part sizes at `tokens`, no token ids (stage_session_read).
+bool conversation_part_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                   size_t tokens, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
 // sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
 // `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.
