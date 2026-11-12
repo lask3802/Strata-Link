@@ -31,7 +31,18 @@ back, and only then writes its own half.
   (default 4: the N newest worker halves are kept, older ones are deleted after each save). The worker lists
   `kStageCapSession = 1u << 29` in its hello's `row_formats` (bits 24-31 are capability bits; 30 is parking, 31 the
   K/V element type). A relay, or a worker whose own layers are split over several of its GPUs, does not list it and
-  says so. Both options on a process that is not a worker stop it at start.
+  says so. Both options on a process that is not a worker stop it at start, and so does `--stage-session-keep`
+  without `--stage-session-dir`. At start the worker also removes the temporary files a save ended in the middle of
+  its write left in the folder (only the exact temporary name of a worker half, `.stage-session-<32 hex>.bin.<16
+  hex>.tmp`, regular files, links not followed, and only those not written to for 10 minutes: another worker may share
+  the folder) and says how many.
+- A worker started by the node agent (`tools/stage_node.py`): node.json's `"stage_session_dir"` (an absolute path on
+  the worker's PC, checked when the agent starts) and optional `"stage_session_keep"` (1 to 1000000). A `/start` with
+  `"session_dir": true` appends `--stage-session-dir <that folder>` (and `--stage-session-keep N` when set) to the
+  worker's arguments; the caller never sends a path, and `--stage-session-dir` is not among the flags a `/start` may
+  add itself. Without the field the worker's arguments are as before, so an older engine that does not know the
+  option still starts. `"session_dir": true` on an agent whose node.json names no folder is refused, as a flag that
+  is not allowed is.
 - Main process: it reads the bit at every connection. Without it, `SAVE` / `RESTORE` are refused as before ("session
   files do not support --remote-stage").
 - The protocol number stays 8: the new messages go only to a worker that listed the bit. An older main process
@@ -62,7 +73,8 @@ Two messages, synchronous with a reply. The payload starts with the token (two u
 - `SessionGet` reads at most `kStageKeepMax` ids in keep[] from a worker that parks, `kStageCkptMax` from one that does
   not (as the other messages with a keep[]). An error that starts with `kStageCkptMissing` (the worker has no such
   half, or the half failed a check before anything was written) leaves the worker's session where it was. Any other
-  failure leaves no position trusted (the next message must be a Reset or a restore).
+  failure leaves no position trusted (the next message must be a Reset or a restore). A failed Commit before it is
+  its error (not the missing one) and is dropped; a failed position table is its error and stays pending.
 - The worker's file errors start with their kind (`invalid: `, `storage: `, `memory: `, `io: `): the main process
   answers its `SERR` with that kind.
 - The reply comes once the worker has written or read its whole file. The main process announces the wait to the
@@ -76,7 +88,9 @@ Two messages, synchronous with a reply. The payload starts with the token (two u
    remote main: the link is alive, and the last pipelined window did not fail.
 2. A new token. `SessionPut`: the worker writes `DIR/stage-session-<32 hex digits>.bin` (temporary file, then rename;
    the K/V goes from its pools into the file 16 MiB at a time, with no host copy of it), then deletes the oldest
-   halves past `--stage-session-keep`. A failure here publishes nothing on either side.
+   halves past `--stage-session-keep`. A failure here publishes nothing on either side. When the worker no longer
+   holds the checkpoint's part (the missing answer), the main process sends `SessionPut` once more without a
+   checkpoint, and its own file then has none either (one log line).
 3. The main process writes its own file with the token in the header. If that fails, the worker's half is an orphan;
    the keep-N rule deletes it later.
 
@@ -91,13 +105,15 @@ is not kept: the file then has no checkpoint.
    half into RAM (admitted against `--conversation-cache-min-free-mib`, as a park is), checks it against its session
    (model, settings, layer range, L, Lc, every part's size), and only then writes it to the device. Its checkpoint
    part goes into its store under the new id; its stores keep only keep[].
-3. Only after the worker's success does the main process write its own half.
+3. Only after the worker's success does the main process write its own half. The worker holds the session then,
+   also when the link was made again before the restore, so the next request goes on from it (and a failed pipelined
+   window of an earlier request no longer refuses a SAVE or a park).
 
 | what fails | answer (`SERR` kind) | after it |
 |---|---|---|
 | the worker has no such half, or its half fails a check | invalid (400) | both sides as they were |
 | the link is lost | io (500) | the next request connects again |
-| the worker fails after it started writing | io (500) | the main process's live session is dropped; the next request reads from a checkpoint or from token 0 |
+| the worker fails after its checks (its device, its transfer, its checkpoint store), or a failed Commit was pending | the engine ends (`FATAL`, 500) | the server starts it again; the next request reads its prompt from token 0. The worker may have written part of its cells: a checkpoint restores only the running state, so nothing may go on from what is left (as after a failed `ParkRestore`) |
 | the main file is a one-GPU file, or has more than one checkpoint | invalid (400) | as it was |
 
 ## The server: `"session_on_unload"`
@@ -112,8 +128,14 @@ file, as it does for an image job's file. It works on one GPU too.
   the phase "saving the session".
 - It never stops the unload. A failed save (nothing to save, short of RAM or disk, a worker without
   `--stage-session-dir`) is one log line, and any older `unload-session.bin` is deleted so it is not restored. A save
-  that has not answered in 120 s ends the engine (the two sides cannot be put back in step in the middle of a file,
-  and the unload was about to stop it) and the unload goes on.
+  that has not answered in `"session_on_unload_timeout_s"` (default 120, from more than 0 up to 3600; another value is
+  a warning and the default) ends the engine (the two sides cannot be put back in step in the middle of a file, and
+  the unload was about to stop it) and the unload goes on.
+- The unload holds the request queue meanwhile, up to that long: a request waits, and so does a peer server's
+  `"before_load"` command that calls this server's `POST /unload` - give it a `"before_load_timeout_s"` longer than
+  this server's `"session_on_unload_timeout_s"`.
+- With `--session-save-reclaim` on the engine the save is retried after a RAM refusal as the `/slots` save is, all of it
+  within the same time.
 - With parallel requests (`"parallel"` / `--batch`) it is off, said once at start.
 - A failed restore after the load is one log line; the request reads its prompt as without the file.
 - The model_control switch to another model does not save (it does not go through the unload).
@@ -130,8 +152,10 @@ Both are mode 0600 on Linux; on Windows they inherit the folder's permissions. T
 is refused as the other. The keep-N rule deletes only names of the exact pattern `stage-session-<32 lower-case hex
 digits>.bin`, never the file just written.
 
-A worker half is deleted only by the keep-N rule, so a `/slots` file saved more than N saves ago cannot be restored
-on a remote main any more (its worker half is gone; the restore answers 400 and changes nothing).
+A worker half is deleted only by the keep-N rule, and the rule counts every half the worker saved: those of the
+unload's saves and those of `/slots` saves alike. So a `/slots` file saved more than N saves ago cannot be restored on
+a remote main any more (its worker half is gone; the restore answers 400 and changes nothing): with
+`session_on_unload` that is after N unloads. N is 4 unless `--stage-session-keep` says otherwise.
 
 ## What is not kept
 
@@ -162,6 +186,9 @@ Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1
   old file, no temporary left; the free-space preflight); mode 0600; the keep-N rule (the newest stay, the one just
   written always, other names untouched, a link of that name not followed, a missing folder); `--stage-session-dir` made absolute and created (0700 on
   Linux), a file refused. The one-GPU golden file is unchanged.
+- `conversation_file_test` also: the worker's start removes a stale temporary file of a worker half's exact name,
+  and keeps a fresh one, other names (upper-case hex, a short or long suffix, another leaf), a folder and a link of that
+  name (the link check is skipped where links cannot be made).
 - `stage_link_test` section 19 (new): SessionPut / SessionGet over a TLS loopback link: the bit; the position, empty,
   token and checkpoint checks, none reaching the handler; the token (high bits set), Lc, the id and a 33-bit byte count
   carried whole; SessionPut does not move the session; a write error comes back with the link and session kept; a
@@ -169,8 +196,10 @@ Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1
   under the new id; missing (no such half, another length) leaves the session where it was, any other failure leaves no
   position; a failed Positions and a failed Commit on both messages, the Commit's still pending after a SessionPut
   and reaching the next prompt chunk; a reply allowed longer than
-  `STRATA_REMOTE_TIMEOUT_S` read as any other; a worker without the handlers (no bit, errors that are not the missing
-  one, at most 64 ids).
+  `STRATA_REMOTE_TIMEOUT_S` read as any other; a SessionPut whose checkpoint part the worker no longer holds is the
+  missing case, and the save without it goes through on the same link; a reply 2 s late in a process of its own with
+  `STRATA_REMOTE_TIMEOUT_S=1` (`stage_link_test --slow-reply`): waited for with an allowance of 30 s, a lost link
+  without one; a worker without the handlers (no bit, errors that are not the missing one, at most 64 ids).
 - `conversation_validation_test` (added to): a state's check at an explicit length (one without ids at any length
   within the cells, one with ids only at its own); a worker half's read limits for this session (the caller's own
   fields kept), the half of this session read back within them and validated, another length refused, and the limits
@@ -179,11 +208,19 @@ Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1
   engine stops and before `after_unload`, restored after the next load and deleted; an older file replaced; a failed
   save does not stop the unload and leaves nothing to restore; a save with no answer in time is given up and the engine
   ended; no save while a request runs, during a switch, with parallel requests, without `slot_save_path`, or with an
-  engine that has no session files; the config key (needs `slot_save_path`, true or false, off with `"parallel"`).
+  engine that has no session files; with `--session-save-reclaim` the save goes through the retry with the
+  timeout as its deadline (`test_session_save_retry`: the deadline reaches every SAVE and ends the wait for RAM);
+  the config keys (`session_on_unload` needs `slot_save_path`, true or false, off with `"parallel"`;
+  `session_on_unload_timeout_s` within (0, 3600], else the default).
+- `tools/test_stage_node.py` (`SessionDirTest`): the worker's argv exactly, without the field (also with a folder in
+  node.json), with it, with the keep; refused without a folder or with a field that is not true or false, nothing
+  started; `--stage-session-dir` is not an extra a `/start` may add; node.json's values checked (an empty, relative or
+  non-text folder, a keep without a folder, a keep of 0, `true` or text), and a bad folder stops the agent's start.
 - Each new check was seen to fail on a mutated build (the reserved-word check, the token check, the keep-N rule and its
   name filter, the token in the header, the layer range check, the read limits' layer count, the explicit-length
   check, the worker's position after a missing half, the Lc check, the failed Commit kept pending by a SessionPut,
-  the server's save call, its delete of an older file, its parallel check, its config check, the restore's clear, its
+  the slow reply's wait, the temporary files' clean-up (its name check, its age check), the SessionPut client's
+  missing answer, the stage agent's `session_dir` argv and refusal, the server's save call, its delete of an older file, its parallel check, its config check, the restore's clear, its
   deadline: without it the test waits out the announced 3600 s).
 - The tests that passed before pass after it: `conv_cache_test`, `conversation_cache_test`, `conversation_memory_test`,
   `conversation_split_failure_test`, `session_save_reclaim_test`, `split_rules_test`, `split_walk_test`,
@@ -198,6 +235,8 @@ Not run:
 - The main process's SAVE / RESTORE code in `generate.cpp` (it cannot run without a model): checked by review only.
 - `conversation_part_sources` (the worker's state and K/V gathered for the file) needs a device: not run.
 - A Linux (GCC) build of this change, and so the checks that run only there (the files' mode 0600, the folder's 0700).
+- The main process's resend without a checkpoint, its `FATAL` after a failed `SessionGet` and its clearing of the
+  link-made-again and pipelined-window state after a restore (all in `generate.cpp`): checked by review only.
 - The keep-N rule's link check: this Windows PC may not make symbolic links, so it was skipped, and the fix it guards
   (links not followed) was not seen to fail without it.
 
@@ -207,30 +246,30 @@ Where the code differs from the design it was built from, or says more than it:
 
 - A lost link answers `SERR io` (500), not a new kind: the kinds are fixed, and an older server ends an engine that
   answers an unknown one as out of step.
-- A `SessionGet` that fails after the worker started writing answers `SERR io` and drops the main process's live
-  session, instead of ending the engine: the main process has written nothing, and the worker's stores are intact.
+- A `SessionGet` that fails after the worker's checks ends the engine (`FATAL`), as a failed `ParkRestore` does: the
+  worker may have written part of its cells, and a checkpoint would restore only the running state over them. (The
+  first build answered `SERR io` and dropped only the live session; a review found the checkpoint path.)
 - A `SessionGet` that fails before any write (the missing case) leaves the worker's position where it was; a
   `ParkRestore` sets it unknown in every case.
 - A failed Commit before a `SessionGet` is its error, not the missing one (a `ParkRestore` drops it with a log
-  line), so the main process drops its live session as after any other failure; the next request reads from a
-  checkpoint or from token 0.
+  line), so the engine ends as after any other failure there.
 - A failed Commit or position table before a `SessionPut` stays pending after it (a `ParkSave` keeps only the
   position table's).
 - The worker streams its K/V to disk on a save (no host copy) but reads its whole half into RAM on a restore.
-- A temporary file left by a crash in the middle of a write is not deleted (two workers might share a folder); a
-  worker half whose main file was never written is deleted by the keep-N rule. The same holds on the main PC when the
-  server's 120 s bound ends the engine during its write: its hidden temporary file stays in `slot_save_path`, up to the
+- A temporary file left by a worker ended in the middle of a write is removed at the worker's next start, once it is
+  10 minutes old; a worker half whose main file was never written is deleted by the keep-N rule. On the main PC, when
+  the server's bound ends the engine during its write, its hidden temporary file stays in `slot_save_path`, up to the
   size of a session file, until someone deletes it.
-- The server's 120 s bound on the save ends the engine at the bound instead of waiting for it; it is a constant
-  (`UNLOAD_SESSION_WAIT_S`), not a config key.
+- The server's bound on the save (`"session_on_unload_timeout_s"`, default 120) ends the engine at the bound
+  instead of waiting for it.
 - A failed save before an unload deletes an older `unload-session.bin`, also one a failed save had already published.
 
 ## Open risks for the GPU run
 
 - The `SWAIT worker` allowance is a guess (16 KiB a token plus 120 s for the worker's first fingerprint of its model
   files). Too short and the server ends the engine during a save.
-- The server's 120 s bound covers both halves and the main process's own fingerprint: a slow disk at 240K tokens may
-  pass it.
+- The server's bound (120 s by default) covers both halves and the main process's own fingerprint: a slow disk at
+  240K tokens may pass it; then `"session_on_unload_timeout_s"` must be raised (with the peer's `before_load_timeout_s`).
 - The worker's RAM at restore: the whole half in host RAM while its model is loaded.
 - The worker's take-over timer (`STRATA_REMOTE_TAKEOVER_S`) counts idle time between messages; a long `SessionPut` or
   `SessionGet` is one message, so a second main process waiting to take over is not served during it.
