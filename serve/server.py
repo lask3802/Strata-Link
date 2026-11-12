@@ -5690,8 +5690,12 @@ class Service:
                       flush=True)
                 try:
                     self.engine.restart()
-                except OSError as e:
-                    raise EngineDied(f"the engine could not be started: {e}") from e
+                except Exception as e:                   # as the first start's failure: the encoder it started goes
+                    if vision_started:
+                        self.vision.unload()
+                    if isinstance(e, OSError):
+                        raise EngineDied(f"the engine could not be started: {e}") from e
+                    raise
                 print("[strata] the engine is running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:

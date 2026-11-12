@@ -113,6 +113,26 @@ class SessionOnUnload(unittest.TestCase):
         self.assertIsNone(self.svc.restore_after_load)
         self.assertFalse(os.path.exists(self.path))
 
+    def test_a_new_start_that_fails_after_a_fatal_restore_is_engine_died(self):
+        from serve.server import EngineDied
+        self.assertEqual(self.svc.unload(), "unloaded")
+        real = self.engine.restart
+        starts = []
+
+        def restart():
+            starts.append(1)
+            if len(starts) > 1:
+                raise OSError("no such program")
+            real()
+            self.engine.script = [
+                "SESSION 268435456 1198691396\n",
+                "FATAL restoring the session file failed after the device state was changed: copy\n"]
+        self.engine.restart = restart
+        with self.svc.fifo, self.assertRaises(EngineDied):
+            self.svc.ensure_loaded()
+        self.assertEqual(len(starts), 2)
+        self.assertIsNone(self.svc.restore_after_load)
+
     def test_an_older_file_is_replaced(self):
         Path(self.path).write_bytes(b"old")
         self.assertEqual(self.svc.unload(), "unloaded")

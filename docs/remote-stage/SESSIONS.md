@@ -117,7 +117,7 @@ is not kept: the file then has no checkpoint.
 | the worker has no such half, or its half fails a check | invalid (400) | both sides as they were |
 | the link is lost | io (500) | the next request connects again |
 | the worker fails after its checks (its device, its transfer, its checkpoint store), or a failed Commit was pending | the engine ends (`FATAL`, 500) | the server ends it at once (a main process still freeing its RAM takes no request) and the next request starts it again and reads its prompt from token 0 (a restore right after a load: the request that loaded it gets the new engine at once). The worker may have written part of its cells: a checkpoint restores only the running state, so nothing may go on from what is left (as after a failed `ParkRestore`) |
-| the main file is a one-GPU file, has more than one checkpoint, holds no tokens, or its checkpoint is past its tokens | invalid (400) | as it was |
+| the main file is a one-GPU file, has more than one checkpoint, holds no tokens, or its checkpoint is past its tokens (the snapshot check refuses the last two before any link message; the main's own checks after it are a guard) | invalid (400) | as it was |
 
 ## The server: `"session_on_unload"`
 
@@ -217,7 +217,7 @@ Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1
   `session_on_unload_timeout_s` within (0, 3600], else the default: 0, true, false, text, 4000).
 - `test_slots`: a `FATAL` during a restore ends the engine at once (not alive; the next request starts it again).
 - `test_session_on_unload`: a restore after a load that ends the engine is followed by a new start in the same
-  request, with nothing restored into it.
+  request, with nothing restored into it; a new start that fails then answers EngineDied (503).
 - `tools/test_stage_node.py` (`SessionDirTest`): the worker's argv exactly, without the field (also with a folder in
   node.json, and with extra flags), with it, with the keep (before the extra flags); refused without a folder or with
   a field that is not true or false, nothing started; `--stage-session-dir` is not an extra a `/start` may add;
