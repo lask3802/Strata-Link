@@ -6887,6 +6887,8 @@ class Service:
                     elif not (self.loaded() and not self._vision_down()):
                         with self._inference_fifo(deadline, cancel):
                             self.ensure_loaded()
+                    elif self.switching:                    # model_control: as ensure_loaded says it to the others
+                        self.ensure_loaded()
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
@@ -10886,7 +10888,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.before_load_strict = cfg.get("before_load_strict") is True
     try:
         t = float(cfg.get("after_unload_timeout_s") or svc.after_unload_timeout_s)
-        if not (t > 0 and math.isfinite(t)):
+        if not 0 < t <= 86400:                          # (a day at most: a huge wait is no wait on some systems)
             raise ValueError
         svc.after_unload_timeout_s = t
     except (TypeError, ValueError):

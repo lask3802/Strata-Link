@@ -225,6 +225,11 @@ class ModelControl(Base):
         self.assertTrue(self.svc.loaded())
         self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 202)
         self.assertEqual(self.chat()[0], 503)
+        self.engine.batch = 2                               # parallel requests skip the fifo on a loaded engine
+        try:
+            self.assertEqual(self.chat()[0], 503)
+        finally:
+            self.engine.batch = 0
         self.assertEqual(self.svc.unload(), "busy")
         self.svc.last_request_at = time.time() - 600
         self.assertEqual(self.svc.unload(idle_for=1), "busy")
@@ -344,7 +349,7 @@ class MainReadsTheConfig(unittest.TestCase):
         self.assertEqual((svc.after_unload, svc.after_unload_timeout_s, svc.model_control), (None, 300.0, None))
 
     def test_a_bad_timeout_keeps_the_default(self):
-        for bad in ("soon", -5, "inf", "nan"):
+        for bad in ("soon", -5, "inf", "nan", 1e300):
             self.assertEqual(self.start({"after_unload_timeout_s": bad}).after_unload_timeout_s, 300.0, bad)
 
     def test_a_bad_model_control_stops_the_start(self):
