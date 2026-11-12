@@ -170,12 +170,15 @@ class ModelControl(Base):
              "log": str(self.tmp / "switch.out")})
 
     def test_off_by_default(self):
-        s, _, b = self.req("/model-control")                # off: a 404, as before the card existed
-        self.assertEqual(s, 404)
-        self.assertIn("model_control", b["error"]["message"])
-        s, _, b = self.req("/model-control", {"model": "deepseek"})
-        self.assertEqual(s, 404)
-        self.assertIn("model_control", b["error"]["message"])
+        # off: the path is unknown, as before the card existed - the same answers as any other unknown path, also
+        # with an API key and without it, and for a POST that is not JSON
+        self.assertEqual(self.req("/model-control")[0], 404)
+        for key in (None, "k"):
+            self.svc.api_key = key
+            for body, headers in ((None, None), ({"model": "deepseek"}, None),
+                                  ({"model": "deepseek"}, {"Content-Type": "text/plain"})):
+                self.assertEqual(self.req("/model-control", body, headers)[:1], self.req("/no-such-path", body, headers)[:1],
+                                 (key, body, headers))
 
     def test_view(self):
         self.configure("pass")
@@ -212,6 +215,26 @@ class ModelControl(Base):
         import signal
         os.kill(self.svc.switching["pid"], signal.SIGTERM if hasattr(signal, "SIGTERM") else 15)
         self.assertTrue(wait_for(lambda: self.svc.switching is None))
+
+    def test_while_switching_a_loaded_model_takes_nothing_new_and_is_not_unloaded(self):
+        # the command is about to stop this server: a request would be cut off midway, and an unload (POST /unload,
+        # the idle unload) would run after_unload under the switch's feet
+        self.configure("import time; time.sleep(30)")
+        mark = self.tmp / "after"
+        self.svc.after_unload = [PY, "-c", f"open({str(mark)!r}, 'w').close()"]
+        self.assertTrue(self.svc.loaded())
+        self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 202)
+        self.assertEqual(self.chat()[0], 503)
+        self.assertEqual(self.svc.unload(), "busy")
+        self.svc.last_request_at = time.time() - 600
+        self.assertEqual(self.svc.unload(idle_for=1), "busy")
+        self.assertTrue(self.engine.alive())
+        self.assertFalse(mark.exists())
+        import os
+        import signal
+        os.kill(self.svc.switching["pid"], signal.SIGTERM if hasattr(signal, "SIGTERM") else 15)
+        self.assertTrue(wait_for(lambda: self.svc.switching is None))
+        self.assertEqual(self.chat()[0], 200)
 
     def test_refusals(self):
         self.configure("pass")
@@ -321,7 +344,7 @@ class MainReadsTheConfig(unittest.TestCase):
         self.assertEqual((svc.after_unload, svc.after_unload_timeout_s, svc.model_control), (None, 300.0, None))
 
     def test_a_bad_timeout_keeps_the_default(self):
-        for bad in ("soon", -5):
+        for bad in ("soon", -5, "inf", "nan"):
             self.assertEqual(self.start({"after_unload_timeout_s": bad}).after_unload_timeout_s, 300.0, bad)
 
     def test_a_bad_model_control_stops_the_start(self):

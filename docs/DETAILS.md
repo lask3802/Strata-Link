@@ -396,13 +396,13 @@ with its checks), and Load of another model that this port can serve instead:
                   "log": "/srv/strata/model-switch/switch.out"}
 ```
 
-Without it `GET /model-control` answers **404**, as before. With it, `GET /model-control` answers the list, whether the model is loaded, a switch under way and the last after_unload
+Without it the path does not exist, as before. With it, `GET /model-control` answers the list, whether the model is loaded, a switch under way and the last after_unload
 result. `POST /model-control` with `{"model": "deepseek"}` (JSON from Strata's own page, as `/unload`) runs `switch`
 plus the id in a session of its own and answers **202**. It answers **409** while a request runs or waits or a switch
 is under way, **400** for this server's own model (use `/load`), and **404** for an unknown id. The command belongs to
 the machine: it stops this server and starts the one for that id, and each server names the other in its own
-`model_control`. Until the command stops this server, a request that would load the model gets **503** with
-`Retry-After`. If the command ends while this server still runs, the switch failed or went back, and the card can
+`model_control`. Until the command stops this server, a request that needs the model gets **503** with `Retry-After`
+(loaded or not: it would be cut off midway), and an unload answers busy. If the command ends while this server still runs, the switch failed or went back, and the card can
 switch again. The page waits until the port answers again, then reloads. Requests sent during the switch fail; nothing
 retries them.
 

@@ -5576,11 +5576,11 @@ class Service:
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
-        if self.loaded() and not self._vision_down():
-            return
         if self.switching:                              # model_control: the switch command is stopping this server
             raise GpuBusy(f"this port is switching to {self.switching['to']}; try again in a few minutes",
-                          retry_after=30)
+                          retry_after=30)                # (loaded or not: it would be cut off midway)
+        if self.loaded() and not self._vision_down():
+            return
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -5898,6 +5898,8 @@ class Service:
                 if self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                return "busy"
+            if self.switching:                          # model_control: the switch command stops it (its own way)
                 return "busy"
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
@@ -8611,12 +8613,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
-            if path == "/model-control":                     # the Monitor's model card (opt-in "model_control")
+            # the Monitor's model card (opt-in "model_control"; off, the path is unknown as before the card existed)
+            if path == "/model-control" and svc.model_control:
                 if self._authorized():
-                    if svc.model_control:
-                        self._json(200, svc.model_control_view())
-                    else:                                    # off: as before the card existed
-                        self._json(404, {"error": {"message": "model switching is off (no \"model_control\")"}})
+                    self._json(200, svc.model_control_view())
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -8726,7 +8726,7 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
-            if path == "/model-control":                     # switch this port to another model (opt-in)
+            if path == "/model-control" and svc.model_control:   # switch this port to another model (opt-in)
                 if not self._own_page("the model can be switched"):
                     return
                 try:
@@ -10886,7 +10886,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.before_load_strict = cfg.get("before_load_strict") is True
     try:
         t = float(cfg.get("after_unload_timeout_s") or svc.after_unload_timeout_s)
-        if not t > 0:
+        if not (t > 0 and math.isfinite(t)):
             raise ValueError
         svc.after_unload_timeout_s = t
     except (TypeError, ValueError):

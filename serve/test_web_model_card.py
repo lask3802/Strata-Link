@@ -48,6 +48,12 @@ class WebModelCard(unittest.TestCase):
     def test_the_card_polls_only_on_the_monitor(self):
         self.assertIn('if (tab === "monitor" && mcpTick % 5 === 0) loadModelControl();', self.js)
 
+    def test_a_server_without_the_card_is_asked_once(self):
+        i = self.js.index("async function loadModelControl()")
+        body = self.js[i:i + 400]
+        self.assertLess(body.index("if (mcOff) return;"), body.index('fetch("model-control"'))
+        self.assertIn("if (r.status === 404) { mc = null; mcOff = true;", body)
+
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
 class WebModelCardParses(unittest.TestCase):
