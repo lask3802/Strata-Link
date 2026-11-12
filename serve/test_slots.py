@@ -321,6 +321,9 @@ class Slots(unittest.TestCase):
         s, b = self.post("/slots/0?action=restore", {"filename": "t.bin"})
         self.assertEqual(s, 500, b)
         self.assertIn("device state", b["error"]["message"])
+        # ended at once: an engine on its way out (a remote main unpinning) must not take the next request
+        self.assertTrue(self.engine.ended and self.engine.proc.killed)
+        self.assertFalse(self.engine.alive())
 
     def test_malformed_or_mismatched_reply_is_a_server_error(self):
         for script in (["RESTORED 1 2 3\n"], ["SAVED x y z\n"], ["SAVED 1 2\n"], ["T 5\n"]):

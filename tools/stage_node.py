@@ -657,9 +657,10 @@ class Workers:
         args += ["--pack", m["pack"], "--native", m["native"]] + (["--ple-gguf", m["ple_gguf"]] if m["ple_gguf"] else [])
         args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
-        args += [str(a) for a in c.get("args", [])] + extra
-        if req.get("session_dir") is True:   # (node.json's folder, checked by _refusal: the caller names no path)
-            args += session_args(c) or []
+        args += [str(a) for a in c.get("args", [])]
+        if req.get("session_dir") is True:   # (node.json's folder, checked by _refusal: the caller names no path;
+            args += session_args(c) or []   # before extra: an extra ending in a flag cannot take its value)
+        args += extra
         env = dict(os.environ)
         env.pop("STRATA_STAGE_TOKEN", None)
         env["STRATA_STAGE_TLS"] = str(c["_tls"])

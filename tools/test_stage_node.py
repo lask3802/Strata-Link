@@ -281,6 +281,7 @@ class SessionDirTest(unittest.TestCase):
         self.assertEqual(self.argv_of(w, {"begin": 40}), self.BASE)
         self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": False}), self.BASE)
         self.assertEqual(self.argv_of(self.workers(), {"begin": 40}), self.BASE)   # (no folder in node.json)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "extra": ["--spec", "4"]}), self.BASE + ["--spec", "4"])
 
     def test_on_appends_node_json_folder(self):
         w = self.workers(stage_session_dir=self.SESSIONS)
@@ -290,7 +291,7 @@ class SessionDirTest(unittest.TestCase):
     def test_keep_passed_when_set(self):
         w = self.workers(stage_session_dir=self.SESSIONS, stage_session_keep=6)
         self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": True, "extra": ["--spec", "4"]}),
-                         self.BASE + ["--spec", "4", "--stage-session-dir", self.SESSIONS, "--stage-session-keep", "6"])
+                         self.BASE + ["--stage-session-dir", self.SESSIONS, "--stage-session-keep", "6", "--spec", "4"])
 
     def test_refused_without_the_folder_or_a_bool(self):
         w = self.workers()

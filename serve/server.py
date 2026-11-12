@@ -3169,7 +3169,8 @@ class StrataEngine:
                     raise out_of_step(line) from None
                 heard, allow = time.monotonic(), float(seconds)
                 continue
-            if head == "FATAL":
+            if head == "FATAL":                            # it is ending: not alive from now (a remote main still
+                self.end_for_restart()                     # unpinning would take the next request: settle_stage_exit)
                 raise EngineDied(line[6:].strip() or "the engine ended during a session restore")
             if head == "SERR":
                 parts = line.rstrip("\r\n").split(" ", 3)
@@ -10989,12 +10990,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         print("[strata] session_on_unload is ignored: parallel requests (\"parallel\" / --batch) keep no session "
               "files", flush=True)
     elif sou:
-        try:
-            t = float(cfg.get("session_on_unload_timeout_s") or svc.session_on_unload_timeout_s)
-            if not 0 < t <= UNLOAD_SESSION_WAIT_MAX_S:
-                raise ValueError
-            svc.session_on_unload_timeout_s = t
-        except (TypeError, ValueError):
+        t = cfg.get("session_on_unload_timeout_s")
+        if not isinstance(t, bool) and isinstance(t, (int, float)) and 0 < t <= UNLOAD_SESSION_WAIT_MAX_S:
+            svc.session_on_unload_timeout_s = float(t)
+        elif t is not None:                             # 0, false, true, text, out of range: the default
             print(f"[strata] \"session_on_unload_timeout_s\" in the config is not a number in (0, "
                   f"{UNLOAD_SESSION_WAIT_MAX_S:g}]; using {svc.session_on_unload_timeout_s:g} s", flush=True)
         svc.session_on_unload = True

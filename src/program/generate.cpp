@@ -17387,7 +17387,7 @@ int main(int argc, char** argv) {
                         if (remote_main) {
                             if (!disk_checks.empty() && disk_checks[0].remote_id == 0) disk_checks.clear();
                             const int64_t ckpt_id = disk_checks.empty() ? 0 : disk_checks[0].remote_id;
-                            const int64_t Lc = disk_checks.empty() ? 0 : (int64_t) disk_checks[0].ids.size();
+                            int64_t Lc = disk_checks.empty() ? 0 : (int64_t) disk_checks[0].ids.size();
                             worker_token = strata::core::session_token_new();
                             const int wait = worker_wait(live.size());
                             const auto tw = Clock::now();
@@ -17403,6 +17403,7 @@ int main(int argc, char** argv) {
                                                      "%lld's part (%s): the session file is saved without a checkpoint\n",
                                              (long long) ckpt_id, we.c_str());
                                 disk_checks.clear();
+                                Lc = 0;   // (the log line below names no checkpoint that was not saved)
                                 we.clear();
                                 put = remote_link.session_put(0, (int64_t) live.size(), worker_token, 0, wbytes,
                                                               part_missing, we, wait);
@@ -17507,6 +17508,12 @@ int main(int argc, char** argv) {
                     if (remote_main) {
                         if (strata::core::session_token_zero(worker_token)) {
                             refuse("the file has no remote stage half (it was not saved by a remote main process)");
+                            continue;
+                        }
+                        // (a SAVE writes no empty session; the worker's own "empty session" refusal would come before
+                        // its handler, not as the missing answer, and end this engine below)
+                        if (image.live.ids.empty()) {
+                            refuse("the file holds an empty session");
                             continue;
                         }
                         if (image.checkpoints.size() > 1) {

@@ -368,7 +368,9 @@ class MainReadsTheConfig(unittest.TestCase):
         self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True}).session_on_unload_timeout_s, 120.0)
         self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True,
                                      "session_on_unload_timeout_s": 600}).session_on_unload_timeout_s, 600.0)
-        for bad in ("soon", -5, 3601, "inf", "nan"):              # a warning and the default
+        self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True,
+                                     "session_on_unload_timeout_s": 0.5}).session_on_unload_timeout_s, 0.5)
+        for bad in ("soon", -5, 3601, "inf", "nan", 0, False, True, "x", 4000, "600", float("nan")):   # warning, default
             self.assertEqual(self.start({"slot_save_path": save, "session_on_unload": True,
                                          "session_on_unload_timeout_s": bad}).session_on_unload_timeout_s, 120.0, bad)
         svc = self.start({"slot_save_path": save, "session_on_unload": True, "parallel": 2})

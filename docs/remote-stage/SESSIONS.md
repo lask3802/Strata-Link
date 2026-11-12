@@ -35,14 +35,17 @@ back, and only then writes its own half.
   without `--stage-session-dir`. At start the worker also removes the temporary files a save ended in the middle of
   its write left in the folder (only the exact temporary name of a worker half, `.stage-session-<32 hex>.bin.<16
   hex>.tmp`, regular files, links not followed, and only those not written to for 10 minutes: another worker may share
-  the folder) and says how many.
+  the folder) and says how many. A worker started again right after it was ended in the middle of a save keeps that
+  save's temporary file until a later start.
 - A worker started by the node agent (`tools/stage_node.py`): node.json's `"stage_session_dir"` (an absolute path on
   the worker's PC, checked when the agent starts) and optional `"stage_session_keep"` (1 to 1000000). A `/start` with
   `"session_dir": true` appends `--stage-session-dir <that folder>` (and `--stage-session-keep N` when set) to the
   worker's arguments; the caller never sends a path, and `--stage-session-dir` is not among the flags a `/start` may
   add itself. Without the field the worker's arguments are as before, so an older engine that does not know the
   option still starts. `"session_dir": true` on an agent whose node.json names no folder is refused, as a flag that
-  is not allowed is.
+  is not allowed is. The two flags come before the `/start`'s own extra flags. Every worker the agent starts with
+  `"session_dir"` on one PC uses node.json's one folder, and so shares its keep-N count: N counts the halves of all of
+  them (here one served split uses it).
 - Main process: it reads the bit at every connection. Without it, `SAVE` / `RESTORE` are refused as before ("session
   files do not support --remote-stage").
 - The protocol number stays 8: the new messages go only to a worker that listed the bit. An older main process
@@ -113,8 +116,8 @@ is not kept: the file then has no checkpoint.
 |---|---|---|
 | the worker has no such half, or its half fails a check | invalid (400) | both sides as they were |
 | the link is lost | io (500) | the next request connects again |
-| the worker fails after its checks (its device, its transfer, its checkpoint store), or a failed Commit was pending | the engine ends (`FATAL`, 500) | the server starts it again; the next request reads its prompt from token 0. The worker may have written part of its cells: a checkpoint restores only the running state, so nothing may go on from what is left (as after a failed `ParkRestore`) |
-| the main file is a one-GPU file, or has more than one checkpoint | invalid (400) | as it was |
+| the worker fails after its checks (its device, its transfer, its checkpoint store), or a failed Commit was pending | the engine ends (`FATAL`, 500) | the server ends it at once (a main process still freeing its RAM takes no request) and the next request starts it again and reads its prompt from token 0. The worker may have written part of its cells: a checkpoint restores only the running state, so nothing may go on from what is left (as after a failed `ParkRestore`) |
+| the main file is a one-GPU file, has more than one checkpoint, or holds no tokens | invalid (400) | as it was |
 
 ## The server: `"session_on_unload"`
 
@@ -128,9 +131,9 @@ file, as it does for an image job's file. It works on one GPU too.
   the phase "saving the session".
 - It never stops the unload. A failed save (nothing to save, short of RAM or disk, a worker without
   `--stage-session-dir`) is one log line, and any older `unload-session.bin` is deleted so it is not restored. A save
-  that has not answered in `"session_on_unload_timeout_s"` (default 120, from more than 0 up to 3600; another value is
-  a warning and the default) ends the engine (the two sides cannot be put back in step in the middle of a file, and
-  the unload was about to stop it) and the unload goes on.
+  that has not answered in `"session_on_unload_timeout_s"` (default 120, from more than 0 up to 3600; another value,
+  0, true, false or text among them, is a warning and the default) ends the engine (the two sides cannot be put back
+  in step in the middle of a file, and the unload was about to stop it) and the unload goes on.
 - The unload holds the request queue meanwhile, up to that long: a request waits, and so does a peer server's
   `"before_load"` command that calls this server's `POST /unload` - give it a `"before_load_timeout_s"` longer than
   this server's `"session_on_unload_timeout_s"`.
@@ -211,16 +214,19 @@ Run (no GPU, Windows, MSVC 2022 with CUDA 13.0 headers, `CUDA_VISIBLE_DEVICES=-1
   engine that has no session files; with `--session-save-reclaim` the save goes through the retry with the
   timeout as its deadline (`test_session_save_retry`: the deadline reaches every SAVE and ends the wait for RAM);
   the config keys (`session_on_unload` needs `slot_save_path`, true or false, off with `"parallel"`;
-  `session_on_unload_timeout_s` within (0, 3600], else the default).
+  `session_on_unload_timeout_s` within (0, 3600], else the default: 0, true, false, text, 4000).
+- `test_slots`: a `FATAL` during a restore ends the engine at once (not alive; the next request starts it again).
 - `tools/test_stage_node.py` (`SessionDirTest`): the worker's argv exactly, without the field (also with a folder in
-  node.json), with it, with the keep; refused without a folder or with a field that is not true or false, nothing
-  started; `--stage-session-dir` is not an extra a `/start` may add; node.json's values checked (an empty, relative or
-  non-text folder, a keep without a folder, a keep of 0, `true` or text), and a bad folder stops the agent's start.
+  node.json, and with extra flags), with it, with the keep (before the extra flags); refused without a folder or with
+  a field that is not true or false, nothing started; `--stage-session-dir` is not an extra a `/start` may add;
+  node.json's values checked (an empty, relative or non-text folder, a keep without a folder, a keep of 0, `true` or
+  text), and a bad folder stops the agent's start.
 - Each new check was seen to fail on a mutated build (the reserved-word check, the token check, the keep-N rule and its
   name filter, the token in the header, the layer range check, the read limits' layer count, the explicit-length
   check, the worker's position after a missing half, the Lc check, the failed Commit kept pending by a SessionPut,
   the slow reply's wait, the temporary files' clean-up (its name check, its age check), the SessionPut client's
-  missing answer, the stage agent's `session_dir` argv and refusal, the server's save call, its delete of an older file, its parallel check, its config check, the restore's clear, its
+  missing answer, the stage agent's `session_dir` argv and refusal, the server's end of an engine that said `FATAL`,
+  the server's save call, its delete of an older file, its parallel check, its config check, the restore's clear, its
   deadline: without it the test waits out the announced 3600 s).
 - The tests that passed before pass after it: `conv_cache_test`, `conversation_cache_test`, `conversation_memory_test`,
   `conversation_split_failure_test`, `session_save_reclaim_test`, `split_rules_test`, `split_walk_test`,
@@ -235,8 +241,9 @@ Not run:
 - The main process's SAVE / RESTORE code in `generate.cpp` (it cannot run without a model): checked by review only.
 - `conversation_part_sources` (the worker's state and K/V gathered for the file) needs a device: not run.
 - A Linux (GCC) build of this change, and so the checks that run only there (the files' mode 0600, the folder's 0700).
-- The main process's resend without a checkpoint, its `FATAL` after a failed `SessionGet` and its clearing of the
-  link-made-again and pipelined-window state after a restore (all in `generate.cpp`): checked by review only.
+- The main process's resend without a checkpoint, its `FATAL` after a failed `SessionGet`, its refusal of a file
+  with no tokens before `SessionGet` and its clearing of the link-made-again and pipelined-window state after a
+  restore (all in `generate.cpp`): checked by review only.
 - The keep-N rule's link check: this Windows PC may not make symbolic links, so it was skipped, and the fix it guards
   (links not followed) was not seen to fail without it.
 
