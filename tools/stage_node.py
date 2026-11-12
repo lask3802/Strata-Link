@@ -26,6 +26,9 @@ node.json (paths are this PC's):
                                                    optional: lock the GPU's clocks (MHz) while a worker runs - for a
                                                    Windows worker (see Workers.lock_clocks); needs administrator/root
       "restart": true                              default: start a worker that ended by itself again (Workers.exited)
+      "stage_session_dir": "/srv/stage/sessions",  optional: the folder a worker keeps its half of its main process's
+      "stage_session_keep": 4                      session files in, and how many (docs/remote-stage/SESSIONS.md); a
+                                                   /start with "session_dir": true passes them (the caller names no path)
       "services": {"NAME": {"start": [...], "stop": [...], "status": [...], "timeout_s": 300}}
                                                    optional: commands this PC runs for /service by name - e.g. another
                                                    engine's server that a main process elsewhere switches to.  Only
@@ -52,7 +55,7 @@ out, https://):
                                worker - running, restarts so far, its last exit (code, time) and the next start's time
     POST /start                {"begin": K, "end": K2?, "next": "host:port"?, "port": 7841, "prefill": 5888,
                                 "cache": "auto"|slots, "extra": [...], "model"?: {"dir": D, "native": F, "pack": P,
-                                "profile"?: R, "ple"?: G}}
+                                "profile"?: R, "ple"?: G}, "session_dir"?: true}
                                - stops the worker on that port, starts this one and answers when it listens (or with
                                its log's tail when it exits).  "model" runs a model shipped under data_dir
                                (data_dir/models/D/F, data_dir/packs/P), so one agent serves every model shipped to it
@@ -322,12 +325,33 @@ class Services:
             self.lock.release()
 
 
+def session_args(cfg: dict) -> list[str] | None:
+    """node.json "stage_session_dir" (an absolute path on this PC) and "stage_session_keep" (optional, 1..1000000): the
+    worker's --stage-session-dir / --stage-session-keep for a /start with "session_dir": true, or None when node.json
+    names no folder.  ValueError for a value that is not one.  The folder is this file's alone: a /start names none
+    (no /start flag names a file to write or read)."""
+    d, keep = cfg.get("stage_session_dir"), cfg.get("stage_session_keep")
+    if d is None:
+        if keep is not None:
+            raise ValueError("stage_session_keep needs stage_session_dir")
+        return None
+    if not isinstance(d, str) or not d.strip() or any(ord(ch) < 32 for ch in d) or not os.path.isabs(d):
+        raise ValueError(f"stage_session_dir must be an absolute path on this PC, not {d!r}")
+    out = ["--stage-session-dir", d]
+    if keep is not None:
+        if isinstance(keep, bool) or not isinstance(keep, int) or not 1 <= keep <= 1000000:
+            raise ValueError(f"stage_session_keep must be a whole number from 1 to 1000000, not {keep!r}")
+        out += ["--stage-session-keep", str(keep)]
+    return out
+
+
 def load_config(path: str) -> dict:
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     if cfg.get("token_file"):
         sys.stderr.write("stage_node: node.json's token_file is not used any more (tls_dir instead)\n")
     try:
         cfg["_services"] = check_services(cfg.get("services"))
+        session_args(cfg)
     except ValueError as e:
         sys.exit(f"stage_node: node.json: {e}")
     d = tls_dir(cfg.get("tls_dir"), "stage_node")
@@ -591,7 +615,13 @@ class Workers:
             return {"ok": False, "error": f"flags not allowed here: {bad} (node.json extra_allow)"}
         if (req.get("end") is None) != (req.get("next") is None):
             return {"ok": False, "error": "a relay needs both end and next"}
+        sd = req.get("session_dir", False)
+        if not isinstance(sd, bool):
+            return {"ok": False, "error": "session_dir must be true or false"}
         try:
+            if sd and session_args(self.cfg) is None:
+                return {"ok": False, "error": "session_dir: this PC's node.json names no stage_session_dir (the "
+                                              "folder its workers keep session files in)"}
             self.model(req)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
@@ -628,6 +658,8 @@ class Workers:
         args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
         args += [str(a) for a in c.get("args", [])] + extra
+        if req.get("session_dir") is True:   # (node.json's folder, checked by _refusal: the caller names no path)
+            args += session_args(c) or []
         env = dict(os.environ)
         env.pop("STRATA_STAGE_TOKEN", None)
         env["STRATA_STAGE_TLS"] = str(c["_tls"])

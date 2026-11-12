@@ -244,6 +244,86 @@ class StartCheckTest(unittest.TestCase):
         self.assertIn("both end and next", w.start({"begin": 24, "end": 40})["error"])
 
 
+class SessionDirTest(unittest.TestCase):
+    """node.json "stage_session_dir" / "stage_session_keep" and a /start's "session_dir": true - the worker's
+    --stage-session-dir from node.json only (the caller names no path); without the field the argv is as before."""
+
+    SESSIONS = os.path.abspath(os.sep + "srv-stage-sessions")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.argv = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def workers(self, **extra):
+        return sn.Workers({"exe": "strata", "bind": "127.0.0.1", "pack": "p", "native": "n", "expert_profile": "e",
+                           "ple_gguf": "", "args": ["--kv", "int8"], "_tls": Path(self.tmp.name),
+                           "log_dir": self.tmp.name, "drop_cache": False, **extra})
+
+    def argv_of(self, w, req):
+        """The worker's argv a /start runs (Popen faked: it records the argv and fails, so nothing starts)."""
+        def popen(args, **kw):
+            self.argv = list(args)
+            raise OSError("not started (test)")
+        with mock.patch.object(sn.subprocess, "Popen", side_effect=popen):
+            r = w.start(req)
+        self.assertIn("cannot start the worker", r.get("error", ""), r)
+        return self.argv
+
+    BASE = ["strata", "--serve", "--stage-worker", "7841", "--stage-begin", "40", "--pack", "p", "--native", "n",
+            "--expert-profile", "e", "--expert-cache", "auto", "--prefill", "2048", "--stage-bind", "127.0.0.1",
+            "--kv", "int8"]
+
+    def test_off_without_the_field(self):
+        w = self.workers(stage_session_dir=self.SESSIONS, stage_session_keep=6)
+        self.assertEqual(self.argv_of(w, {"begin": 40}), self.BASE)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": False}), self.BASE)
+        self.assertEqual(self.argv_of(self.workers(), {"begin": 40}), self.BASE)   # (no folder in node.json)
+
+    def test_on_appends_node_json_folder(self):
+        w = self.workers(stage_session_dir=self.SESSIONS)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": True}),
+                         self.BASE + ["--stage-session-dir", self.SESSIONS])
+
+    def test_keep_passed_when_set(self):
+        w = self.workers(stage_session_dir=self.SESSIONS, stage_session_keep=6)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": True, "extra": ["--spec", "4"]}),
+                         self.BASE + ["--spec", "4", "--stage-session-dir", self.SESSIONS, "--stage-session-keep", "6"])
+
+    def test_refused_without_the_folder_or_a_bool(self):
+        w = self.workers()
+        with mock.patch.object(sn.subprocess, "Popen", side_effect=AssertionError("started")):
+            self.assertIn("names no stage_session_dir", w.start({"begin": 40, "session_dir": True})["error"])
+            w = self.workers(stage_session_dir=self.SESSIONS)
+            for bad in ("yes", 1, "/tmp/x", None):
+                self.assertIn("true or false", w.start({"begin": 40, "session_dir": bad})["error"], bad)
+
+    def test_the_flag_is_not_an_extra(self):
+        self.assertNotIn("--stage-session-dir", sn.EXTRA_ALLOWED)
+        w = self.workers(stage_session_dir=self.SESSIONS)
+        self.assertIn("not allowed", w.start({"begin": 40, "extra": ["--stage-session-dir", "/tmp/x"]})["error"])
+
+    def test_config_checked(self):
+        self.assertIsNone(sn.session_args({}))
+        self.assertEqual(sn.session_args({"stage_session_dir": self.SESSIONS, "stage_session_keep": 1}),
+                         ["--stage-session-dir", self.SESSIONS, "--stage-session-keep", "1"])
+        for bad in ({"stage_session_dir": ""}, {"stage_session_dir": "   "}, {"stage_session_dir": "relative/dir"},
+                    {"stage_session_dir": 5}, {"stage_session_dir": self.SESSIONS + "\n"},
+                    {"stage_session_keep": 3},
+                    {"stage_session_dir": self.SESSIONS, "stage_session_keep": 0},
+                    {"stage_session_dir": self.SESSIONS, "stage_session_keep": True},
+                    {"stage_session_dir": self.SESSIONS, "stage_session_keep": "4"}):
+            with self.assertRaises(ValueError, msg=bad):
+                sn.session_args(bad)
+        node = Path(self.tmp.name) / "node.json"
+        node.write_text(json.dumps({"stage_session_dir": "relative", "tls_dir": self.tmp.name}))
+        with self.assertRaises(SystemExit) as got:
+            sn.load_config(str(node))
+        self.assertIn("stage_session_dir", str(got.exception))
+
+
 class ModelTest(unittest.TestCase):
     """/start's "model": a model shipped under data_dir, by plain names."""
 
