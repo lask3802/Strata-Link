@@ -363,6 +363,7 @@ By default the model stays loaded until you close Strata. Three server options, 
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | A command run before the model is loaded again, for example one that unloads another server's model. |
 | | `"before_load_timeout_s": 120` | How long that command may run. When it fails or times out, the free VRAM decides: with `min_free_vram_mib` set and not enough free, the request gets **503** with `Retry-After`; otherwise the model loads with a warning. `"before_load_strict": true` always refuses on a failure; `"before_load_ignore_failure": true` always loads. |
 | | `"after_unload": "cmd"` or `["cmd", "arg"]` | A command run after the engine stopped on an unload (`POST /unload` or the idle unload), for example one that stops a remote stage's worker on its PC. `"after_unload_timeout_s"` (default 300) bounds it; at the timeout the command and what it started are ended. A failure is logged and shown on the Monitor's Model card; the model is unloaded either way. |
+| | `"session_on_unload": true` | Before an unload stops the engine (`POST /unload`, the Monitor's Unload, the idle unload), save the conversation to `<slot_save_path>/unload-session.bin`; the next load restores it and deletes the file. Needs `"slot_save_path"`; off with parallel requests. A failed save, or one not done in 120 s (the engine is then ended), is logged and the unload goes on. On a remote stage the worker needs `--stage-session-dir` ([remote-stage/SESSIONS.md](remote-stage/SESSIONS.md)). |
 
 `POST /unload` unloads now (`409` while a request is running; `?wait=1` waits for the running turn, up to 300 s, or
 `?wait=<seconds>`). `POST /load` loads ahead of a request. Both need `Content-Type: application/json`:
@@ -531,6 +532,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `api_monitor` | off | Records requests for `/api-monitor`. |
 | `lazy_load` | off | Start without loading the model. |
 | `slot_save_path` | none | Enables session files. |
+| `session_on_unload` | off | Saves the conversation before an unload and restores it after the next load (see [Sharing the GPU](#sharing-the-gpu-with-other-programs-optional)). |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
@@ -834,6 +836,10 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 - Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
+- A remote stage (`--remote-stage`) saves and restores them only when its worker runs with `--stage-session-dir DIR`
+  (`--stage-session-keep N`, default 4: the worker keeps its half of the N newest files there). Its file is refused by a
+  one-GPU engine and binds the split; a file older than N saves cannot be restored on it. See
+  [remote-stage/SESSIONS.md](remote-stage/SESSIONS.md); not run on GPUs yet.
 
 ### The web page (Chat, Images, Monitor, About)
 
