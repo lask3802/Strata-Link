@@ -902,7 +902,7 @@ class ServicesTest(unittest.TestCase):
         self.assertEqual(ok, {"rx": {"start": ["a", "b"], "stop": ["c"], "timeout_s": 60.0}})
         self.assertEqual(sn.check_services({"rx": {"status": ["s"]}})["rx"]["timeout_s"], sn.SERVICE_TIMEOUT_S)
         for bad in ([], {"r x": {"start": ["a"]}}, {"rx": ["a"]}, {"rx": {}}, {"rx": {"start": "a"}},
-                    {"rx": {"start": []}}, {"rx": {"start": ["a", 1]}}, {"rx": {"start": ["a"], "timeout_s": 0}},
+                    {"rx": {"start": []}}, {"rx": {"start": ["a", 1]}}, {"rx": {"start": ["a"], "timeout_s": 0}}, {"rx": {"start": ["a"], "timeout_s": 0.5}},
                     {"rx": {"start": ["a"], "timeout_s": 99999}}, {"rx": {"start": ["a"], "timeout_s": True}},
                     {"../x": {"start": ["a"]}}):
             with self.assertRaises(ValueError, msg=repr(bad)):

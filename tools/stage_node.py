@@ -261,7 +261,7 @@ def check_services(value) -> dict:
         if not one:
             raise ValueError(f"services.{name} has none of {', '.join(SERVICE_ACTIONS)}")
         t = s.get("timeout_s", SERVICE_TIMEOUT_S)
-        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= SERVICE_TIMEOUT_MAX_S:
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 1 <= t <= SERVICE_TIMEOUT_MAX_S:
             raise ValueError(f"services.{name}.timeout_s must be 1..{SERVICE_TIMEOUT_MAX_S:g} s")
         one["timeout_s"] = float(t)
         out[name] = one
