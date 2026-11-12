@@ -349,12 +349,13 @@ $("unload-btn").onclick = async () => {
 // GET model-control says which model this server runs and which others this port can serve instead. Unload and Load of
 // this server's model are the header button's (the same checks); a load of another model POSTs model-control, whose
 // command stops this server and starts the other one: the page waits for the port to answer again, then reloads.
-let mc = null, mcSwitch = null;
+let mc = null, mcSwitch = null, mcOff = false;   // mcOff: this server has no card (a 404): no more asking
 const mcLabel = (id) => ((mc && mc.models.find((m) => m.id === id)) || {label: id}).label;
 async function loadModelControl() {
+  if (mcOff) return;
   try {
     const r = await fetch("model-control", {headers: headers()});
-    if (r.status === 404) { mc = null; renderModelCard(); return; }   // a server without the card
+    if (r.status === 404) { mc = null; mcOff = true; renderModelCard(); return; }   // a server without the card
     if (!r.ok) return;
     mc = await r.json();
   } catch (e) { return; }
@@ -428,6 +429,8 @@ $("mc-load").onclick = async () => {
     }
     if (Date.now() - mcSwitch.at > 45 * 60 * 1000) {
       toast("error", "Switch takes too long", "Nothing answers on this port after 45 minutes: look at the switch log.", 15000);
+      mcSwitch = null;
+      renderModelCard();
       return;
     }
     setTimeout(wait, 3000);

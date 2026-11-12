@@ -106,6 +106,17 @@ class AfterUnload(Base):
         self.assertLess(time.time() - t0, 10)
         self.assertIn("after_unload_timeout_s", self.svc.after_unload_result)
 
+    def test_a_timeout_ends_what_the_command_started_too(self):
+        # a script's own children (its curl, a stop it waits for) end with it: none is left to meet the next load
+        mark = self.tmp / "late"
+        child = f"import time; time.sleep(3); open({str(mark)!r}, 'w').close()"
+        self.svc.after_unload = [PY, "-c", f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"]
+        self.svc.after_unload_timeout_s = 0.5
+        self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertIn("after_unload_timeout_s", self.svc.after_unload_result)
+        time.sleep(5)
+        self.assertFalse(mark.exists(), "the command's child outlived its timeout")
+
     def test_the_idle_unload_runs_it_too(self):
         mark = self.tmp / "ran"
         self.svc.after_unload = [PY, "-c", f"open({str(mark)!r}, 'w').close()"]
@@ -159,7 +170,9 @@ class ModelControl(Base):
              "log": str(self.tmp / "switch.out")})
 
     def test_off_by_default(self):
-        self.assertEqual(self.req("/model-control")[2], {"enabled": False})
+        s, _, b = self.req("/model-control")                # off: a 404, as before the card existed
+        self.assertEqual(s, 404)
+        self.assertIn("model_control", b["error"]["message"])
         s, _, b = self.req("/model-control", {"model": "deepseek"})
         self.assertEqual(s, 404)
         self.assertIn("model_control", b["error"]["message"])
@@ -208,10 +221,39 @@ class ModelControl(Base):
         self.assertEqual(self.req("/model-control", ["deepseek"])[0], 400)
         with self.svc.fifo:                                                               # a request runs
             self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 409)
+        for key in ("busy", "queued"):                                     # one waits for the fifo / is admitted
+            with self.svc.status_lock:
+                old = self.svc.status.get(key)
+                self.svc.status[key] = 1
+            try:
+                self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 409, key)
+            finally:
+                with self.svc.status_lock:
+                    self.svc.status[key] = old
         self.assertEqual(self.req("/model-control", {"model": "deepseek"}, {"Content-Type": "text/plain"})[0], 415)
         self.assertEqual(self.req("/model-control", {"model": "deepseek"}, {"Origin": "https://example.com"})[0], 403)
         self.assertIsNone(self.svc.switching)
         self.assertFalse(self.args.exists())
+
+    def test_the_command_runs_in_a_session_of_its_own(self):
+        # it stops this server: it must not be in its process group (a stop that signals the group would end it)
+        from unittest import mock
+        import serve.server as server
+        self.configure("pass")
+        real = server.subprocess.Popen
+        seen = {}
+
+        def popen(cmd, **kw):
+            seen.update(kw)
+            return real(cmd, **kw)
+        with mock.patch.object(server.subprocess, "Popen", popen):
+            self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 202)
+        if server.os.name == "nt":
+            self.assertTrue(seen["creationflags"] & server.subprocess.DETACHED_PROCESS)
+        else:
+            self.assertIs(seen.get("start_new_session"), True)
+        self.assertIs(seen.get("close_fds"), True)
+        self.assertTrue(wait_for(lambda: self.svc.switching is None))
 
     def test_a_command_that_cannot_run(self):
         self.svc.model_control = model_control_setting(
@@ -227,6 +269,69 @@ class ModelControl(Base):
         self.assertEqual(self.req("/model-control")[0], 401)
         self.assertEqual(self.req("/model-control", {"model": "deepseek"})[0], 401)
         self.assertEqual(self.req("/model-control", None, {"Authorization": "Bearer k"})[0], 200)
+
+
+class MainReadsTheConfig(unittest.TestCase):
+    """server.main: the run config's after_unload, after_unload_timeout_s and model_control reach the Service, a bad
+    model_control stops the start, --offline refuses both."""
+
+    def start(self, extra, argv=()):
+        from unittest import mock
+        import serve.server as server
+        from tools.strata_tokenizer import BYTE_TO_UNICODE
+
+        class Served(Exception):
+            pass
+        root = Path(tempfile.mkdtemp())
+        tok = root / "tokenizer"
+        tok.mkdir()
+        tokens = [BYTE_TO_UNICODE[i] for i in range(256)] + ["ab", "<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+        (tok / "vocab.json").write_text(json.dumps({t: i for i, t in enumerate(tokens)}))
+        (tok / "merges.txt").write_text("a b")
+        (tok / "token_type.json").write_text(json.dumps([0] * 257 + [3, 3, 3]))
+        config = root / "run.json"
+        config.write_text(json.dumps({"exe": "engine/strata", "cwd": str(root), "tokenizer": str(tok), "args": [],
+                                      **extra}))
+        got = {}
+
+        def serve_(svc, **kw):
+            got["svc"] = svc
+            raise Served
+
+        def engine(*a, **kw):                                # a fake engine: nothing is started
+            e = UnloadableEngine(ByteTokenizer(), "ok", max_context=CTX)
+            e.info, e.spawn = {}, (a[0] if a else "strata", list(a[1]) if len(a) > 1 else [])
+            return e
+        with mock.patch.object(server, "serve", serve_), mock.patch.object(server, "StrataEngine", engine):
+            try:
+                server.main(["--engine", "strata", "--config", str(config), "--port", "0", "--lazy", *argv])
+            except Served:
+                pass
+        return got.get("svc")
+
+    def test_the_keys_reach_the_service(self):
+        svc = self.start({"after_unload": ["x", "down"], "after_unload_timeout_s": 42,
+                          "model_control": {"this": "deepseek", "models": MODELS, "switch": ["s", "to"]}})
+        self.assertIsNotNone(svc, "server.main did not get to serve()")
+        self.assertEqual((svc.after_unload, svc.after_unload_timeout_s, svc.model_control["this"]),
+                         (["x", "down"], 42.0, "deepseek"))
+
+    def test_absent_keys_leave_it_off(self):
+        svc = self.start({})
+        self.assertEqual((svc.after_unload, svc.after_unload_timeout_s, svc.model_control), (None, 300.0, None))
+
+    def test_a_bad_timeout_keeps_the_default(self):
+        for bad in ("soon", -5):
+            self.assertEqual(self.start({"after_unload_timeout_s": bad}).after_unload_timeout_s, 300.0, bad)
+
+    def test_a_bad_model_control_stops_the_start(self):
+        with self.assertRaises(SystemExit):
+            self.start({"model_control": {"this": "x", "models": MODELS}})
+
+    def test_offline_refuses_them(self):
+        for extra in ({"after_unload": ["x"]}, {"model_control": {"this": "deepseek", "models": MODELS, "switch": ["s"]}}):
+            with self.assertRaises(SystemExit):
+                self.start(extra, ["--offline"])
 
 
 if __name__ == "__main__":

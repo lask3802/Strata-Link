@@ -362,7 +362,7 @@ By default the model stays loaded until you close Strata. Three server options, 
 | `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | Load an unloaded model only when that much VRAM is free (it waits up to 15 s for memory being given back). Otherwise answer **503** "the GPU is in use by another program". With several GPUs it checks the first one. |
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | A command run before the model is loaded again, for example one that unloads another server's model. |
 | | `"before_load_timeout_s": 120` | How long that command may run. When it fails or times out, the free VRAM decides: with `min_free_vram_mib` set and not enough free, the request gets **503** with `Retry-After`; otherwise the model loads with a warning. `"before_load_strict": true` always refuses on a failure; `"before_load_ignore_failure": true` always loads. |
-| | `"after_unload": "cmd"` or `["cmd", "arg"]` | A command run after the engine stopped on an unload (`POST /unload` or the idle unload), for example one that stops a remote stage's worker on its PC. `"after_unload_timeout_s"` (default 300) bounds it. A failure is logged and shown on the Monitor's Model card; the model is unloaded either way. |
+| | `"after_unload": "cmd"` or `["cmd", "arg"]` | A command run after the engine stopped on an unload (`POST /unload` or the idle unload), for example one that stops a remote stage's worker on its PC. `"after_unload_timeout_s"` (default 300) bounds it; at the timeout the command and what it started are ended. A failure is logged and shown on the Monitor's Model card; the model is unloaded either way. |
 
 `POST /unload` unloads now (`409` while a request is running; `?wait=1` waits for the running turn, up to 300 s, or
 `?wait=<seconds>`). `POST /load` loads ahead of a request. Both need `Content-Type: application/json`:
@@ -396,7 +396,7 @@ with its checks), and Load of another model that this port can serve instead:
                   "log": "/srv/strata/model-switch/switch.out"}
 ```
 
-`GET /model-control` answers the list, whether the model is loaded, a switch under way and the last after_unload
+Without it `GET /model-control` answers **404**, as before. With it, `GET /model-control` answers the list, whether the model is loaded, a switch under way and the last after_unload
 result. `POST /model-control` with `{"model": "deepseek"}` (JSON from Strata's own page, as `/unload`) runs `switch`
 plus the id in a session of its own and answers **202**. It answers **409** while a request runs or waits or a switch
 is under way, **400** for this server's own model (use `/load`), and **404** for an unknown id. The command belongs to

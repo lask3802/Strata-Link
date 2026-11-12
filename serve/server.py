@@ -5140,7 +5140,7 @@ class Service:
         # machine can serve on this port instead; a switch runs the configured command, which stops this server
         self.model_control = None
         self.switching = None                            # {"to": id, "at": time, "pid": n} once a switch started
-        self.vram_reserve = None                        # #533: the last POST /v1/vram reserve (None: the start's)
+        self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.vision_no_shrink = False                    # the engine said its cache never shrinks (no --vram-elastic)
@@ -5919,12 +5919,25 @@ class Service:
         print(f"[strata] after unloading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
         why = None
         try:
-            r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.after_unload_timeout_s,
-                               stdin=subprocess.DEVNULL)
-            if r.returncode != 0:
-                why = f"it exited with code {r.returncode}"
-        except subprocess.TimeoutExpired:
-            why = f"it did not finish in {self.after_unload_timeout_s:g} s (after_unload_timeout_s)"
+            # its own process group: a timeout ends what it started too (a script's curl, its own children), so a
+            # stop still running cannot meet the next load's before_load
+            kw = {"start_new_session": True} if os.name != "nt" else \
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            p = subprocess.Popen(cmd, shell=isinstance(cmd, str), stdin=subprocess.DEVNULL, **kw)
+            try:
+                rc = p.wait(timeout=self.after_unload_timeout_s)
+                if rc != 0:
+                    why = f"it exited with code {rc}"
+            except subprocess.TimeoutExpired:
+                why = f"it did not finish in {self.after_unload_timeout_s:g} s (after_unload_timeout_s)"
+                try:
+                    if os.name != "nt":
+                        os.killpg(p.pid, signal.SIGKILL)
+                    else:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, timeout=30)
+                except (OSError, subprocess.SubprocessError):
+                    p.kill()
+                p.wait()
         except (OSError, subprocess.SubprocessError) as e:
             why = f"it could not run ({e})"
         self.after_unload_result = "ok" if why is None else why
@@ -8600,7 +8613,10 @@ def make_handler(svc: Service):
                 return
             if path == "/model-control":                     # the Monitor's model card (opt-in "model_control")
                 if self._authorized():
-                    self._json(200, svc.model_control_view())
+                    if svc.model_control:
+                        self._json(200, svc.model_control_view())
+                    else:                                    # off: as before the card existed
+                        self._json(404, {"error": {"message": "model switching is off (no \"model_control\")"}})
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -10869,8 +10885,15 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
     try:
+        t = float(cfg.get("after_unload_timeout_s") or svc.after_unload_timeout_s)
+        if not t > 0:
+            raise ValueError
+        svc.after_unload_timeout_s = t
+    except (TypeError, ValueError):
+        print("[strata] \"after_unload_timeout_s\" in the config is not a positive number; using "
+              f"{svc.after_unload_timeout_s:g} s", flush=True)
+    try:
         svc.after_unload = after_unload_setting(cfg.get("after_unload"))
-        svc.after_unload_timeout_s = float(cfg.get("after_unload_timeout_s") or svc.after_unload_timeout_s)
         svc.model_control = model_control_setting(cfg.get("model_control"))
     except (TypeError, ValueError) as e:
         raise SystemExit(f"[strata] config: {e}")
