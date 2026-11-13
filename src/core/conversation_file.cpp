@@ -975,6 +975,8 @@ std::string session_free_space_dir(const std::string& path, bool windows_rules) 
     return p.substr(0, cut + 1);   // with its trailing backslash: "\\server\share\dir\", "C:\"
 }
 
+bool session_free_bytes(const std::string& path, uint64_t& out) { return free_space(path, out); }
+
 std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     std::vector<SessionModelFile> f;
     for (size_t i = 0; i < in.native_shards.size(); ++i) f.push_back({"native shard " + std::to_string(i), in.native_shards[i]});

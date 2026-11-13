@@ -15,6 +15,7 @@ import os
 import queue
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -146,12 +147,15 @@ class SessionOnUnload(unittest.TestCase):
 
     def test_a_failed_save_does_not_stop_the_unload(self):
         Path(self.path).write_bytes(b"old")              # an older file is not restored either
+        temp = Path(self.dir.name) / f".{UNLOAD_SESSION_FILE}.0123456789abcdef.tmp"
+        temp.write_bytes(b"part")                        # an engine still in step removes its own: not the server's
         self.engine.fail = True                          # SERR invalid: nothing to save
         self.assertEqual(self.svc.unload(), "unloaded")
         self.assertEqual(self.sent(), [f"SAVE {self.path}\n"])
         self.assertTrue(self.engine.unloaded)
         self.assertIsNone(self.svc.restore_after_load)
         self.assertFalse(os.path.exists(self.path))
+        self.assertTrue(temp.exists())
         self.assertFalse(self.svc.status["busy"])
         self.engine.fail = False
         with self.svc.fifo:
@@ -162,12 +166,24 @@ class SessionOnUnload(unittest.TestCase):
         # a step announced for an hour (a remote stage's worker writing its half), and then nothing
         self.engine.script = ["SWAIT worker 3600\n"]
         self.svc.session_on_unload_timeout_s = 0.5
+        # the hidden temporary file the ended engine's write left (removed), and a /slots save's (not touched)
+        left = Path(self.dir.name) / f".{UNLOAD_SESSION_FILE}.0123456789abcdef.tmp"
+        other = Path(self.dir.name) / ".chat.bin.0123456789abcdef.tmp"
+        left.write_bytes(b"part")
+        other.write_bytes(b"part")
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.svc.unload()), daemon=True)
         t0 = time.monotonic()
-        self.assertEqual(self.svc.unload(), "unloaded")
+        t.start()
+        t.join(timeout=20)                               # (without the deadline it would wait the hour: fail fast)
+        self.assertFalse(t.is_alive(), "the save was not given up at its deadline")
+        self.assertEqual(got, ["unloaded"])
         self.assertLess(time.monotonic() - t0, 10)
         self.assertTrue(self.engine.ended, "the engine was ended (it cannot be put back in step mid-file)")
         self.assertIsNone(self.svc.restore_after_load)
         self.assertFalse(self.svc.status["busy"])
+        self.assertFalse(left.exists(), "the ended save's temporary file is removed")
+        self.assertTrue(other.exists(), "another name's temporary file is left alone")
 
     def test_with_session_save_reclaim_the_save_is_retried_within_the_timeout(self):
         from unittest import mock

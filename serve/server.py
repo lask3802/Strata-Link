@@ -3129,15 +3129,17 @@ class StrataEngine:
         while True:
             limit = max(silence, allow)
             left = limit - (time.monotonic() - heard) if silence > 0 else None
+            by_deadline = False                             # the deadline, not the silence bound, sets this wait
             if deadline is not None:
                 cap = deadline - time.monotonic()
+                by_deadline = left is None or cap <= left
                 left = cap if left is None else min(left, cap)
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
                 line = self.lines.get(timeout=left)
             except queue.Empty:
-                if deadline is not None and time.monotonic() >= deadline:
+                if by_deadline:                             # (also when the wait woke a little early)
                     self.end_for_restart()
                     raise EngineDied(f"the session {action} did not finish in time; the server ended the engine") from None
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
@@ -5979,6 +5981,9 @@ class Service:
                   "prompt again", flush=True)
             with contextlib.suppress(OSError):          # (an older file, or one a failed save published: not restored)
                 os.unlink(path)
+            alive = getattr(self.engine, "alive", None)
+            if callable(alive) and not alive():         # ended in the middle of its write (the deadline, a FATAL):
+                self._drop_unload_temps()               # its hidden temporary file is nobody's now
             return
         finally:
             with self.status_lock:
@@ -5986,6 +5991,25 @@ class Service:
         self.restore_after_load, self.restore_after_load_from = path, "the unload"
         print(f"[strata] the conversation ({r.get('tokens')} tokens, {r.get('bytes')} bytes) saved in "
               f"{float(r.get('ms') or 0) / 1000:.1f} s before the unload; the next load restores it", flush=True)
+
+    def _drop_unload_temps(self) -> None:
+        """The temporary files an ended engine's save of unload-session.bin left in slot_save_path (the engine names
+        them .<name>.<16 hex>.tmp beside the file and removes its own unless it is ended first).  Only that one name's:
+        a /slots save's temporary files are not touched."""
+        pat = re.compile(r"\." + re.escape(UNLOAD_SESSION_FILE) + r"\.[0-9a-f]{16}\.tmp")
+        gone = 0
+        try:
+            names = os.listdir(self.slot_save_path)
+        except OSError:
+            return
+        for name in names:
+            if pat.fullmatch(name):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(self.slot_save_path, name))
+                    gone += 1
+        if gone:
+            print(f"[strata] removed {gone} temporary file{'s' if gone > 1 else ''} the ended save left in "
+                  f"{self.slot_save_path}", flush=True)
 
     def run_after_unload(self) -> None:
         """The after_unload command (opt-in), once the engine has stopped.  Its failure is logged and kept in
@@ -10966,14 +10990,18 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
-    try:
-        t = float(cfg.get("after_unload_timeout_s") or svc.after_unload_timeout_s)
-        if not 0 < t <= 86400:                          # (a day at most: a huge wait is no wait on some systems)
-            raise ValueError
-        svc.after_unload_timeout_s = t
-    except (TypeError, ValueError):
-        print("[strata] \"after_unload_timeout_s\" in the config is not a positive number; using "
-              f"{svc.after_unload_timeout_s:g} s", flush=True)
+    t = cfg.get("after_unload_timeout_s")
+    if t is not None:                                   # 0, true and false too: a warning and the default
+        try:
+            if isinstance(t, bool):
+                raise ValueError
+            t = float(t)
+            if not 0 < t <= 86400:                      # (a day at most: a huge wait is no wait on some systems)
+                raise ValueError
+            svc.after_unload_timeout_s = t
+        except (TypeError, ValueError):
+            print("[strata] \"after_unload_timeout_s\" in the config is not a positive number; using "
+                  f"{svc.after_unload_timeout_s:g} s", flush=True)
     try:
         svc.after_unload = after_unload_setting(cfg.get("after_unload"))
         svc.model_control = model_control_setting(cfg.get("model_control"))

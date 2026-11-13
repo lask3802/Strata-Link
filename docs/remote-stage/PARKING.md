@@ -294,8 +294,9 @@ Where the code differs from the design above, or says more than it:
   is the one the design gives.
 - `remote_relink` drops the parked conversations only when parking was asked for; without it the cache is empty
   anyway (forced to 0 MiB), so the default path is unchanged.
-- The main process refuses to start when `(--conversation-cache-slots + 1) x (--prompt-cache + 1)` passes 64 (the
-  worker's checkpoint store): the defaults (4 slots, `--prompt-cache 6`) need 35.
+- When `(--conversation-cache-slots + 1) x (--prompt-cache + 1)` passes 64 (the worker's checkpoint store), parking
+  is off with one line and the main process starts without it (a remote main ignored `--conversation-cache-mib` before
+  parking, so such a config started then too): the defaults (4 slots, `--prompt-cache 6`) need 35.
 - The main process also skips a park from a `--batch` slot (its state is not the worker's session) and after its last
   pipelined window failed. The id counter stops parks at `INT32_MAX`; the checkpoint counter has no such stop (as
   before this change: 2^31 checkpoints in one process).

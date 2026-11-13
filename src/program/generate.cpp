@@ -4328,14 +4328,16 @@ int main(int argc, char** argv) {
                                  "boundaries only (--prompt-cache-every and --prompt-cache-tail are off)\n",
                          o.prompt_cache);
         // the ids a parking main process may hold on the worker: the chain and each parked conversation's checkpoints,
-        // plus one park each, must fit in one keep[] (kStageKeepMax) and the worker's checkpoint store (kStageCkptMax)
+        // plus one park each, must fit in one keep[] (kStageKeepMax) and the worker's checkpoint store (kStageCkptMax).
+        // Too many: parking off with one line, the server still starts (a remote main ignored --conversation-cache-mib
+        // before parking, so a config with it and a large --prompt-cache started then, and starts now)
         if (remote_park_asked &&
             ((int64_t) o.conversation_cache_slots + 1) * (o.prompt_cache + 1) > strata::net::kStageCkptMax) {
-            std::fprintf(stderr, "strata generate: remote stage: %d parked conversations of up to %d checkpoints "
-                                 "each need more checkpoint parts than a worker keeps (%d): lower "
-                                 "--conversation-cache-slots or --prompt-cache\n",
+            std::fprintf(stderr, "strata generate: remote stage: conversation parking is off: %d parked conversations "
+                                 "of up to %d checkpoints each need more checkpoint parts than a worker keeps (%d) "
+                                 "(lower --conversation-cache-slots or --prompt-cache to turn it on)\n",
                          o.conversation_cache_slots, o.prompt_cache + 1, strata::net::kStageCkptMax);
-            return 2;
+            remote_park_asked = false;
         }
         if (remote_park_asked)
             std::fprintf(stderr, "strata generate: remote stage: up to %d parked conversations in %lld MiB here, the "
@@ -17384,6 +17386,26 @@ int main(int argc, char** argv) {
                         // without goes to disk without a checkpoint); a failure there publishes nothing.  This file
                         // records the token; a worker half whose main file then fails is an orphan its keep-N removes.
                         strata::core::SessionToken worker_token{};
+                        if (remote_main && o.session_min_free_mib > 0) {
+                            // this side's disk before the worker writes: a main file refused for space after the
+                            // worker's half would leave an orphan there, and its keep-N would push out a valid half.
+                            // (The reserve only: the file's own size is known once it is captured, so a disk between
+                            // the reserve and reserve + file still ends in an orphan the next keep-N removes.)
+                            const uint64_t reserve = (uint64_t) o.session_min_free_mib << 20;
+                            uint64_t avail = 0;
+                            if (!strata::core::session_free_bytes(path, avail)) {
+                                refuse("session file: cannot read the free disk space for " + path,
+                                       strata::core::SessionError::io);
+                                continue;
+                            }
+                            if (avail <= reserve) {
+                                refuse("session file: not enough disk space (a reserve of " +
+                                       std::to_string(reserve >> 20) + " MiB needed, " + std::to_string(avail >> 20) +
+                                       " MiB free); the remote stage's half was not saved",
+                                       strata::core::SessionError::storage);
+                                continue;
+                            }
+                        }
                         if (remote_main) {
                             if (!disk_checks.empty() && disk_checks[0].remote_id == 0) disk_checks.clear();
                             const int64_t ckpt_id = disk_checks.empty() ? 0 : disk_checks[0].remote_id;

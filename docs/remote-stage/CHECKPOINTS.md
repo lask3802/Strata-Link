@@ -63,7 +63,8 @@ Out (forced off or refused in remote mode, each with a stderr line):
   under a park id. Since built as an opt-in: [PARKING.md](PARKING.md) (an explicit `--conversation-cache-mib N` with
   `--prompt-cache N`, and a worker that lists `kStageCapPark`; without them, as above).
 - Session files: refused with a remote stage (the existing guard checks `stages`/`multi_gpu`, which a remote main has
-  neither of).
+  neither of). Since built as an opt-in: [SESSIONS.md](SESSIONS.md) (a worker started with `--stage-session-dir`;
+  without it, as above).
 
 ## Protocol (kStageProtocol 5 -> 6)
 

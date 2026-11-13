@@ -739,6 +739,9 @@ int main() {
         check(session_free_space_dir("/a/b/chat.bin", false) == "/a/b", "free space: POSIX folder");
         check(session_free_space_dir("/chat.bin", false) == "/", "free space: POSIX root");
         check(session_free_space_dir("chat.bin", false) == ".", "free space: POSIX bare name");
+        uint64_t free_bytes = 0;   // the volume of a file to be written in `dir` (a remote main's check before SAVE)
+        check(session_free_bytes((dir / "not-yet.bin").string(), free_bytes) && free_bytes > 0,
+              "free space: read for a file not written yet");
     }
 #ifndef _WIN32
     // what restore will not open: a symbolic link, a hard-linked file, a FIFO, a directory

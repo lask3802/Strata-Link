@@ -185,7 +185,7 @@ class Main:
 
     def config(self, splits: list[int], chunk: int, first: Node, timing: bool, max_context: int, extra=()) -> dict:
         args = list(self.base["args"])
-        if "--conversation-cache-mib" in args:   # the remote stage turns it off; say so in the config too
+        if "--conversation-cache-mib" in args:   # parking (docs/remote-stage/PARKING.md) is not what is tuned: off
             i = args.index("--conversation-cache-mib")
             del args[i:i + 2]
         args = with_arg(args, "--prefill", str(chunk))

@@ -256,6 +256,8 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
+// The free bytes of the volume `path` would be written to (this PC's rules, the folder above); false when unreadable.
+bool session_free_bytes(const std::string& path, uint64_t& out);
 
 // ---- A remote stage worker's half of a session file (docs/remote-stage/SESSIONS.md): its own layers' K/V of cells
 // [0, L), its running state at L and, when the main process's file keeps a checkpoint at Lc, its running state at Lc.
@@ -280,7 +282,7 @@ struct StageSessionImage {
 // "stage-session-<32 hex>.bin"
 std::string stage_session_file_name(const SessionToken& token);
 // Writes `image` (its K/V from `sources` when given, else from image.kv) to `path`.  Refused before any disk access:
-// a zero token, L < 1, Lc > L, a checkpoint state with Lc 0.
+// a zero token, L < 1, Lc > L, layer-split state.  With Lc 0 image.ckpt is not written (the file has no checkpoint).
 bool stage_session_write(const std::string& path, const StageSessionImage& image,
                          const std::vector<SessionKvSource>* sources, const SessionFileIdentity& id, size_t& bytes,
                          std::string& error, const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);

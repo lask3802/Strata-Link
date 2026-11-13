@@ -87,8 +87,9 @@ Two messages, synchronous with a reply. The payload starts with the token (two u
 
 ## Save
 
-1. The main process's usual checks (a complete session, `--prompt-cache` > 0, RAM for its own half), and two more on a
-   remote main: the link is alive, and the last pipelined window did not fail.
+1. The main process's usual checks (a complete session, `--prompt-cache` > 0, RAM for its own half), and three more on
+   a remote main: the link is alive, the last pipelined window did not fail, and its own disk has more than the
+   `--session-min-free-mib` reserve free.
 2. A new token. `SessionPut`: the worker writes `DIR/stage-session-<32 hex digits>.bin` (temporary file, then rename;
    the K/V goes from its pools into the file 16 MiB at a time, with no host copy of it), then deletes the oldest
    halves past `--stage-session-keep`. A failure here publishes nothing on either side. When the worker no longer
@@ -267,8 +268,12 @@ Where the code differs from the design it was built from, or says more than it:
 - The worker streams its K/V to disk on a save (no host copy) but reads its whole half into RAM on a restore.
 - A temporary file left by a worker ended in the middle of a write is removed at the worker's next start, once it is
   10 minutes old; a worker half whose main file was never written is deleted by the keep-N rule. On the main PC, when
-  the server's bound ends the engine during its write, its hidden temporary file stays in `slot_save_path`, up to the
-  size of a session file, until someone deletes it.
+  the engine is ended during the save before an unload (the server's bound, a `FATAL`), the server deletes the
+  hidden temporary files of `unload-session.bin` (`.unload-session.bin.<16 hex>.tmp`, that name only) in
+  `slot_save_path`; a `/slots` save's temporary file left by an ended engine stays until someone deletes it.
+- Before `SessionPut` a remote main checks its own disk against `--session-min-free-mib` (the reserve alone: the
+  main file's size is known only once it is captured), so a full disk on the main PC refuses the save (`storage`)
+  without a worker half; a disk between the reserve and the reserve plus the file still leaves an orphan half.
 - The server's bound on the save (`"session_on_unload_timeout_s"`, default 120) ends the engine at the bound
   instead of waiting for it.
 - A failed save before an unload deletes an older `unload-session.bin`, also one a failed save had already published.

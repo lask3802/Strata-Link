@@ -351,7 +351,7 @@ class MainReadsTheConfig(unittest.TestCase):
         self.assertEqual((svc.after_unload, svc.after_unload_timeout_s, svc.model_control), (None, 300.0, None))
 
     def test_a_bad_timeout_keeps_the_default(self):
-        for bad in ("soon", -5, "inf", "nan", 1e300):
+        for bad in ("soon", -5, "inf", "nan", 1e300, 0, True, False):   # (true was 1 s, 0 the default silently)
             self.assertEqual(self.start({"after_unload_timeout_s": bad}).after_unload_timeout_s, 300.0, bad)
 
     def test_session_on_unload(self):
