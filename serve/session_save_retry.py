@@ -37,16 +37,20 @@ def retryable(action, error) -> bool:
             and required_mib(error) is not None)
 
 
-def session_file(service, action, path, refused_type):
-    """Called only when --session-save-reclaim is enabled; never changes RESTORE."""
+def session_file(service, action, path, refused_type, deadline=None):
+    """Called only when --session-save-reclaim is enabled; never changes RESTORE.  `deadline` (time.monotonic(), the
+    save before an unload): passed to every SAVE, and the wait for RAM ends there too."""
     engine = service.engine
     process = getattr(engine, 'proc', None)
+    kw = {} if deadline is None else {'deadline': deadline}
     try:
-        return engine.session_file(action, path)
+        return engine.session_file(action, path, **kw)
     except refused_type as error:
         if not retryable(action, error) or process is None:
             raise
-        deadline = time.monotonic() + SETTLE_SECONDS
+        settle_end = time.monotonic() + SETTLE_SECONDS
+        if deadline is not None:
+            settle_end = min(settle_end, deadline)
         last_error = error
 
         def same_process():
@@ -60,7 +64,7 @@ def session_file(service, action, path, refused_type):
               f'need={required_mib(error)} MiB, limit={SETTLE_SECONDS:g}s; floor unchanged', flush=True)
         for attempt in range(MAX_RETRIES):
             while True:
-                if not same_process() or time.monotonic() >= deadline:
+                if not same_process() or time.monotonic() >= settle_end:
                     raise last_error
                 available = available_mib()
                 needed = required_mib(last_error)
@@ -68,17 +72,17 @@ def session_file(service, action, path, refused_type):
                     raise last_error
                 if available >= needed:
                     break
-                time.sleep(max(0.0, min(POLL_SECONDS, deadline - time.monotonic())))
+                time.sleep(max(0.0, min(POLL_SECONDS, settle_end - time.monotonic())))
             # No replacement, restart, or blind retry when telemetry is unknown.
             if not same_process():
                 raise last_error
             try:
-                return engine.session_file(action, path)
+                return engine.session_file(action, path, **kw)
             except refused_type as failure:
                 if not retryable(action, failure):
                     raise
                 last_error = failure
-                if attempt + 1 == MAX_RETRIES or time.monotonic() >= deadline:
+                if attempt + 1 == MAX_RETRIES or time.monotonic() >= settle_end:
                     raise
-                time.sleep(max(0.0, min(POLL_SECONDS, deadline - time.monotonic())))
+                time.sleep(max(0.0, min(POLL_SECONDS, settle_end - time.monotonic())))
         raise last_error

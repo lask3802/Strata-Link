@@ -80,7 +80,7 @@ function showTab(name) {
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
-  if (tab === "monitor") loadMcp();
+  if (tab === "monitor") { loadMcp(); loadModelControl(); }
   if (tab === "about") loadConfig();
   if (lastMetrics) render(lastMetrics);
 }
@@ -198,6 +198,7 @@ async function poll() {
       lastMetrics = m;
       metricsFailures = 0;
       render(lastMetrics);
+      if (mc) renderModelCard();
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
@@ -205,6 +206,7 @@ async function poll() {
     if (++metricsFailures === 3) setPill("error", tr("pill.unreachable", "Server not reachable"));
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
+  if (tab === "monitor" && mcpTick % 5 === 0) loadModelControl();   // the model card: every 5 s
   setTimeout(poll, 1000);
 }
 
@@ -341,6 +343,99 @@ $("unload-btn").onclick = async () => {
     modelOp = null;
     if (lastMetrics) render(lastMetrics); else modelButton({});
   }
+};
+
+// ------------------------------------------------------------------ Model card (the Monitor; opt-in "model_control")
+// GET model-control says which model this server runs and which others this port can serve instead. Unload and Load of
+// this server's model are the header button's (the same checks); a load of another model POSTs model-control, whose
+// command stops this server and starts the other one: the page waits for the port to answer again, then reloads.
+let mc = null, mcSwitch = null, mcOff = false;   // mcOff: this server has no card (a 404): no more asking
+const mcLabel = (id) => ((mc && mc.models.find((m) => m.id === id)) || {label: id}).label;
+async function loadModelControl() {
+  if (mcOff) return;
+  try {
+    const r = await fetch("model-control", {headers: headers()});
+    if (r.status === 404) { mc = null; mcOff = true; renderModelCard(); return; }   // a server without the card
+    if (!r.ok) return;
+    mc = await r.json();
+  } catch (e) { return; }
+  if (mcSwitch && !mcSwitch.lost && !mc.switching && Date.now() - mcSwitch.at > 20000) {
+    // the command ended and this server still runs: the switch did not happen (or went back)
+    mcSwitch = null;
+    toast("error", "Switch failed", "This server still runs. The switch command's log says why.", 8000);
+  }
+  renderModelCard();
+}
+function renderModelCard() {
+  const card = $("mc-card");
+  card.hidden = !(mc && mc.enabled);
+  if (card.hidden) return;
+  const sel = $("mc-model");
+  const ids = mc.models.map((m) => m.id).join("\n");
+  if (sel.dataset.ids !== ids) {
+    sel.dataset.ids = ids;
+    sel.innerHTML = mc.models.map((m) => `<option value="${esc(m.id)}">${esc(m.label)}${m.id === mc.this ? " (this server)" : ""}</option>`).join("");
+    sel.value = mc.this;
+  }
+  const live = (lastMetrics && lastMetrics.live) || {};
+  const unloaded = live.state === "unloaded";
+  const switching = mcSwitch || mc.switching;
+  const other = sel.value !== mc.this;
+  $("mc-state").textContent = switching ? `Switching to ${mcLabel(switching.to)}…`
+    : `${mcLabel(mc.this)} · ${modelOp === "load" ? "loading…" : modelOp === "unload" ? "unloading…" : unloaded ? "unloaded" : live.state ? "loaded" : "…"}`;
+  $("mc-load").textContent = other ? "Switch and load" : "Load";
+  const blocked = Boolean(switching) || Boolean(modelOp) || !live.state;
+  $("mc-load").disabled = blocked || (other ? turnBlocksUnload(live) : !unloaded || pageBusy());
+  $("mc-unload").disabled = blocked || unloaded || turnBlocksUnload(live);
+  const notes = [];
+  if (switching) notes.push("This server stops and the other model loads; the page reloads when it answers (a few minutes).");
+  else if (other) notes.push(`${mcLabel(mc.this)} stops and ${mcLabel(sel.value)} loads in its place on this port.`);
+  if (mc.after_unload && mc.after_unload !== "ok") notes.push(`The last unload's after_unload command failed: ${mc.after_unload}.`);
+  $("mc-note").textContent = notes.join(" ");
+}
+$("mc-model").onchange = renderModelCard;
+$("mc-unload").onclick = () => { if (!$("unload-btn").disabled && ((lastMetrics && lastMetrics.live) || {}).state !== "unloaded") $("unload-btn").click(); };
+$("mc-load").onclick = async () => {
+  const target = $("mc-model").value;
+  if (!mc || !target) return;
+  if (target === mc.this) {
+    if (((lastMetrics && lastMetrics.live) || {}).state === "unloaded" && !$("unload-btn").disabled) $("unload-btn").click();
+    return;
+  }
+  if (!confirm(`Switch this port to ${mcLabel(target)}? ${mcLabel(mc.this)} stops (the conversations it holds are dropped) and ${mcLabel(target)} loads. This takes a few minutes; the page reloads when it answers.`)) return;
+  let r, body = {};
+  try {
+    r = await fetch("model-control", {method: "POST", headers: headers(true), body: JSON.stringify({model: target})});
+    try { body = await r.json(); } catch (e) { /* no body */ }
+  } catch (e) {
+    toast("error", "Switch failed", tr("model.noAnswer", "The server did not answer."));
+    return;
+  }
+  if (r.status !== 202) {
+    toast(r.status === 409 ? "warn" : "error", "Switch not started", (body.error && body.error.message) || `HTTP ${r.status}`, 6000);
+    return;
+  }
+  mcSwitch = {to: target, at: Date.now(), lost: false};
+  renderModelCard();
+  toast("info", `Switching to ${mcLabel(target)}`, "This takes a few minutes.", 6000);
+  const wait = async () => {
+    if (!mcSwitch) return;
+    try {
+      const h = await (await fetch("health", {cache: "no-store"})).json();
+      // the old server answered until it stopped; the first answer after a gap, or another model's, is the new one
+      if (mcSwitch.lost || (h.model && h.model !== health.model)) { location.reload(); return; }
+    } catch (e) {
+      mcSwitch.lost = true;
+    }
+    if (Date.now() - mcSwitch.at > 45 * 60 * 1000) {
+      toast("error", "Switch takes too long", "Nothing answers on this port after 45 minutes: look at the switch log.", 15000);
+      mcSwitch = null;
+      renderModelCard();
+      return;
+    }
+    setTimeout(wait, 3000);
+  };
+  setTimeout(wait, 3000);
 };
 
 function render(m) {
@@ -1637,10 +1732,17 @@ async function start() {
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
   setBusy(false);
   renderChat();
-  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
-  if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-  loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  // /?q=... fills the question in and focuses the box; it is never sent from the address (#4221): any page can link here,
+  // and a send would go out with the API key and the MCP tools saved in this browser. The person presses Send.
+  const startQuestion = new URLSearchParams(location.search).get("q");
+  if (startQuestion) {
+    history.replaceState(null, "", location.pathname + location.hash);
+    $("input").value = startQuestion;
+    autosize();
+  }
+  loadHealth().then(loadMcp);
   showTab(location.hash.slice(1) || "chat");
+  if (startQuestion && tab === "chat") $("input").focus();
   poll();
   requestAnimationFrame(fitHeader);
 }

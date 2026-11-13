@@ -23,6 +23,7 @@
 
 #include "strata/net/stage_tls.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -46,6 +47,10 @@ inline constexpr int32_t kStageCkptMax = 64;
 /// the start of the worker's CkptRestore error for an id it does not hold - the one restore error the main process
 /// recovers from (it reads the prompt from token 0); every other error means the worker's session is lost
 inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
+/// Parked conversations (docs/remote-stage/PARKING.md): the ids a keep[] may name on a worker that lists
+/// kStageCapPark (the live chain's checkpoints, the parked conversations' parks and checkpoints).  A worker without
+/// the bit reads kStageCkptMax at most, as before: a main process names more only when it parks.
+inline constexpr int32_t kStageKeepMax = 256;
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -67,6 +72,19 @@ enum class StageMsg : uint32_t {
     CkptSaveOk = 13,     // a = 1 stored, 0 not stored (the worker's store is as it was)
     CkptRestore = 14,    // a = id, b = L; payload: int64 keep[]
     CkptRestoreOk = 15,
+    // parked conversations (docs/remote-stage/PARKING.md; only to a worker whose hello lists kStageCapPark)
+    ParkSave = 16,       // a = id, b = L (the worker must be at L); payload: int64 keep[] (with id).  The worker
+                         // drops what keep[] does not name first, whatever the outcome
+    ParkSaveOk = 17,     // a = 1 stored, 0 not stored (the prune above happened)
+    ParkRestore = 18,    // a = id, b = L; payload: int64 keep[] (the park itself not in it: the main process took it)
+    ParkRestoreOk = 19,
+    // session files (docs/remote-stage/SESSIONS.md; only to a worker whose hello lists kStageCapSession)
+    SessionPut = 20,     // a = the id of the checkpoint part at Lc (0: none), b = L (the worker must be at L);
+                         // payload: uint64 token[2], int64 Lc.  The worker writes its half of the session to its disk
+    SessionPutOk = 21,   // a = the bytes written
+    SessionGet = 22,     // a = the id the worker keeps the checkpoint at Lc under (0: none), b = L; payload: uint64
+                         // token[2], int64 Lc, int64 keep[] (with a).  The worker reads its half back: session at L
+    SessionGetOk = 23,
 };
 
 #pragma pack(push, 1)
@@ -127,6 +145,17 @@ void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, 
 /// which still compares kv_type itself): no K/V type is compared here, and each side logs a line (--kv must
 /// match by hand); two without it: kv_type compared, as earlier builds do.
 inline constexpr uint32_t kStageCapKvElem = 1u << 31;
+/// Bit 30 (kStageCapPark): parked conversations (docs/remote-stage/PARKING.md).  A worker lists it when it keeps the
+/// parks (ParkSave / ParkRestore) and reads a keep[] of up to kStageKeepMax ids; a main process lists it when it
+/// parks (the worker then admits every checkpoint part against its RAM floor too).  A side without it never sends or
+/// gets the park messages; an older peer ignores the bit (neither the hello check nor the row formats read it).
+inline constexpr uint32_t kStageCapPark = 1u << 30;
+/// Bit 29 (kStageCapSession): session files (docs/remote-stage/SESSIONS.md).  A worker lists it when it keeps its half
+/// of a remote main process's session file on its own disk (--stage-session-dir) and takes SessionPut / SessionGet;
+/// a main process sends them only to a worker that lists it (and lists nothing itself).  An older peer ignores it.
+inline constexpr uint32_t kStageCapSession = 1u << 29;
+/// The 128-bit token of a session file's worker half (SessionPut / SessionGet): all zeros is no token.
+using StageToken = std::array<uint64_t, 2>;
 /// the row_formats bits for a K/V element type as --kv names it (fp16, int8, q4_0, k8v4); 0 for another name
 uint32_t stage_kv_elem_bits(const std::string& kv);
 /// both hellos carry their K/V element type
@@ -215,6 +244,26 @@ public:
     /// The worker puts checkpoint `id` (saved at L) back and keeps only `keep`; `missing` (with false): it does not
     /// hold `id` and nothing changed there.  Any other error: the worker's session is lost.
     bool ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
+    /// Parked conversations (a worker whose hello lists kStageCapPark): the worker drops what `keep` does not name,
+    /// then keeps its layers' K/V of cells [0, L) and its running state at L under `id`; `stored` false: it could not
+    /// (the prune happened).  An error: the worker's session is lost.
+    bool park_save(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& stored, std::string& err);
+    /// The worker puts park `id` (saved at L) back whole and keeps only `keep`; `missing` (with false): it does not
+    /// hold `id`, or the park failed its check before anything was written.  Any other error: the session is lost.
+    bool park_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
+    /// Session files (a worker whose hello lists kStageCapSession): the worker writes its half of the session at L
+    /// (and its checkpoint part `ckpt_id`, saved at Lc; 0: none) to its disk under `token`; `bytes`: what it wrote.
+    /// An error from the worker leaves its session and stores as they were; `missing` (with false): the worker does
+    /// not hold checkpoint part `ckpt_id` (the caller may save again without a checkpoint).  `wait_s` > 0: the reply
+    /// may take that long (else STRATA_REMOTE_TIMEOUT_S, as every reply); the link counts as lost after it.
+    bool session_put(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, int64_t& bytes, bool& missing,
+                     std::string& err, int wait_s = 0);
+    /// The worker reads its half under `token` back (the whole file checked before it writes anything): its session
+    /// at L, the checkpoint at Lc kept under `ckpt_id` (0: none), its stores pruned to `keep`.  `missing` (with
+    /// false): it has no such half or the half failed its check - nothing changed there.  Any other error: the
+    /// worker's session is lost (its stores are as they were).  `wait_s` as for session_put.
+    bool session_get(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, const std::vector<int64_t>& keep,
+                     bool& missing, std::string& err, int wait_s = 0);
 
     const StageStats& stats() const { return stats_; }
     std::string peer_name() const { return peer_; }
@@ -231,6 +280,9 @@ private:
     /// a synchronous message with a keep[] payload (Reset, CkptSave, CkptRestore); `reply_a`: the reply's `a`
     bool keep_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, const std::vector<int64_t>& keep,
                     int64_t& reply_a, std::string& err);
+    /// SessionPut / SessionGet: the token and Lc before keep[], and a reply that may take `wait_s`
+    bool session_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, const StageToken& token, int64_t Lc,
+                       const std::vector<int64_t>& keep, int64_t& reply_a, std::string& err, int wait_s);
     /// a failed link: shut down (both directions fail from now on) - the descriptor is closed only by close(), so
     /// the other thread never reads or writes a number the process may have reused
     void break_();
@@ -298,6 +350,21 @@ struct StageHandlers {
     /// it was), -1 an error.  ckpt_restore: an id it does not hold is an error starting with kStageCkptMissing.
     std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_save;
     std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_restore;
+    /// Parked conversations (optional; unset: a ParkSave / ParkRestore gets an error).  serve_stage has checked the
+    /// position (ParkSave) and the pending errors as for the checkpoint messages.  park_save: 1 stored, 0 not stored,
+    /// -1 an error.  park_restore: an id it does not hold, or a park that fails its check before any write, is an
+    /// error starting with kStageCkptMissing; the session is at L after a success.
+    std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> park_save;
+    std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> park_restore;
+    /// Session files (optional; unset: a SessionPut / SessionGet gets an error).  serve_stage has checked the position
+    /// and the pending errors (session_put, as for a ParkSave) and the token (not zero).  session_put: false with an
+    /// error leaves the session and the stores as they were; `bytes` the file's size.  session_get: an error starting
+    /// with kStageCkptMissing has written nothing (the session stays where it was); any other may have (the session is
+    /// lost); the session is at L after a success.
+    std::function<bool(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, int64_t& bytes,
+                       std::string& err)> session_put;
+    std::function<bool(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc,
+                       const std::vector<int64_t>& keep, std::string& err)> session_get;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
     /// optional (a relay worker): about once a second while the served main process is idle (no message read or being
     /// read, no reply going out), on the serving thread.  False ends that connection with `err`, as a closed one ends:

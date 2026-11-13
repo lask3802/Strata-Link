@@ -47,6 +47,10 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
 constexpr size_t kHeader = 64, kTrailer = 16;
+// a remote stage worker's half (stage_session_write): its own magic, so neither kind of file reads as the other
+constexpr char kStageMagic[8] = {'S', 'T', 'R', 'W', 'S', 'E', 'S', '\x01'};
+constexpr char kStageEnd[8] = {'S', 'T', 'R', 'W', 'E', 'N', 'D', '\x01'};
+constexpr uint32_t kStageVersion = 1;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -686,12 +690,8 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
-    for (int64_t g : s.geometry) o.i64(g);
-    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
-    put_checkpoint(o, s.live);
-    o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+// the K/V layers: streamed from `sources` when given, else from `kv`
+void put_kv_layers(Out& o, const std::vector<ConversationKv>& kv, const std::vector<SessionKvSource>* sources) {
     if (sources) {
         o.u64(sources->size());
         for (const auto& k : *sources) {
@@ -700,11 +700,29 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
         }
         return;
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
+    o.u64(kv.size());
+    for (const auto& k : kv) {
         put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
         o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
     }
+}
+
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+    for (int64_t g : s.geometry) o.i64(g);
+    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+    put_checkpoint(o, s.live);
+    o.u64(s.checkpoints.size());
+    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    put_kv_layers(o, s.kv, sources);
+}
+
+// a remote stage worker's half (StageSessionImage)
+void put_stage_payload(Out& o, const StageSessionImage& s, const std::vector<SessionKvSource>* sources) {
+    for (int64_t g : s.head.geometry) o.i64(g);
+    o.i64(s.head.layer_lo); o.i64(s.head.layer_hi); o.u64(s.head.tokens); o.u64(s.head.ckpt_tokens);
+    put_checkpoint(o, s.state);
+    if (s.head.ckpt_tokens) put_checkpoint(o, s.ckpt);
+    put_kv_layers(o, s.kv, sources);
 }
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
@@ -762,6 +780,24 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
+bool get_kv_layers(In& in, std::vector<ConversationKv>& kv) {
+    uint64_t n = 0;
+    // a K/V layer at least 7 + 5 = 96 bytes
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    kv.resize((size_t) n);
+    for (auto& k : kv) {
+        in.kv_layer = (size_t) (&k - kv.data());
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+        k.format = (int) format;
+        if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
+            !in.buffer(k.pooled, 4)) return false;
+    }
+    return true;
+}
+
 bool get_payload(In& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
@@ -780,19 +816,27 @@ bool get_payload(In& in, SavedConversation& s) {
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
-    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
-    s.kv.resize((size_t) n);
-    for (auto& k : s.kv) {
-        in.kv_layer = (size_t) (&k - s.kv.data());
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-        k.format = (int) format;
-        if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
-            !in.buffer(k.pooled, 4)) return false;
-    }
-    return true;
+    return get_kv_layers(in, s.kv);
+}
+
+// a remote stage worker's half: `want` is what the caller expects (geometry when it is not all zeros, the layer range,
+// L and Lc), checked before the arrays that follow are read
+bool get_stage_payload(In& in, const StageSessionHead& want, StageSessionImage& s) {
+    for (auto& g : s.head.geometry) if (!in.i64(g)) return false;
+    if (in.limits.geometry && *in.limits.geometry != s.head.geometry)
+        return in.fail("saved with another model geometry than this runtime's");
+    if (!in.i64(s.head.layer_lo) || !in.i64(s.head.layer_hi) || !in.u64(s.head.tokens) ||
+        !in.u64(s.head.ckpt_tokens)) return false;
+    if (s.head.layer_lo != want.layer_lo || s.head.layer_hi != want.layer_hi)
+        return in.fail("saved for layers " + std::to_string(s.head.layer_lo) + "-" + std::to_string(s.head.layer_hi) +
+                       ", this worker holds " + std::to_string(want.layer_lo) + "-" + std::to_string(want.layer_hi));
+    if (s.head.tokens != want.tokens || s.head.ckpt_tokens != want.ckpt_tokens)
+        return in.fail("saved at " + std::to_string(s.head.tokens) + " tokens (checkpoint " +
+                       std::to_string(s.head.ckpt_tokens) + "), not at " + std::to_string(want.tokens) + " (" +
+                       std::to_string(want.ckpt_tokens) + ")");
+    if (!get_checkpoint(in, s.state)) return false;
+    if (s.head.ckpt_tokens && !get_checkpoint(in, s.ckpt)) return false;
+    return get_kv_layers(in, s.kv);
 }
 
 bool has_stage_parts(const SavedConversation& s) {
@@ -802,16 +846,20 @@ bool has_stage_parts(const SavedConversation& s) {
 }
 
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
-// header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+// header_hash:u64 (session_hash64 of bytes 0..55, seed 0).  The reserved words hold a remote main process's worker
+// token (zero otherwise), and a worker's own file (kStageMagic) its token in the same place.
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, const SessionToken& token = {},
+                  const char* magic = kMagic, uint32_t version = kVersion) {
     std::memset(h, 0, kHeader);
-    std::memcpy(h, kMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    std::memcpy(h, magic, 8);
+    const uint32_t size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, &token[0], 8);
+    std::memcpy(h + 48, &token[1], 8);
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
 }
@@ -927,6 +975,8 @@ std::string session_free_space_dir(const std::string& path, bool windows_rules) 
     return p.substr(0, cut + 1);   // with its trailing backslash: "\\server\share\dir\", "C:\"
 }
 
+bool session_free_bytes(const std::string& path, uint64_t& out) { return free_space(path, out); }
+
 std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     std::vector<SessionModelFile> f;
     for (size_t i = 0; i < in.native_shards.size(); ++i) f.push_back({"native shard " + std::to_string(i), in.native_shards[i]});
@@ -1024,15 +1074,14 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
 }
 
 namespace {
-bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
-                const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                SessionStatus& st) {
-    st = {};
-    st.error = SessionError::invalid;   // refusals before any disk access
-    if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
-    if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+// One file: `payload_of` walks the payload (a sizing pass, then the write), between the header (`magic`, `version`,
+// `token` in the reserved words) and the trailer (its hash and `end`).  st.error is the caller's refusal class until a
+// disk access starts.
+bool write_file(const std::string& path, const char* magic, uint32_t version, const char* end, const SessionToken& token,
+                const std::function<void(Out&)>& payload_of, const SessionFileIdentity& id, size_t& bytes,
+                std::string& error, const SessionWriteOptions& opt, SessionStatus& st) {
     Out sizing;
-    put_payload(sizing, image, sources);
+    payload_of(sizing);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1069,17 +1118,17 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, token, magic, version);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
+    if (ok) payload_of(out);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+        ok = f.write(&ph, 8) && f.write(end, 8);
     }
     ok = f.finish(opt.durable) && ok;
     std::string why;
@@ -1098,6 +1147,38 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     error = "session file: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
     if (st.published) error += " (the new file has already replaced the old one; its folder entry may not survive a power loss)";
     return false;   // Publisher removes this call's temporary file, and only that
+}
+
+bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+                SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;   // refusals before any disk access
+    if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
+    if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    return write_file(path, kMagic, kVersion, kEnd, opt.worker_token,
+                      [&](Out& o) { put_payload(o, image, sources); }, id, bytes, error, opt, st);
+}
+
+bool stage_write_impl(const std::string& path, const StageSessionImage& image,
+                      const std::vector<SessionKvSource>* sources, const SessionFileIdentity& id, size_t& bytes,
+                      std::string& error, const SessionWriteOptions& opt, SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;   // refusals before any disk access
+    const StageSessionHead& h = image.head;
+    if (session_token_zero(h.token)) { error = "session file: a worker half without a token"; return false; }
+    if (h.tokens < 1 || h.ckpt_tokens > h.tokens) {
+        error = "session file: a worker half of " + std::to_string(h.tokens) + " tokens with a checkpoint at " +
+                std::to_string(h.ckpt_tokens);
+        return false;
+    }
+    if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (!image.state.stage_parts.empty() || !image.ckpt.stage_parts.empty()) {
+        error = "session file: layer-split state cannot be saved";
+        return false;
+    }
+    return write_file(path, kStageMagic, kStageVersion, kStageEnd, h.token,
+                      [&](Out& o) { put_stage_payload(o, image, sources); }, id, bytes, error, opt, st);
 }
 
 bool write_guarded(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
@@ -1170,9 +1251,23 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
     return write_guarded(path, image, nullptr, id, bytes, error, options, status);
 }
 
+
 namespace {
-bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+// What one kind of file looks like to the reader.
+struct FileKind {
+    const char* magic;
+    uint32_t version;
+    const char* end;
+    uint64_t max_size;               // the largest file the caller's limits admit
+    bool token_ok;                   // a non-zero token in the reserved words is accepted (and returned)
+    const SessionToken* want_token;  // non-null: the token must be exactly this one (a worker's half)
+};
+
+// Full validation of one file before the caller's image is replaced: `parse` reads the payload into the caller's own
+// object, which the caller moves into its image only when this returns true.
+bool read_file(const std::string& path, const SessionFileIdentity& id, const FileKind& kind,
+               const std::function<bool(In&)>& parse, size_t& bytes, std::string& error, const SessionReadLimits& limits,
+               SessionStatus& st) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
@@ -1184,7 +1279,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
         return false;
     }
     if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
-    const uint64_t max_size = session_read_max_file_bytes(limits);
+    const uint64_t max_size = kind.max_size;
     if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: size " + std::to_string(size) + " exceeds this engine's limit" +
                 (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
@@ -1202,10 +1297,23 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
-    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+    if (std::memcmp(h, kind.magic, 8) != 0) {
+        // the other kind's magic says what it is: a worker's half is no main file, and the other way round
+        const bool other = std::memcmp(h, kind.magic == kMagic ? kStageMagic : kMagic, 8) == 0;
+        error = !other ? "session file: not a Strata session file (magic)"
+                : kind.magic == kMagic ? "session file: a remote stage worker's half, not a session file"
+                                       : "session file: a main process's session file, not a worker's half";
+        return false;
+    }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (version != kind.version) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    // the reserved words: zero in every file a one-GPU engine writes; a remote main process's file holds its worker
+    // token there, which only a read that asks for one accepts (an engine without a remote stage refuses it here)
+    if (hsize != kHeader || ((r0 || r1) && !kind.token_ok)) { error = "session file: invalid header fields"; return false; }
+    if (kind.want_token && (r0 != (*kind.want_token)[0] || r1 != (*kind.want_token)[1])) {
+        error = "session file: another session's worker half (the token differs)";
+        return false;
+    }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
@@ -1221,19 +1329,28 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
             return false;
         }
     }
-    SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (!parse(in)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
     uint64_t ph = 0;
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
-    if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
-    image = std::move(parsed);
+    if (std::memcmp(t + 8, kind.end, 8) != 0) { error = "session file: bad end marker"; return false; }
     bytes = (size_t) size;
+    st.worker_token = {r0, r1};
     st.error = SessionError::none;
+    return true;
+}
+
+bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    const FileKind kind{kMagic, kVersion, kEnd, session_read_max_file_bytes(limits), limits.worker_token, nullptr};
+    SavedConversation parsed;
+    if (!read_file(path, id, kind, [&](In& in) { return get_payload(in, parsed); }, bytes, error, limits, st))
+        return false;
+    image = std::move(parsed);
     return true;
 }
 } // namespace
@@ -1251,6 +1368,215 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+// ---- a remote stage worker's half (docs/remote-stage/SESSIONS.md)
+
+SessionToken session_token_new() {
+    SessionToken t{};
+    std::random_device rd;
+    while (session_token_zero(t)) {
+        // two independent draws of the device, each mixed with the process and the clock (random64)
+        t[0] = random64() ^ ((uint64_t(rd()) << 32) | rd());
+        t[1] = random64() ^ ((uint64_t(rd()) << 32) | rd()) ^ P3;
+    }
+    return t;
+}
+
+std::string session_token_hex(const SessionToken& t) {
+    char s[33];
+    std::snprintf(s, sizeof s, "%016llx%016llx", (unsigned long long) t[0], (unsigned long long) t[1]);
+    return s;
+}
+
+std::string stage_session_file_name(const SessionToken& token) {
+    return "stage-session-" + session_token_hex(token) + ".bin";
+}
+
+bool stage_session_write(const std::string& path, const StageSessionImage& image,
+                         const std::vector<SessionKvSource>* sources, const SessionFileIdentity& id, size_t& bytes,
+                         std::string& error, const SessionWriteOptions& options, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = stage_write_impl(path, image, sources, id, bytes, error, options, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while writing " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+uint64_t stage_session_max_file_bytes(const SessionReadLimits& l) {
+    const uint64_t open = UINT64_MAX;
+    if (l.max_tokens == open || l.max_kv_layers == open) return l.max_file_bytes;
+    for (uint64_t b : l.max_state_bytes) if (b == open) return l.max_file_bytes;
+    if (l.max_kv_bytes.size() < l.max_kv_layers) return l.max_file_bytes;
+    // one state: ids (8 + 4 per token), images (8 + 16 per image), five state arrays (8 + bytes), used (8)
+    uint64_t cp = sat_add(16, sat_mul(l.max_tokens, 4 + 16));
+    for (uint64_t b : l.max_state_bytes) cp = sat_add(cp, sat_add(8, b));
+    cp = sat_add(cp, 8);
+    uint64_t n = kHeader + kTrailer + 18 * 8 + 4 * 8;              // geometry, layer range, L, Lc
+    n = sat_add(n, sat_mul(2, cp));                                // the state at L and at Lc
+    n = sat_add(n, 8);
+    for (uint64_t i = 0; i < l.max_kv_layers; ++i) {
+        n = sat_add(n, 7 * 8);
+        for (uint64_t b : l.max_kv_bytes[(size_t) i]) n = sat_add(n, sat_add(8, b));
+    }
+    return std::min(n, l.max_file_bytes);
+}
+
+bool stage_session_read(const std::string& path, const SessionFileIdentity& id, const StageSessionHead& want,
+                        StageSessionImage& image, size_t& bytes, std::string& error, const SessionReadLimits& limits,
+                        SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        if (session_token_zero(want.token)) {
+            error = "session file: a worker half without a token";
+            st.error = SessionError::invalid;
+        } else {
+            const FileKind kind{kStageMagic, kStageVersion, kStageEnd, stage_session_max_file_bytes(limits), true,
+                                &want.token};
+            StageSessionImage parsed;
+            ok = read_file(path, id, kind, [&](In& in) { return get_stage_payload(in, want, parsed); }, bytes, error,
+                           limits, st);
+            if (ok) {
+                parsed.head.token = want.token;
+                image = std::move(parsed);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+namespace {
+// UTF-8 names to paths and back (on Windows a narrow std::string path would be read in the ANSI code page)
+std::filesystem::path u8_path(const std::string& s) {
+    return std::filesystem::path(std::u8string(s.begin(), s.end()));
+}
+std::string u8_string(const std::filesystem::path& p) {
+    const std::u8string u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+bool lower_hex(const std::string& s, size_t at, size_t n) {
+    for (size_t i = at; i < at + n; ++i) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+bool stage_session_name(const std::string& name) {
+    static const std::string pre = "stage-session-", post = ".bin";
+    if (name.size() != pre.size() + 32 + post.size() || name.compare(0, pre.size(), pre) != 0 ||
+        name.compare(pre.size() + 32, post.size(), post) != 0) return false;
+    return lower_hex(name, pre.size(), 32);
+}
+// the temporary name a worker half's write uses (temp_name of a stage-session name): .<that name>.<16 hex>.tmp
+bool stage_session_temp_name(const std::string& name) {
+    static const size_t leaf = 14 + 32 + 4;   // stage-session-<32 hex>.bin
+    if (name.size() != 1 + leaf + 1 + 16 + 4 || name[0] != '.' || !stage_session_name(name.substr(1, leaf)) ||
+        name[1 + leaf] != '.' || name.compare(1 + leaf + 1 + 16, 4, ".tmp") != 0) return false;
+    return lower_hex(name, 1 + leaf + 1, 16);
+}
+} // namespace
+
+size_t stage_session_prune(const std::string& dir, size_t keep, const std::string& keep_name, std::string& error) {
+    error.clear();
+    struct Entry {
+        std::filesystem::file_time_type at;
+        std::string name;
+        std::filesystem::path path;
+    };
+    std::vector<Entry> files;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(u8_path(dir), ec), end;
+    if (ec) { error = "cannot list " + dir + ": " + ec.message(); return 0; }
+    for (; it != end; it.increment(ec)) {
+        if (ec) { error = "cannot list " + dir + ": " + ec.message(); break; }
+        const std::string name = u8_string(it->path().filename());
+        if (!stage_session_name(name)) continue;
+        std::error_code ec2;
+        const auto st = it->symlink_status(ec2);   // (not followed: a link or a folder of that name is not this rule's)
+        if (ec2 || !std::filesystem::is_regular_file(st)) continue;
+        const auto at = it->last_write_time(ec2);
+        if (ec2) continue;
+        files.push_back({at, name, it->path()});
+    }
+    // the newest first; keep_name before every other, whatever its time says (it was just written)
+    std::sort(files.begin(), files.end(), [&](const Entry& a, const Entry& b) {
+        const bool ka = a.name == keep_name, kb = b.name == keep_name;
+        if (ka != kb) return ka;
+        if (a.at != b.at) return a.at > b.at;
+        return a.name > b.name;
+    });
+    size_t removed = 0;
+    for (size_t i = keep; i < files.size(); ++i) {
+        if (files[i].name == keep_name) continue;
+        std::error_code ec2;
+        if (std::filesystem::remove(files[i].path, ec2)) {
+            ++removed;
+        } else if (ec2) {
+            error += (error.empty() ? "" : "; ") + std::string("cannot remove ") + files[i].name + ": " + ec2.message();
+        }
+    }
+    return removed;
+}
+
+bool stage_session_dir_prepare(std::string& dir, std::string& error, size_t* removed, std::string* warning,
+                               int64_t stale_s) {
+    if (removed) *removed = 0;
+    if (warning) warning->clear();
+    if (dir.empty()) { error = "--stage-session-dir: an empty path"; return false; }
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::absolute(u8_path(dir), ec);
+    if (ec) { error = "--stage-session-dir " + dir + ": " + ec.message(); return false; }
+    const bool existed = std::filesystem::exists(p, ec);
+    if (ec) { error = "--stage-session-dir " + dir + ": " + ec.message(); return false; }
+    if (!existed) {
+        if (!std::filesystem::create_directories(p, ec) || ec) {
+            error = "--stage-session-dir " + dir + ": cannot create it" + (ec ? ": " + ec.message() : std::string());
+            return false;
+        }
+        // this user's alone: it holds conversations
+        std::filesystem::permissions(p, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
+        if (ec) { error = "--stage-session-dir " + dir + ": " + ec.message(); return false; }
+    } else if (!std::filesystem::is_directory(p, ec) || ec) {
+        error = "--stage-session-dir " + dir + ": not a folder";
+        return false;
+    } else {
+        // a save ended in the middle of its write (the process killed) leaves its temporary file: up to a whole half
+        std::vector<std::filesystem::path> stale;
+        const auto now = std::filesystem::file_time_type::clock::now();
+        std::filesystem::directory_iterator it(p, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            if (!stage_session_temp_name(u8_string(it->path().filename()))) continue;
+            std::error_code e2;
+            const auto st = it->symlink_status(e2);
+            if (e2 || !std::filesystem::is_regular_file(st)) continue;
+            const auto at = it->last_write_time(e2);
+            if (e2 || now - at < std::chrono::seconds(stale_s)) continue;
+            stale.push_back(it->path());
+        }
+        for (const auto& f : stale) {
+            std::error_code e2;
+            if (std::filesystem::remove(f, e2)) {
+                if (removed) ++*removed;
+            } else if (e2 && warning) {
+                *warning += (warning->empty() ? "" : "; ") + std::string("cannot remove ") +
+                            u8_string(f.filename()) + ": " + e2.message();
+            }
+        }
+    }
+    dir = u8_string(p);
+    return true;
 }
 
 } // namespace strata::core

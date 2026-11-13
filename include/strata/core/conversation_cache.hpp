@@ -190,6 +190,16 @@ struct SavedConversation {
     std::shared_ptr<void> pending;
     // STRATA_CKPT_ASYNC: the same for the background copy that fills `live.gdn` (the park's running state)
     std::shared_ptr<void> live_pending;
+    // A remote stage (docs/remote-stage/PARKING.md): the id the worker keeps its half of this conversation under (its
+    // layers' K/V and running state; 0 = none).  The checkpoints' own `remote_id`s name their worker parts.
+    int32_t remote_park = 0;
+
+    /// the worker ids this image holds (its park and its checkpoints' parts), appended to `out`
+    void remote_ids(std::vector<int64_t>& out) const {
+        if (remote_park != 0) out.push_back(remote_park);
+        for (const auto& c : checkpoints)
+            if (c.remote_id != 0) out.push_back(c.remote_id);
+    }
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -299,6 +309,11 @@ public:
         return r;
     }
     size_t retained_bytes() const { return reuse_.bytes(); }
+    /// A remote stage (docs/remote-stage/PARKING.md): every worker id the parked conversations hold, appended to `out`
+    /// (an id two images share appears twice; the worker reads keep[] as a set)
+    void remote_ids(std::vector<int64_t>& out) const {
+        for (const auto& e : entries_) e.remote_ids(out);
+    }
     int64_t retained_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&

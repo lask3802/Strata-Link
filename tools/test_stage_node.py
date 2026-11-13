@@ -244,6 +244,87 @@ class StartCheckTest(unittest.TestCase):
         self.assertIn("both end and next", w.start({"begin": 24, "end": 40})["error"])
 
 
+class SessionDirTest(unittest.TestCase):
+    """node.json "stage_session_dir" / "stage_session_keep" and a /start's "session_dir": true - the worker's
+    --stage-session-dir from node.json only (the caller names no path); without the field the argv is as before."""
+
+    SESSIONS = os.path.abspath(os.sep + "srv-stage-sessions")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.argv = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def workers(self, **extra):
+        return sn.Workers({"exe": "strata", "bind": "127.0.0.1", "pack": "p", "native": "n", "expert_profile": "e",
+                           "ple_gguf": "", "args": ["--kv", "int8"], "_tls": Path(self.tmp.name),
+                           "log_dir": self.tmp.name, "drop_cache": False, **extra})
+
+    def argv_of(self, w, req):
+        """The worker's argv a /start runs (Popen faked: it records the argv and fails, so nothing starts)."""
+        def popen(args, **kw):
+            self.argv = list(args)
+            raise OSError("not started (test)")
+        with mock.patch.object(sn.subprocess, "Popen", side_effect=popen):
+            r = w.start(req)
+        self.assertIn("cannot start the worker", r.get("error", ""), r)
+        return self.argv
+
+    BASE = ["strata", "--serve", "--stage-worker", "7841", "--stage-begin", "40", "--pack", "p", "--native", "n",
+            "--expert-profile", "e", "--expert-cache", "auto", "--prefill", "2048", "--stage-bind", "127.0.0.1",
+            "--kv", "int8"]
+
+    def test_off_without_the_field(self):
+        w = self.workers(stage_session_dir=self.SESSIONS, stage_session_keep=6)
+        self.assertEqual(self.argv_of(w, {"begin": 40}), self.BASE)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": False}), self.BASE)
+        self.assertEqual(self.argv_of(self.workers(), {"begin": 40}), self.BASE)   # (no folder in node.json)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "extra": ["--spec", "4"]}), self.BASE + ["--spec", "4"])
+
+    def test_on_appends_node_json_folder(self):
+        w = self.workers(stage_session_dir=self.SESSIONS)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": True}),
+                         self.BASE + ["--stage-session-dir", self.SESSIONS])
+
+    def test_keep_passed_when_set(self):
+        w = self.workers(stage_session_dir=self.SESSIONS, stage_session_keep=6)
+        self.assertEqual(self.argv_of(w, {"begin": 40, "session_dir": True, "extra": ["--spec", "4"]}),
+                         self.BASE + ["--stage-session-dir", self.SESSIONS, "--stage-session-keep", "6", "--spec", "4"])
+
+    def test_refused_without_the_folder_or_a_bool(self):
+        w = self.workers()
+        with mock.patch.object(sn.subprocess, "Popen", side_effect=AssertionError("started")):
+            self.assertIn("names no stage_session_dir", w.start({"begin": 40, "session_dir": True})["error"])
+            w = self.workers(stage_session_dir=self.SESSIONS)
+            for bad in ("yes", 1, "/tmp/x", None):
+                self.assertIn("true or false", w.start({"begin": 40, "session_dir": bad})["error"], bad)
+
+    def test_the_flag_is_not_an_extra(self):
+        self.assertNotIn("--stage-session-dir", sn.EXTRA_ALLOWED)
+        w = self.workers(stage_session_dir=self.SESSIONS)
+        self.assertIn("not allowed", w.start({"begin": 40, "extra": ["--stage-session-dir", "/tmp/x"]})["error"])
+
+    def test_config_checked(self):
+        self.assertIsNone(sn.session_args({}))
+        self.assertEqual(sn.session_args({"stage_session_dir": self.SESSIONS, "stage_session_keep": 1}),
+                         ["--stage-session-dir", self.SESSIONS, "--stage-session-keep", "1"])
+        for bad in ({"stage_session_dir": ""}, {"stage_session_dir": "   "}, {"stage_session_dir": "relative/dir"},
+                    {"stage_session_dir": 5}, {"stage_session_dir": self.SESSIONS + "\n"},
+                    {"stage_session_keep": 3},
+                    {"stage_session_dir": self.SESSIONS, "stage_session_keep": 0},
+                    {"stage_session_dir": self.SESSIONS, "stage_session_keep": True},
+                    {"stage_session_dir": self.SESSIONS, "stage_session_keep": "4"}):
+            with self.assertRaises(ValueError, msg=bad):
+                sn.session_args(bad)
+        node = Path(self.tmp.name) / "node.json"
+        node.write_text(json.dumps({"stage_session_dir": "relative", "tls_dir": self.tmp.name}))
+        with self.assertRaises(SystemExit) as got:
+            sn.load_config(str(node))
+        self.assertIn("stage_session_dir", str(got.exception))
+
+
 class ModelTest(unittest.TestCase):
     """/start's "model": a model shipped under data_dir, by plain names."""
 
@@ -877,6 +958,104 @@ class ShipTest(unittest.TestCase):
         self.assertGreaterEqual(live[1], 3, "the pieces did not overlap")
 
 
+class ServicesTest(unittest.TestCase):
+    """node.json's "services" (opt-in): only the configured argument lists run, by name and action, one at a time,
+    bounded; a command that leaves a daemon holding its output still answers."""
+
+    PY = sys.executable
+
+    def setUp(self):
+        self.err = io.StringIO()
+        self.quiet = mock.patch.object(sys, "stderr", self.err)
+        self.quiet.start()
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.quiet.stop()
+        self.tmp.cleanup()
+
+    def services(self, value) -> sn.Services:
+        return sn.Services({"_services": sn.check_services(value)})
+
+    def test_check(self):
+        self.assertEqual(sn.check_services(None), {})
+        ok = sn.check_services({"rx": {"start": ["a", "b"], "stop": ["c"], "timeout_s": 60}})
+        self.assertEqual(ok, {"rx": {"start": ["a", "b"], "stop": ["c"], "timeout_s": 60.0}})
+        self.assertEqual(sn.check_services({"rx": {"status": ["s"]}})["rx"]["timeout_s"], sn.SERVICE_TIMEOUT_S)
+        for bad in ([], {"r x": {"start": ["a"]}}, {"rx": ["a"]}, {"rx": {}}, {"rx": {"start": "a"}},
+                    {"rx": {"start": []}}, {"rx": {"start": ["a", 1]}}, {"rx": {"start": ["a"], "timeout_s": 0}}, {"rx": {"start": ["a"], "timeout_s": 0.5}},
+                    {"rx": {"start": ["a"], "timeout_s": 99999}}, {"rx": {"start": ["a"], "timeout_s": True}},
+                    {"../x": {"start": ["a"]}}):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                sn.check_services(bad)
+
+    def test_run_and_refusals(self):
+        s = self.services({"rx": {"start": [self.PY, "-c", "print('up'); print('second line')"],
+                                  "stop": [self.PY, "-c", "import sys; print('no'); sys.exit(4)"]}})
+        code, body = s.run("rx", "start")
+        self.assertEqual((code, body["ok"], body["rc"], body["output"]), (200, True, 0, ["up", "second line"]))
+        code, body = s.run("rx", "stop")
+        self.assertEqual((code, body["ok"], body["rc"], body["output"]), (200, False, 4, ["no"]))
+        self.assertEqual(s.run("rx", "status")[0], 400)          # not configured
+        self.assertEqual(s.run("rx", "kill")[0], 400)
+        self.assertEqual(s.run("other", "start")[0], 404)
+        self.assertEqual(s.run(None, "start")[0], 404)
+        self.assertEqual(self.services(None).run("rx", "start")[0], 404)
+
+    def test_timeout_and_a_missing_program(self):
+        s = self.services({"slow": {"start": [self.PY, "-c", "import time; time.sleep(30)"], "timeout_s": 1},
+                           "gone": {"start": [str(Path(self.tmp.name) / "missing")]}})
+        t0 = time.time()
+        code, body = s.run("slow", "start")
+        self.assertLess(time.time() - t0, 20)
+        self.assertEqual((code, body["ok"], body["rc"]), (200, False, None))
+        self.assertIn("did not finish", body["error"])
+        code, body = s.run("gone", "start")
+        self.assertEqual((body["ok"], body["rc"]), (False, None))
+        self.assertIn("could not run", body["error"])
+
+    def test_one_at_a_time_and_a_second_is_refused_at_once(self):
+        s = self.services({"slow": {"start": [self.PY, "-c", "import time; time.sleep(3)"], "timeout_s": 30}})
+        t = threading.Thread(target=s.run, args=("slow", "start"))
+        t.start()
+        try:
+            deadline = time.time() + 10
+            while not s.lock.locked() and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(s.lock.locked())
+            t0 = time.time()
+            code, body = s.run("slow", "start")
+            self.assertLess(time.time() - t0, 1, "a second /service waited instead of being refused")
+            self.assertEqual((code, body["ok"]), (409, False))
+        finally:
+            t.join()
+
+    def test_a_timeout_ends_what_the_command_waits_for_too(self):
+        mark = Path(self.tmp.name) / "late"
+        child = f"import time; time.sleep(3); open({str(mark)!r}, 'w').close()"
+        code = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+        s = self.services({"w": {"start": [self.PY, "-c", code], "timeout_s": 1}})
+        self.assertIn("did not finish", s.run("w", "start")[1]["error"])
+        time.sleep(5)
+        self.assertFalse(mark.exists(), "the command's child outlived its timeout")
+
+    def test_the_output_is_its_tail(self):
+        # more than the 4 MiB read back: the last lines are what is shown
+        code = "import sys; sys.stdout.write(''.join('%015d\\n' % i for i in range(400000)))"
+        s = self.services({"loud": {"start": [self.PY, "-c", code]}})
+        self.assertEqual(s.run("loud", "start")[1]["output"][-1], "%015d" % 399999)
+
+    def test_a_daemon_left_behind_does_not_hold_the_answer(self):
+        # the command starts a child that inherits its output and lives on (as `setsid nohup ... &` does), then ends
+        child = "import time; time.sleep(20)"
+        code = (f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}]); print('started')")
+        s = self.services({"d": {"start": [self.PY, "-c", code], "timeout_s": 15}})
+        t0 = time.time()
+        status, body = s.run("d", "start")
+        self.assertLess(time.time() - t0, 10)
+        self.assertEqual((status, body["ok"], body["output"]), (200, True, ["started"]))
+
+
 @unittest.skipIf(OPENSSL is None, "no openssl command to make the keys")
 class AgentTlsTest(unittest.TestCase):
     """Who the agent takes: a PC whose certificate is its own or in its peers/, over TLS 1.3 - and who a client
@@ -945,6 +1124,32 @@ class AgentTlsTest(unittest.TestCase):
         if "control: loaded" in r.stdout:
             self.skipTest("this Python's new contexts set their own security level: the host policy reaches none")
         self.assertEqual((r.returncode, r.stdout.split()), (0, ["control:", "refused", "loaded"]), r.stderr[-400:])
+
+    def test_service_over_https(self):
+        # /service through the agent's own handler: a peer runs a configured command; without services, 404
+        cfg = {"_tls": self.node, "bind": "127.0.0.1", "data_dir": self.tmp.name, "drop_cache": False,
+               "_services": sn.check_services({"rx": {"status": [sys.executable, "-c", "print('rx: not running')"]}})}
+        srv = sn.TlsServer(("127.0.0.1", 0), sn.make_handler(cfg, sn.Workers(cfg), sn.Store(cfg)),
+                           sn.tls_context(self.node, True))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def post(url, body):
+                r = urllib.request.Request(url + "/service", data=json.dumps(body).encode(), method="POST",
+                                           headers={"Content-Type": "application/json"})
+                try:
+                    with sn.https_opener(sn.tls_context(self.main, False)).open(r, timeout=30) as resp:
+                        return resp.status, json.load(resp)
+                except urllib.error.HTTPError as e:
+                    with e:
+                        return e.code, json.load(e)
+            url = f"https://127.0.0.1:{srv.server_address[1]}"
+            code, body = post(url, {"name": "rx", "action": "status"})
+            self.assertEqual((code, body["ok"], body["output"]), (200, True, ["rx: not running"]))
+            self.assertEqual(post(url, {"name": "rx", "action": "start"})[0], 400)
+            self.assertEqual(post(self.url, {"name": "rx", "action": "status"})[0], 404)   # this agent has none
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_a_peer_is_served_and_named(self):
         self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})

@@ -1124,6 +1124,80 @@ bool StageClient::ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>
     return false;
 }
 
+bool StageClient::park_save(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& stored, std::string& err) {
+    int64_t a = 0;
+    stored = false;
+    if (!keep_call_(StageMsg::ParkSave, StageMsg::ParkSaveOk, id, L, keep, a, err)) return false;
+    stored = a == 1;
+    return true;
+}
+
+bool StageClient::park_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing,
+                               std::string& err) {
+    int64_t a = 0;
+    missing = false;
+    if (keep_call_(StageMsg::ParkRestore, StageMsg::ParkRestoreOk, id, L, keep, a, err)) return true;
+    // the worker's own text, as for a checkpoint (ckpt_restore)
+    missing = connected() && err.rfind(std::string("remote stage (worker): ") + kStageCkptMissing, 0) == 0;
+    return false;
+}
+
+bool StageClient::session_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, const StageToken& token,
+                                int64_t Lc, const std::vector<int64_t>& keep, int64_t& reply_a, std::string& err,
+                                int wait_s) {
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    StageHeader h;
+    h.type = (uint32_t) type;
+    h.a = a;
+    h.b = b;
+    int64_t pre[3];
+    std::memcpy(&pre[0], &token[0], 8);
+    std::memcpy(&pre[1], &token[1], 8);
+    pre[2] = Lc;
+    h.bytes = sizeof pre + keep.size() * sizeof(int64_t);
+    if (!send_msg(S(fd_), *tls_, tls_tx_, h, pre, sizeof pre, keep.data(), keep.size() * sizeof(int64_t), err)) {
+        break_();
+        return false;
+    }
+    stats_.bytes_out += sizeof h + h.bytes;
+    // the worker writes or reads a file of up to a few GiB before it answers: the caller's allowance, when it is
+    // longer than the socket's own time-out (STRATA_REMOTE_TIMEOUT_S), for the reply's first byte
+    const int limit_s = std::max(wait_s, io_timeout_s());
+    if (wait_s > io_timeout_s() && !tls_->buffered()) {
+        std::string e;
+        if (!wait_readable(S(fd_), Clock::now() + std::chrono::seconds(limit_s), nullptr, e)) {
+            err = "remote stage: receive failed: timed out (no reply to a session file message in " +
+                  std::to_string(limit_s) + " s)";
+            break_();
+            return false;
+        }
+    }
+    return read_reply_(want, nullptr, 0, reply_a, err);
+}
+
+bool StageClient::session_put(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc, int64_t& bytes,
+                              bool& missing, std::string& err, int wait_s) {
+    bytes = 0;
+    missing = false;
+    if (session_call_(StageMsg::SessionPut, StageMsg::SessionPutOk, ckpt_id, L, token, Lc, {}, bytes, err, wait_s))
+        return true;
+    missing = connected() && err.rfind(std::string("remote stage (worker): ") + kStageCkptMissing, 0) == 0;
+    return false;
+}
+
+bool StageClient::session_get(int64_t ckpt_id, int64_t L, const StageToken& token, int64_t Lc,
+                              const std::vector<int64_t>& keep, bool& missing, std::string& err, int wait_s) {
+    int64_t a = 0;
+    missing = false;
+    if (session_call_(StageMsg::SessionGet, StageMsg::SessionGetOk, ckpt_id, L, token, Lc, keep, a, err, wait_s))
+        return true;
+    // the worker's own text, as for a checkpoint (ckpt_restore)
+    missing = connected() && err.rfind(std::string("remote stage (worker): ") + kStageCkptMissing, 0) == 0;
+    return false;
+}
+
 bool StageClient::positions(const int32_t* table, int64_t cells, std::string& err) {
     std::lock_guard<std::mutex> lk(send_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
@@ -1150,6 +1224,8 @@ struct Inbox {
     std::vector<float> rows;    ///< a window's rows, fp32 (copied to run_in by the serving thread)
     double decode_ms = 0;       ///< the rows' conversion from the link's format (the receiving thread's)
     std::vector<int64_t> keep;  ///< Reset / CkptSave / CkptRestore: the checkpoint ids the main process holds
+    StageToken token{};         ///< SessionPut / SessionGet: the session's token and its checkpoint's length
+    int64_t lc = 0;
     StageHello hello;
     int slot = -1;
     std::string bad;            ///< the message was malformed: reply this error
@@ -1484,14 +1560,39 @@ int serve_stage(const std::string& bind_addr, int port, std::shared_ptr<TlsCrede
                             in.tok32.resize((size_t) cells * 3);
                             if (!recv_all(fd, *link.tls, link.rx, in.tok32.data(), (size_t) cells * 12, in.err)) in.closed = true;
                         }
-                    } else if (type == StageMsg::Reset || type == StageMsg::CkptSave || type == StageMsg::CkptRestore) {
-                        if (in.h.bytes % 8 != 0 || in.h.bytes / 8 > (uint64_t) kStageCkptMax) {
+                    } else if (type == StageMsg::Reset || type == StageMsg::CkptSave || type == StageMsg::CkptRestore ||
+                               type == StageMsg::ParkSave || type == StageMsg::ParkRestore) {
+                        // a worker that keeps parks (its hello lists kStageCapPark) reads the longer keep[] a
+                        // parking main process sends (docs/remote-stage/PARKING.md); any other, kStageCkptMax ids
+                        const uint64_t keep_max = h.park_save ? (uint64_t) kStageKeepMax : (uint64_t) kStageCkptMax;
+                        if (in.h.bytes % 8 != 0 || in.h.bytes / 8 > keep_max) {
                             in.bad = "bad checkpoint list";
                             if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
                         } else {
                             in.keep.resize((size_t) (in.h.bytes / 8));
                             if (!recv_all(fd, *link.tls, link.rx, in.keep.data(), (size_t) in.h.bytes, in.err))
                                 in.closed = true;
+                        }
+                    } else if (type == StageMsg::SessionPut || type == StageMsg::SessionGet) {
+                        // the token, Lc, and (SessionGet) keep[] as for the messages above
+                        const uint64_t keep_max = h.park_save ? (uint64_t) kStageKeepMax : (uint64_t) kStageCkptMax;
+                        const uint64_t pre = 24;
+                        if (in.h.bytes < pre || in.h.bytes % 8 != 0 ||
+                            (type == StageMsg::SessionPut ? in.h.bytes != pre : (in.h.bytes - pre) / 8 > keep_max)) {
+                            in.bad = "bad session file message";
+                            if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
+                        } else {
+                            int64_t head[3] = {};
+                            in.keep.resize((size_t) ((in.h.bytes - pre) / 8));
+                            if (!recv_all(fd, *link.tls, link.rx, head, (size_t) pre, in.err) ||
+                                (!in.keep.empty() &&
+                                 !recv_all(fd, *link.tls, link.rx, in.keep.data(), in.keep.size() * 8, in.err))) {
+                                in.closed = true;
+                            } else {
+                                std::memcpy(&in.token[0], &head[0], 8);
+                                std::memcpy(&in.token[1], &head[1], 8);
+                                in.lc = head[2];
+                            }
                         }
                     } else if (type != StageMsg::Commit) {
                         in.bad = "unknown message type " + std::to_string(in.h.type);
@@ -1911,6 +2012,126 @@ int serve_stage(const std::string& bind_addr, int port, std::shared_ptr<TlsCrede
                 pos = in.h.b;
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::CkptRestoreOk;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::ParkSave: {
+                // as a CkptSave: after every reply and window before it, only where the session is, and a failed
+                // Commit or position table is this save's error.  A failed position table stays pending too: the main
+                // process skips a park that fails and goes on, so the message that replaces the session next (a
+                // Reset, a CkptRestore, a ParkRestore) must report it again - the request's positions are wrong
+                std::string e;
+                int stored = -1;
+                if (!replies_out()) { keep = false; break; }
+                if (!pending_err.empty() || !pos_err.empty()) {
+                    const std::string kept_pos = pos_err;
+                    e = take_pending();
+                    pos_err = kept_pos;
+                }
+                else if (in.h.b != pos)
+                    e = "a parked conversation at " + std::to_string(in.h.b) + ", the worker's session is at " +
+                        std::to_string(pos);
+                else if (in.h.b < 1) e = "an empty parked conversation";
+                else if (!h.park_save) e = "this worker keeps no parked conversations";
+                else stored = h.park_save(in.h.a, in.h.b, in.keep, e);
+                if (stored < 0) { keep = reply_error(e); break; }
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::ParkSaveOk;
+                r.a = stored;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::ParkRestore: {
+                // as a CkptRestore: the session is replaced, so a failed Commit no longer matters (logged); a failed
+                // position table does (it is this request's)
+                std::string e;
+                if (!pending_err.empty()) {
+                    std::fprintf(stderr, "strata stage worker: a commit failed before a parked conversation's "
+                                         "restore: %s\n", pending_err.c_str());
+                    pending_err.clear();
+                }
+                if (!replies_out()) { keep = false; break; }
+                if (!pos_err.empty()) {
+                    e = pos_err;
+                    pos_err.clear();
+                    keep = reply_error(e);
+                    break;
+                }
+                if (!h.park_restore) e = "this worker keeps no parked conversations";
+                if (!h.park_restore || !h.park_restore(in.h.a, in.h.b, in.keep, e)) {
+                    // the handler may have written part of the session before it failed: no position is trusted
+                    // (a missing park wrote nothing, but the main process reads from 0 then anyway: a Reset next)
+                    pos = -1;
+                    keep = reply_error(e);
+                    break;
+                }
+                pos = in.h.b;
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::ParkRestoreOk;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::SessionPut: {
+                // as a ParkSave: after every reply and window before it, only where the session is, a failed Commit
+                // or position table is this save's error.  Unlike a park's, both stay pending: a SAVE comes between
+                // requests and replaces nothing, so the next request (one that goes on from the live session too)
+                // must still find them.  A failure leaves the session where it was
+                std::string e;
+                bool ok = false;
+                int64_t bytes = 0;
+                if (!replies_out()) { keep = false; break; }
+                if (!pending_err.empty() || !pos_err.empty()) {
+                    const std::string kept = pending_err, kept_pos = pos_err;
+                    e = take_pending();
+                    pending_err = kept;
+                    pos_err = kept_pos;
+                }
+                else if (in.h.b != pos)
+                    e = "a session file at " + std::to_string(in.h.b) + ", the worker's session is at " +
+                        std::to_string(pos);
+                else if (in.h.b < 1) e = "an empty session";
+                else if (in.token[0] == 0 && in.token[1] == 0) e = "a session file without a token";
+                else if (in.lc < 0 || in.lc > in.h.b || (in.lc == 0) != (in.h.a == 0))
+                    e = "a session file's checkpoint at " + std::to_string(in.lc) + " (part " +
+                        std::to_string(in.h.a) + ") of " + std::to_string(in.h.b) + " tokens";
+                else if (!h.session_put) e = "this worker keeps no session files";
+                else ok = h.session_put(in.h.a, in.h.b, in.token, in.lc, bytes, e);
+                if (!ok) { keep = reply_error(e.empty() ? std::string("the session file was not written") : e); break; }
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SessionPutOk;
+                r.a = bytes;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::SessionGet: {
+                // the session is replaced, but only once the whole file has passed its checks: a failed Commit or
+                // position table is this restore's error, not the missing one (the main process ends its engine).  The
+                // Commit's is reported here and dropped; the position table's stays pending (its request's)
+                std::string e;
+                if (!replies_out()) { keep = false; break; }
+                if (!pending_err.empty() || !pos_err.empty()) {
+                    const std::string kept_pos = pos_err;
+                    e = take_pending();
+                    pos_err = kept_pos;
+                    keep = reply_error(e);
+                    break;
+                }
+                if (in.h.b < 1) e = "an empty session";
+                else if (in.token[0] == 0 && in.token[1] == 0) e = "a session file without a token";
+                else if (in.lc < 0 || in.lc > in.h.b || (in.lc == 0) != (in.h.a == 0))
+                    e = "a session file's checkpoint at " + std::to_string(in.lc) + " (part " +
+                        std::to_string(in.h.a) + ") of " + std::to_string(in.h.b) + " tokens";
+                else if (!h.session_get) e = "this worker keeps no session files";
+                if (!e.empty()) { keep = reply_error(e); break; }   // (nothing written: the position stands)
+                if (!h.session_get(in.h.a, in.h.b, in.token, in.lc, in.keep, e)) {
+                    // the missing case wrote nothing (the session is where it was); any other may have
+                    if (e.rfind(kStageCkptMissing, 0) != 0) pos = -1;
+                    keep = reply_error(e.empty() ? std::string("the session file was not restored") : e);
+                    break;
+                }
+                pos = in.h.b;
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SessionGetOk;
                 if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 break;
             }

@@ -478,6 +478,115 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     return sync(error);
 }
 
+// ---- a remote stage worker's half of a parked conversation (docs/remote-stage/PARKING.md): the K/V of this session's
+// own attention layers for cells [0, tokens) and its running state at `tokens`, without token ids (the worker has none)
+bool conversation_part_bytes(const SessionState& ss, const ModelGeometry& g, size_t tokens, size_t& bytes,
+                             std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, tokens, z, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    size_t n = 0;
+    if (!product(n, {layers, z.tail + z.dead + z.block_pos})) return fail(error, "park byte count overflow");
+    const size_t state = z.gdn + (ss.ple_hist ? z.ple : 0);
+    if (n > SIZE_MAX - state) return fail(error, "park byte count overflow");
+    n += state;
+    for (size_t j = 0; j < layers; ++j) {
+        size_t k = 0;
+        if (!conversation_kv_capture_bytes({}, owned(ss, j), g, (int64_t) tokens, true, k, error)) return false;
+        if (k > SIZE_MAX - n) return fail(error, "park byte count overflow");
+        n += k;
+    }
+    bytes = n;
+    return true;
+}
+
+bool conversation_part_save(std::vector<ConversationKv>& kv, ConversationCheckpoint& state, const SessionState& ss,
+                            const ModelGeometry& g, size_t tokens, std::string& error) {
+    if (tokens < 1) return fail(error, "an empty park");
+    if (!sync(error)) return false;
+    // built apart, so a failure leaves the caller's vectors as they were
+    ConversationCheckpoint s;
+    std::vector<ConversationKv> k(owned_qsa(ss));
+    if (!conversation_checkpoint_save(s, ss, g, tokens, error)) return false;
+    for (size_t j = 0; j < k.size(); ++j)
+        if (!conversation_kv_save(k[j], owned(ss, j), g, (int64_t) tokens, true, error)) return false;
+    kv = std::move(k);
+    state = std::move(s);
+    return true;
+}
+
+bool conversation_part_validate(const std::vector<ConversationKv>& kv, const ConversationCheckpoint& state,
+                                const SessionState& ss, const ModelGeometry& g, size_t tokens, std::string& error) {
+    if (tokens < 1) return fail(error, "an empty park");
+    if (kv.size() != owned_qsa(ss)) return fail(error, "a park of another layer carve");
+    if (!checkpoint_validate(state, ss, g, tokens, error)) return false;
+    for (size_t j = 0; j < kv.size(); ++j)
+        if (!conversation_kv_validate(kv[j], owned(ss, j), g, (int64_t) tokens, true, error)) return false;
+    return true;
+}
+
+ConversationRestore conversation_part_restore(const std::vector<ConversationKv>& kv, const ConversationCheckpoint& state,
+                                              SessionState& ss, const ModelGeometry& g, size_t tokens,
+                                              std::string& error) {
+    if (!conversation_part_validate(kv, state, ss, g, tokens, error)) return ConversationRestore::invalid;
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    // conversation_kv_restore writes the authoritative pool and refreshes a streamed layer's resident window
+    for (size_t j = 0; j < kv.size(); ++j)
+        if (!conversation_kv_restore(kv[j], owned(ss, j), g, (int64_t) tokens, true, error))
+            return ConversationRestore::transfer_failed;
+    if (!conversation_checkpoint_restore(state, ss, g, tokens, error)) return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+
+bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss, const ModelGeometry& g,
+                                      size_t tokens, std::string& error) {
+    if (!c.ids.empty() && c.ids.size() != tokens) return fail(error, "a checkpoint of another length");
+    return checkpoint_validate(c, ss, g, tokens, error);
+}
+
+bool conversation_part_sources(std::vector<SessionKvSource>& sources, ConversationCheckpoint& state,
+                               StageSessionHead& head, const SessionState& ss, const ModelGeometry& g, size_t tokens,
+                               std::string& error) {
+    if (tokens < 1) return fail(error, "an empty session");
+    if (!sync(error)) return false;
+    // built apart, so a failure leaves the caller's as they were
+    ConversationCheckpoint s;
+    if (!conversation_checkpoint_save(s, ss, g, tokens, error)) return false;
+    std::vector<SessionKvSource> out(owned_qsa(ss));
+    for (size_t j = 0; j < out.size(); ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, (int64_t) tokens, true, error)) return false;
+    head.geometry = geometry_key(g);
+    head.layer_lo = ss.layer_lo;
+    head.layer_hi = ss.layer_hi;
+    head.tokens = tokens;
+    sources = std::move(out);
+    state = std::move(s);
+    return true;
+}
+
+bool conversation_part_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
+                                   size_t tokens, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, tokens, z, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    size_t tails = 0, dead = 0, block_pos = 0;
+    if (!product(tails, {layers, z.tail}) || !product(dead, {layers, z.dead}) ||
+        !product(block_pos, {layers, z.block_pos})) return fail(error, "indexer byte count overflow");
+    SessionReadLimits l = limits;   // keeps the caller's admit / progress / max_file_bytes
+    l.max_tokens = 0;               // a worker's states carry no token ids
+    l.max_checkpoints = 1;
+    l.max_kv_layers = layers;
+    l.geometry = geometry_key(g);
+    l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
+    l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+    l.max_kv_bytes.assign(layers, {});
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_part_sizes(owned(ss, j), g, (int64_t) tokens, true, l.max_kv_bytes[j], error))
+            return false;
+    limits = std::move(l);
+    return true;
+}
+
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
                                   const ModelGeometry& g, std::string& error, bool queued) {
     // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two

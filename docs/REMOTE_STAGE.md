@@ -483,6 +483,14 @@ python3 tools/stage_node.py node.json
 - Other endpoints: `GET /ping`, `GET /info` (GPU, RAM, the clock setting), `POST /stop`, `GET /log`, `POST /sink`
   and `POST /send` (a link test), `POST /put`, `GET /ranges`, `GET /sha256` (for `stage_ship.py`). A stop waits up
   to 180 s for the worker to exit (a worker with ~30 GB of pinned experts takes more than 30 s to unpin).
+- `POST /service` (`{"name": NAME, "action": "start" | "stop" | "status"}`, opt-in): runs one of node.json's
+  `"services"` - `{"NAME": {"start": [ARG, ...], "stop": [...], "status": [...], "timeout_s": 300}}` - and answers its
+  exit code, seconds and the last 40 lines of its output. Only those argument lists run (no shell, nothing taken from
+  the request), one `/service` at a time (a second one meanwhile answers **409** at once), at most `timeout_s` (1 to
+  3600 s; then the command and what it waits for are ended). For another engine's helper on this PC
+  that a main process elsewhere switches to, for example DeepSeek's expert server behind a server's `model_control`
+  (DETAILS.md, "Sharing the GPU"). A command that leaves a daemon behind (`setsid nohup`) still returns: the output is
+  read from a file, not a pipe. A daemon it starts runs in the agent's service, so restarting the agent's unit ends it.
 - Shipped files are sparse: on Windows they are marked sparse and grown with `SetEndOfFile` (NTFS and ReFS would
   otherwise write the gaps as zeros), so 84.77 GiB of shards holding 8 layers took 11.94 GiB of disk. A drive that
   cannot hold sparse files (FAT32, exFAT) is refused with that reason.

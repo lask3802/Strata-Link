@@ -108,12 +108,23 @@ def parse_request(req: dict, cfg: dict) -> dict:
     return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "response_format": fmt}
 
 
-def sd_cli_args(cfg: dict, job: dict, out_pattern: str) -> list[str]:
+def write_prompt(work: Path, prompt: str) -> Path:
+    """The job's prompt as a file for sd-cli's --prompt-file, readable by this user only (#4202).  Not on the command line:
+    every local account can read a process's arguments (ps, /proc/<pid>/cmdline).  Written as UTF-8 without newline
+    translation and read back by sd-cli as raw bytes, so the prompt is unchanged."""
+    path = work / "prompt.txt"
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8", newline="") as f:
+        f.write(prompt)
+    return path
+
+
+def sd_cli_args(cfg: dict, job: dict, out_pattern: str, prompt_file: str) -> list[str]:
     """The sd-cli command for one job: the model card's stable-diffusion.cpp command (8 steps, CFG 1, euler, Turbo's
-    sigmas, --diffusion-fa from the config's args), the size, seed and batch count, and the config's other args."""
+    sigmas, --diffusion-fa from the config's args), the prompt from `prompt_file` (write_prompt), the size, seed and
+    batch count, and the config's other args."""
     cmd = [str(cfg["exe"]),
            "--diffusion-model", str(cfg["diffusion_model"]), "--vae", str(cfg["vae"]), "--llm", str(cfg["llm"]),
-           "-p", job["prompt"],
+           "--prompt-file", prompt_file,
            "--steps", str(job["steps"]), "--cfg-scale", "1.0", "--sampling-method", "euler",
            "-W", str(job["width"]), "-H", str(job["height"])]
     if job["steps"] == TURBO_STEPS:
@@ -223,7 +234,15 @@ class ImageGen:
         the GPU turn.  ImageJobFailed when sd-cli fails, times out or is cancelled."""
         work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
         pattern = str(work / "img_%d.png")
-        cmd = sd_cli_args(self.cfg, job, pattern)
+        try:
+            cmd = sd_cli_args(self.cfg, job, pattern, str(write_prompt(work, job["prompt"])))
+        except BaseException:                       # the prompt file was not made: nothing else is in the folder yet
+            for p in work.iterdir():
+                with contextlib.suppress(OSError):
+                    p.unlink()
+            with contextlib.suppress(OSError):
+                work.rmdir()
+            raise
         timeout = float(self.cfg.get("timeout_s") or 3600)
         logf = work / "sd-cli.log"
         t0 = time.monotonic()
@@ -444,6 +463,7 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
     elif policy == "unload" and restore:
         if restore != "unloaded":
             svc.restore_after_load = restore         # Service.ensure_loaded restores it after the next start
+            svc.restore_after_load_from = None
         if gen.reload == "eager":
             try:
                 svc.ensure_loaded()                  # the caller still holds the FIFO
@@ -452,16 +472,20 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
 
 
 def restore_session(svc) -> None:
-    """After an engine start: restore the conversation an image job saved before it unloaded the engine."""
+    """After an engine start: restore the conversation an image job (or session_on_unload) saved before it unloaded
+    the engine."""
     path = getattr(svc, "restore_after_load", None)
     if not path:
         return
+    what = getattr(svc, "restore_after_load_from", None) or "the image job"
     svc.restore_after_load = None
+    svc.restore_after_load_from = None
     try:
         r = svc.engine.session_file("restore", path)
-        print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
-    except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
-        print(f"[strata] the conversation from before the image job was not restored ({e}); the next request "
+        print(f"[strata] the conversation from before {what} is back ({r.get('tokens')} tokens)", flush=True)
+    except Exception as e:                           # noqa: BLE001 - the engine runs without the old cache (or was
+        #                                              ended by a FATAL restore: ensure_loaded starts it again)
+        print(f"[strata] the conversation from before {what} was not restored ({e}); the next request "
               "reads its prompt again", flush=True)
     finally:
         with contextlib.suppress(OSError):

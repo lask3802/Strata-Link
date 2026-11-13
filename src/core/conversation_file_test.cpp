@@ -739,6 +739,9 @@ int main() {
         check(session_free_space_dir("/a/b/chat.bin", false) == "/a/b", "free space: POSIX folder");
         check(session_free_space_dir("/chat.bin", false) == "/", "free space: POSIX root");
         check(session_free_space_dir("chat.bin", false) == ".", "free space: POSIX bare name");
+        uint64_t free_bytes = 0;   // the volume of a file to be written in `dir` (a remote main's check before SAVE)
+        check(session_free_bytes((dir / "not-yet.bin").string(), free_bytes) && free_bytes > 0,
+              "free space: read for a file not written yet");
     }
 #ifndef _WIN32
     // what restore will not open: a symbolic link, a hard-linked file, a FIFO, a directory
@@ -768,6 +771,332 @@ int main() {
         check(::stat(link.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "the session file is mode 0600");
     }
 #endif
+
+    // ---- remote stage session files (docs/remote-stage/SESSIONS.md)
+    // a remote main process's file carries its worker half's token in the header's reserved words: an engine that
+    // does not ask for a token (one GPU, or an older build: both check those words are zero) refuses it
+    {
+        const SessionToken token{0x0123456789abcdefull, 0xfedcba9876543210ull};
+        check(session_token_hex(token) == "0123456789abcdeffedcba9876543210", "token: 32 hex digits, t[0] first");
+        check(stage_session_file_name(token) == "stage-session-0123456789abcdeffedcba9876543210.bin",
+              "token: the worker's file name");
+        const SessionToken t1 = session_token_new(), t2 = session_token_new();
+        check(!session_token_zero(t1) && !session_token_zero(t2) && t1 != t2, "token: new ones are not zero, nor equal");
+        const fs::path remote = dir / "remote-main.bin";
+        SessionWriteOptions opt;
+        opt.worker_token = token;
+        check(session_file_write(remote.string(), original, id, written, error, opt), "remote main: write with a token");
+        const std::vector<char> g = slurp(remote);
+        uint64_t r0 = 0, r1 = 0, hh = 0;
+        std::memcpy(&r0, g.data() + 40, 8); std::memcpy(&r1, g.data() + 48, 8); std::memcpy(&hh, g.data() + 56, 8);
+        check(r0 == token[0] && r1 == token[1] && hh == session_hash64(g.data(), 56, 0),
+              "remote main: the token in the reserved words, under the header's checksum");
+        check(g.size() == image.size() && std::equal(g.begin() + 64, g.end(), image.begin() + 64),
+              "remote main: everything after the header as without a token");
+        check(rejects(remote, id, "invalid header fields"),
+              "remote main: a read that asks for no token (one GPU, an older engine) refuses the file");
+        SessionReadLimits want;
+        want.worker_token = true;
+        SavedConversation back;
+        size_t read = 0;
+        SessionStatus st;
+        check(session_file_read(remote.string(), id, back, read, error, want, &st) && same(original, back) &&
+                  st.worker_token == token,
+              "remote main: a read that asks for a token takes the file and returns it");
+        st = {};
+        check(session_file_read(good.string(), id, back, read, error, want, &st) && session_token_zero(st.worker_token),
+              "remote main: a file without a token reads with a zero one (the engine refuses that itself)");
+    }
+    // the worker's half: its own format, written and read whole
+    {
+        auto stage_state = [](uint8_t seed) {
+            ConversationCheckpoint c = checkpoint(0, seed);
+            c.imgs.clear();   // (a worker's state carries no ids and no pictures)
+            return c;
+        };
+        StageSessionImage w;
+        w.head.token = {0x1111111111111111ull, 0x2222222222222222ull};
+        for (size_t i = 0; i < w.head.geometry.size(); ++i) w.head.geometry[i] = int64_t(100 + i);
+        w.head.layer_lo = 20;
+        w.head.layer_hi = 48;
+        w.head.tokens = 1000;
+        w.head.ckpt_tokens = 500;
+        w.state = stage_state(5);
+        w.ckpt = stage_state(6);
+        {
+            const SavedConversation s = sample();
+            w.kv.push_back(s.kv[0]);
+            w.kv.push_back(s.kv[1]);
+        }
+        auto same_stage = [&](const StageSessionImage& a, const StageSessionImage& b) {
+            if (a.head.token != b.head.token || a.head.geometry != b.head.geometry || a.head.layer_lo != b.head.layer_lo ||
+                a.head.layer_hi != b.head.layer_hi || a.head.tokens != b.head.tokens ||
+                a.head.ckpt_tokens != b.head.ckpt_tokens || !same_checkpoint(a.state, b.state) ||
+                (a.head.ckpt_tokens && !same_checkpoint(a.ckpt, b.ckpt)) || a.kv.size() != b.kv.size())
+                return false;
+            SavedConversation x, y;
+            x.kv = a.kv;
+            y.kv = b.kv;
+            return same(x, y);
+        };
+        const fs::path wdir = dir / "stage";
+        fs::create_directories(wdir);
+        const fs::path wp = wdir / stage_session_file_name(w.head.token);
+        check(stage_session_write(wp.string(), w, nullptr, id, written, error), "worker half: write");
+        check(written == fs::file_size(wp) && no_temp(wdir), "worker half: its size, no temporary left");
+        const std::vector<char> wimg = slurp(wp);
+        check(std::memcmp(wimg.data(), "STRWSES\x01", 8) == 0 &&
+                  std::memcmp(wimg.data() + wimg.size() - 8, "STRWEND\x01", 8) == 0,
+              "worker half: its own magic and end marker");
+        StageSessionHead want = w.head;
+        auto read_ok = [&](const fs::path& p, const StageSessionHead& h, const SessionFileIdentity& i,
+                           const SessionReadLimits& l, StageSessionImage& out) {
+            size_t n = 0;
+            error.clear();
+            return stage_session_read(p.string(), i, h, out, n, error, l) && n == fs::file_size(p);
+        };
+        {
+            StageSessionImage back;
+            check(read_ok(wp, want, id, {}, back) && same_stage(w, back), "worker half: round trip");
+        }
+        auto stage_rejects = [&](const fs::path& p, const StageSessionHead& h, const char* expect,
+                                 const SessionFileIdentity& i, const SessionReadLimits& l = {}) {
+            StageSessionImage out;
+            out.head.tokens = 77;   // (untouched by a refusal)
+            size_t n = 0;
+            error.clear();
+            const bool ok = stage_session_read(p.string(), i, h, out, n, error, l);
+            if (!ok && expect && error.find(expect) == std::string::npos) {
+                std::fprintf(stderr, "  unexpected error text: %s (wanted %s)\n", error.c_str(), expect);
+                return false;
+            }
+            return !ok && !error.empty() && out.head.tokens == 77 && out.kv.empty();
+        };
+        // every rejection before the caller's image is touched
+        StageSessionHead h = want;
+        h.token[1] ^= 1;
+        check(stage_rejects(wp, h, "token", id), "worker half: another token refused");
+        h = want;
+        h.token = {};
+        check(stage_rejects(wp, h, "without a token", id), "worker half: a read without a token refused");
+        check(stage_rejects(wp, want, "model", {id.model ^ 1, id.config}), "worker half: another model refused");
+        check(stage_rejects(wp, want, "configuration", {id.model, id.config ^ 1}),
+              "worker half: another configuration refused");
+        h = want;
+        h.layer_lo = 24;
+        check(stage_rejects(wp, h, "layers", id), "worker half: another layer range refused");
+        h = want;
+        h.tokens = 999;
+        check(stage_rejects(wp, h, "saved at 1000", id), "worker half: another L refused");
+        h = want;
+        h.ckpt_tokens = 0;
+        check(stage_rejects(wp, h, "checkpoint 500", id), "worker half: another Lc refused");
+        {
+            SessionReadLimits l;
+            std::array<int64_t, 18> other = w.head.geometry;
+            other[3] += 1;
+            l.geometry = other;
+            check(stage_rejects(wp, want, "geometry", id, l), "worker half: another geometry refused");
+            SessionReadLimits small;   // layer 0's K is 17 MiB: a bound of 4096 bytes refuses it before allocating
+            small.max_kv_bytes = {{4096, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX}};
+            check(stage_rejects(wp, want, "exceeds this engine's limit 4096", id, small),
+                  "worker half: a K/V part larger than this worker's refused");
+            SessionReadLimits one;
+            one.max_kv_layers = 1;
+            check(stage_rejects(wp, want, "exceeds", id, one), "worker half: more K/V layers than this worker owns refused");
+            SessionReadLimits poor;
+            poor.admit = [](uint64_t, std::string& why) { why = "no RAM (test)"; return false; };
+            SessionStatus st;
+            StageSessionImage out;
+            size_t n = 0;
+            check(!stage_session_read(wp.string(), id, want, out, n, error, poor, &st) &&
+                      st.error == SessionError::memory && error.find("no RAM (test)") != std::string::npos,
+                  "worker half: the RAM preflight refuses before the payload is read");
+        }
+        for (size_t cut : {size_t(0), size_t(63), size_t(64), size_t(64 + 18 * 8 + 3), wimg.size() / 2,
+                           wimg.size() - 16, wimg.size() - 1}) {
+            const fs::path p = wdir / "cut.bin";
+            spit(p, std::vector<char>(wimg.begin(), wimg.begin() + (std::ptrdiff_t) cut));
+            check(stage_rejects(p, want, nullptr, id), "worker half: a torn file refused");
+        }
+        {
+            auto d = wimg;
+            d.push_back('x');
+            const fs::path p = wdir / "tail.bin";
+            spit(p, d);
+            check(stage_rejects(p, want, "size", id), "worker half: trailing bytes refused");
+        }
+        for (size_t at : {size_t(64 + 18 * 8 + 40), wimg.size() / 2, wimg.size() - 12}) {
+            auto d = wimg;
+            d[at] ^= 0x10;
+            const fs::path p = wdir / "flip.bin";
+            spit(p, d);
+            check(stage_rejects(p, want, nullptr, id), "worker half: a corrupted byte refused (the hash)");
+        }
+        {
+            auto d = wimg;
+            d[20] ^= 0x10;   // the model fingerprint, its checksum not recomputed
+            const fs::path p = wdir / "flip-head.bin";
+            spit(p, d);
+            check(stage_rejects(p, want, "header checksum", id), "worker half: a corrupted header refused");
+        }
+        check(stage_rejects(good, want, "a main process's session file", id), "worker half: a main file is not one");
+        check(rejects(wp, id, "worker's half"), "a worker half is not a main file");
+        check(stage_rejects(wdir / "absent.bin", want, nullptr, id), "worker half: a missing file refused");
+        // no checkpoint (Lc 0)
+        {
+            StageSessionImage n = w;
+            n.head.ckpt_tokens = 0;
+            n.ckpt = {};
+            const fs::path p = wdir / "nockpt.bin";
+            check(stage_session_write(p.string(), n, nullptr, id, written, error), "worker half: write without a checkpoint");
+            StageSessionImage back;
+            check(read_ok(p, n.head, id, {}, back) && same_stage(n, back), "worker half: round trip without a checkpoint");
+            check(stage_rejects(p, want, "checkpoint 0", id), "worker half: one without a checkpoint is not one with");
+        }
+        // what a write refuses before any disk access
+        {
+            StageSessionImage bad = w;
+            bad.head.token = {};
+            SessionStatus st;
+            check(!stage_session_write((wdir / "bad.bin").string(), bad, nullptr, id, written, error, {}, &st) &&
+                      st.error == SessionError::invalid && !fs::exists(wdir / "bad.bin"),
+                  "worker half: no token, no file");
+            bad = w;
+            bad.head.tokens = 0;
+            bad.head.ckpt_tokens = 0;
+            check(!stage_session_write((wdir / "bad.bin").string(), bad, nullptr, id, written, error) &&
+                      !fs::exists(wdir / "bad.bin"), "worker half: an empty session, no file");
+            bad = w;
+            bad.head.ckpt_tokens = 1001;
+            check(!stage_session_write((wdir / "bad.bin").string(), bad, nullptr, id, written, error) &&
+                      !fs::exists(wdir / "bad.bin"), "worker half: a checkpoint past L, no file");
+        }
+        // temp + rename: a failure before the rename keeps the old file, and no temporary is left
+        {
+            SessionWriteOptions fo;
+            fo.fault = [](const char* step) { return std::strcmp(step, "rename") == 0 ? EIO : 0; };
+            StageSessionImage n = w;
+            n.head.tokens = 1001;
+            SessionStatus st;
+            check(!stage_session_write(wp.string(), n, nullptr, id, written, error, fo, &st) && !st.published &&
+                      slurp(wp) == wimg && no_temp(wdir),
+                  "worker half: a failed rename keeps the old file, no temporary left");
+            fo.fault = [](const char* step) { return std::strcmp(step, "write") == 0 ? ENOSPC : 0; };
+            check(!stage_session_write(wp.string(), n, nullptr, id, written, error, fo, &st) &&
+                      st.error == SessionError::storage && slurp(wp) == wimg && no_temp(wdir),
+                  "worker half: a full disk keeps the old file (storage)");
+            SessionWriteOptions full;
+            full.min_free_bytes = UINT64_MAX / 2;
+            check(!stage_session_write(wp.string(), n, nullptr, id, written, error, full, &st) &&
+                      st.error == SessionError::storage && slurp(wp) == wimg,
+                  "worker half: the free-space preflight refuses before writing");
+        }
+#ifndef _WIN32
+        {
+            struct stat st {};
+            check(::stat(wp.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "worker half: mode 0600");
+        }
+#endif
+        // the keep-N rule: the N newest stage-session files stay, the one just written always; other names stay
+        {
+            const fs::path kd = dir / "keep";
+            fs::create_directories(kd);
+            const auto now = fs::file_time_type::clock::now();
+            std::vector<std::string> names;
+            for (int i = 0; i < 6; ++i) {
+                SessionToken t{uint64_t(i + 1), 0};
+                names.push_back(stage_session_file_name(t));
+                spit(kd / names.back(), std::vector<char>(10, 'k'));
+                fs::last_write_time(kd / names.back(), now - std::chrono::hours(10 - i));   // names[5] the newest
+            }
+            for (const char* other : {"stage-session-ABC.bin", "notes.txt", ".stage-session-x.tmp",
+                                      "stage-session-0000000000000000000000000000000G.bin"})
+                spit(kd / other, std::vector<char>(3, 'o'));
+            std::string pe;
+            // names[0], the oldest, is the one just written (its time does not count)
+            const size_t removed = stage_session_prune(kd.string(), 4, names[0], pe);
+            check(removed == 2 && pe.empty(), "keep-N: two removed of six, keeping four");
+            check(fs::exists(kd / names[0]) && fs::exists(kd / names[5]) && fs::exists(kd / names[4]) &&
+                      fs::exists(kd / names[3]) && !fs::exists(kd / names[2]) && !fs::exists(kd / names[1]),
+                  "keep-N: the one just written and the three newest stay, the oldest go");
+            check(fs::exists(kd / "stage-session-ABC.bin") && fs::exists(kd / "notes.txt") &&
+                      fs::exists(kd / ".stage-session-x.tmp") &&
+                      fs::exists(kd / "stage-session-0000000000000000000000000000000G.bin"),
+                  "keep-N: other names are not touched");
+            // a link of that name (to a file elsewhere) is not this rule's: never counted, never deleted
+            const fs::path link = kd / stage_session_file_name(SessionToken{0x77, 0});
+            std::error_code lec;
+            fs::create_symlink(dir / "good.bin", link, lec);   // (Windows: only with the privilege to make links)
+            check(stage_session_prune(kd.string(), 1, names[0], pe) == 3 && fs::exists(kd / names[0]),
+                  "keep-N 1: only the one just written");
+            if (!lec) check(fs::is_symlink(link) && fs::exists(dir / "good.bin"), "keep-N: a link of that name is kept");
+            else std::printf("  (no symbolic link here: %s; the link check is skipped)\n", lec.message().c_str());
+            check(stage_session_prune((kd / "absent").string(), 1, "", pe) == 0 && !pe.empty(),
+                  "keep-N: a missing folder is an error, nothing removed");
+        }
+        // --stage-session-dir: made absolute, created (0700 on POSIX); a file there is refused
+        {
+            const fs::path cwd = fs::current_path();
+            fs::current_path(dir);
+            std::string d = "made/sessions", de;
+            const bool ok = stage_session_dir_prepare(d, de);
+            fs::current_path(cwd);
+            check(ok && fs::path(d).is_absolute() && fs::is_directory(dir / "made" / "sessions") &&
+                      fs::equivalent(fs::path(d), dir / "made" / "sessions"),
+                  "session dir: made absolute and created");
+#ifndef _WIN32
+            struct stat st {};
+            check(::stat(d.c_str(), &st) == 0 && (st.st_mode & 0777) == 0700, "session dir: created 0700");
+#endif
+            std::string again = d;
+            check(stage_session_dir_prepare(again, de) && again == d, "session dir: one that exists is taken");
+            std::string f = (dir / "good.bin").string();
+            check(!stage_session_dir_prepare(f, de) && de.find("not a folder") != std::string::npos,
+                  "session dir: a file is refused");
+        }
+        // a save ended in the middle of its write leaves its temporary file: the worker's start removes it - only
+        // that exact name, a regular file, and one not written to for the stale time (another worker may be writing)
+        {
+            const fs::path td = dir / "temps";
+            fs::create_directories(td);
+            const std::string half = stage_session_file_name(SessionToken{0xabc, 0xdef});
+            const std::string stale = "." + half + ".0123456789abcdef.tmp", fresh = "." + half + ".fedcba9876543210.tmp";
+            const auto old = fs::file_time_type::clock::now() - std::chrono::hours(2);
+            std::vector<std::string> others = {"." + half + ".AAAAAAAAAAAAAAAA.tmp", "." + half + ".0123456789abcdef.tmpx",
+                                               "." + half + ".0123456789abcde.tmp", ".notes.0123456789abcdef.tmp",
+                                               half, "keep.txt"};
+            for (const auto& n : others) spit(td / n, std::vector<char>(5, 't'));
+            spit(td / stale, std::vector<char>(5, 't'));
+            spit(td / fresh, std::vector<char>(5, 't'));
+            for (const auto& n : others) fs::last_write_time(td / n, old);
+            fs::last_write_time(td / stale, old);
+            const std::string as_dir = "." + stage_session_file_name(SessionToken{1, 1}) + ".1111111111111111.tmp";
+            fs::create_directories(td / as_dir);
+            fs::last_write_time(td / as_dir, old);
+            const fs::path target = dir / "temp-target.bin";
+            spit(target, std::vector<char>(5, 'x'));
+            const std::string as_link = "." + stage_session_file_name(SessionToken{2, 2}) + ".2222222222222222.tmp";
+            std::error_code lec;
+            fs::create_symlink(target, td / as_link, lec);
+            std::string d = td.string(), de, warn;
+            size_t removed = 9;
+            const bool prep = stage_session_dir_prepare(d, de, &removed, &warn);
+            if (!prep || removed != 1 || !warn.empty())
+                std::fprintf(stderr, "  dir_prepare: %d, %zu removed, warning %s, error %s\n", (int) prep, removed,
+                             warn.c_str(), de.c_str());
+            check(prep && removed == 1 && warn.empty() &&
+                      !fs::exists(td / stale),
+                  "temporary files: the stale one of a worker half's exact name removed");
+            bool kept = fs::exists(td / fresh) && fs::is_directory(td / as_dir) && fs::exists(target);
+            for (const auto& n : others) kept = kept && fs::exists(td / n);
+            check(kept, "temporary files: a fresh one, other names, a folder and a link's target are kept");
+            if (!lec) check(fs::is_symlink(td / as_link), "temporary files: a link of that name is kept");
+            std::string again = td.string();
+            check(stage_session_dir_prepare(again, de, &removed, &warn, 0) && removed == 1 && !fs::exists(td / fresh),
+                  "temporary files: with no stale time the fresh one goes too");
+        }
+    }
 
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);

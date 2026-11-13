@@ -26,6 +26,13 @@ node.json (paths are this PC's):
                                                    optional: lock the GPU's clocks (MHz) while a worker runs - for a
                                                    Windows worker (see Workers.lock_clocks); needs administrator/root
       "restart": true                              default: start a worker that ended by itself again (Workers.exited)
+      "stage_session_dir": "/srv/stage/sessions",  optional: the folder a worker keeps its half of its main process's
+      "stage_session_keep": 4                      session files in, and how many (docs/remote-stage/SESSIONS.md); a
+                                                   /start with "session_dir": true passes them (the caller names no path)
+      "services": {"NAME": {"start": [...], "stop": [...], "status": [...], "timeout_s": 300}}
+                                                   optional: commands this PC runs for /service by name - e.g. another
+                                                   engine's server that a main process elsewhere switches to.  Only
+                                                   these argument lists run (no shell, nothing from the request)
     }
 
 Who may drive it: the agent speaks HTTPS, TLS 1.3 only, and takes a connection only from a PC whose certificate is
@@ -48,7 +55,7 @@ out, https://):
                                worker - running, restarts so far, its last exit (code, time) and the next start's time
     POST /start                {"begin": K, "end": K2?, "next": "host:port"?, "port": 7841, "prefill": 5888,
                                 "cache": "auto"|slots, "extra": [...], "model"?: {"dir": D, "native": F, "pack": P,
-                                "profile"?: R, "ple"?: G}}
+                                "profile"?: R, "ple"?: G}, "session_dir"?: true}
                                - stops the worker on that port, starts this one and answers when it listens (or with
                                its log's tail when it exits).  "model" runs a model shipped under data_dir
                                (data_dir/models/D/F, data_dir/packs/P), so one agent serves every model shipped to it
@@ -66,6 +73,9 @@ out, https://):
                                connection open for the next (every other answer closes it)
     GET  /ranges?path=P        the byte ranges of data_dir/P written so far ([[offset, length], ...]) and its size
     GET  /sha256?path=P        the sha256 of data_dir/P (a whole file shipped again only when it changed)
+    POST /service              {"name": NAME, "action": "start"|"stop"|"status"} - runs node.json's services[NAME]
+                               [action] (one /service at a time) and answers its exit code, seconds and output's tail;
+                               404 without that service, 400 without that action
 The shipped model files keep every offset of the originals, so a node that holds only its layers' bytes (and
 every shard's header) loads them as from the whole file - tools/stage_ship.py sends only those.
 """
@@ -81,6 +91,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -227,10 +238,122 @@ def peer_name(sock: ssl.SSLSocket) -> str:
     return f"{cn} (SHA256:{hashlib.sha256(der).hexdigest()[:16]})"
 
 
+SERVICE_ACTIONS = ("start", "stop", "status")
+SERVICE_TIMEOUT_S = 300.0      # a service command's default limit ("timeout_s", at most SERVICE_TIMEOUT_MAX_S)
+SERVICE_TIMEOUT_MAX_S = 3600.0
+
+
+def check_services(value) -> dict:
+    """node.json's "services": {NAME: {action: [arg, ...], "timeout_s": S}} -> the same, checked (ValueError)."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("services must be an object")
+    out = {}
+    for name, s in value.items():
+        if not PLAIN_NAME.fullmatch(name) or not isinstance(s, dict):
+            raise ValueError(f"services: {name!r} must be a plain name with an object")
+        one = {}
+        for action in SERVICE_ACTIONS:
+            cmd = s.get(action)
+            if cmd is None:
+                continue
+            if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd)):
+                raise ValueError(f"services.{name}.{action} must be a list of strings")
+            one[action] = list(cmd)
+        if not one:
+            raise ValueError(f"services.{name} has none of {', '.join(SERVICE_ACTIONS)}")
+        t = s.get("timeout_s", SERVICE_TIMEOUT_S)
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 1 <= t <= SERVICE_TIMEOUT_MAX_S:
+            raise ValueError(f"services.{name}.timeout_s must be 1..{SERVICE_TIMEOUT_MAX_S:g} s")
+        one["timeout_s"] = float(t)
+        out[name] = one
+    return out
+
+
+class Services:
+    """node.json's named commands, one run at a time.  The output goes to a temporary file, not a pipe: a command
+    that leaves a daemon behind (setsid nohup) would otherwise keep the pipe open and the answer would never come."""
+
+    def __init__(self, cfg: dict):
+        self.services = cfg.get("_services", {})
+        self.lock = threading.Lock()
+
+    def run(self, name, action) -> tuple[int, dict]:
+        s = self.services.get(name) if isinstance(name, str) else None
+        if s is None:
+            return 404, {"ok": False, "error": f"no service {name!r} in node.json"}
+        if action not in SERVICE_ACTIONS or action not in s:
+            return 400, {"ok": False, "error": f"service {name} has no action {action!r}"}
+        # not queued: a caller that gave up must not have its start or stop run later, after it went on
+        if not self.lock.acquire(blocking=False):
+            return 409, {"ok": False, "error": "another /service is still running"}
+        try:
+            t0 = time.perf_counter()
+            with tempfile.TemporaryFile() as out:
+                try:
+                    # its own process group: a timeout ends what it started and still waits for (not a daemon it
+                    # detached with setsid, which has a session of its own)
+                    kw = {"start_new_session": True} if os.name != "nt" else \
+                        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                    p = subprocess.Popen(s[action], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **kw)
+                    try:
+                        rc, err = p.wait(timeout=s["timeout_s"]), None
+                    except subprocess.TimeoutExpired:
+                        rc, err = None, f"did not finish in {s['timeout_s']:g} s"
+                        try:
+                            if os.name != "nt":
+                                os.killpg(p.pid, signal.SIGKILL)
+                            else:
+                                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True,
+                                               timeout=30)
+                        except (OSError, subprocess.SubprocessError):
+                            p.kill()
+                        p.wait()
+                except OSError as e:
+                    rc, err = None, f"could not run: {e}"
+                size = out.seek(0, os.SEEK_END)                  # the tail: the last 4 MiB, not the first
+                out.seek(max(0, size - (4 << 20)))
+                text = out.read().decode("utf-8", errors="replace")
+            body = {"ok": rc == 0, "name": name, "action": action, "rc": rc,
+                    "seconds": round(time.perf_counter() - t0, 2), "output": tail(text, 40)}
+            if err:
+                body["error"] = err
+            sys.stderr.write(f"stage_node: service {name} {action}: rc {rc}{f' ({err})' if err else ''}\n")
+            return 200, body
+        finally:
+            self.lock.release()
+
+
+def session_args(cfg: dict) -> list[str] | None:
+    """node.json "stage_session_dir" (an absolute path on this PC) and "stage_session_keep" (optional, 1..1000000): the
+    worker's --stage-session-dir / --stage-session-keep for a /start with "session_dir": true, or None when node.json
+    names no folder.  ValueError for a value that is not one.  The folder is this file's alone: a /start names none
+    (no /start flag names a file to write or read)."""
+    d, keep = cfg.get("stage_session_dir"), cfg.get("stage_session_keep")
+    if d is None:
+        if keep is not None:
+            raise ValueError("stage_session_keep needs stage_session_dir")
+        return None
+    if not isinstance(d, str) or not d.strip() or any(ord(ch) < 32 for ch in d) or not os.path.isabs(d):
+        raise ValueError(f"stage_session_dir must be an absolute path on this PC, not {d!r}")
+    out = ["--stage-session-dir", d]
+    if keep is not None:
+        if isinstance(keep, bool) or not isinstance(keep, int) or not 1 <= keep <= 1000000:
+            raise ValueError(f"stage_session_keep must be a whole number from 1 to 1000000, not {keep!r}")
+        out += ["--stage-session-keep", str(keep)]
+    return out
+
+
 def load_config(path: str) -> dict:
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     if cfg.get("token_file"):
         sys.stderr.write("stage_node: node.json's token_file is not used any more (tls_dir instead)\n")
+    try:
+        cfg["_services"] = check_services(cfg.get("services"))
+        session_args(cfg)
+    except ValueError as e:
+        sys.exit(f"stage_node: node.json: {e}")
     d = tls_dir(cfg.get("tls_dir"), "stage_node")
     try:
         cfg["_tls"], cfg["_server_ctx"], cfg["_client_ctx"] = d, tls_context(d, True), tls_context(d, False)
@@ -492,7 +615,13 @@ class Workers:
             return {"ok": False, "error": f"flags not allowed here: {bad} (node.json extra_allow)"}
         if (req.get("end") is None) != (req.get("next") is None):
             return {"ok": False, "error": "a relay needs both end and next"}
+        sd = req.get("session_dir", False)
+        if not isinstance(sd, bool):
+            return {"ok": False, "error": "session_dir must be true or false"}
         try:
+            if sd and session_args(self.cfg) is None:
+                return {"ok": False, "error": "session_dir: this PC's node.json names no stage_session_dir (the "
+                                              "folder its workers keep session files in)"}
             self.model(req)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
@@ -528,7 +657,10 @@ class Workers:
         args += ["--pack", m["pack"], "--native", m["native"]] + (["--ple-gguf", m["ple_gguf"]] if m["ple_gguf"] else [])
         args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
-        args += [str(a) for a in c.get("args", [])] + extra
+        args += [str(a) for a in c.get("args", [])]
+        if req.get("session_dir") is True:   # (node.json's folder, checked by _refusal: the caller names no path;
+            args += session_args(c) or []   # before extra: an extra ending in a flag cannot take its value)
+        args += extra
         env = dict(os.environ)
         env.pop("STRATA_STAGE_TOKEN", None)
         env["STRATA_STAGE_TLS"] = str(c["_tls"])
@@ -840,7 +972,9 @@ class Body:
             pass
 
 
-def make_handler(cfg: dict, workers: Workers, store: Store):
+def make_handler(cfg: dict, workers: Workers, store: Store, services: Services | None = None):
+    services = services if services is not None else Services(cfg)
+
     class Handler(BaseHTTPRequestHandler):
         # HTTP/1.1, but only a /put answered ok (its body read whole) keeps the connection (the shipper's next piece
         # follows on it); every other answer closes it, as HTTP/1.0 did - no handler is left with an unread body before
@@ -973,6 +1107,9 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
                 self.reply(200, {"ok": True, "stopped": workers.stop(req.get("port"))})
             elif path == "/send":
                 self.reply(200, send_test(req["url"], int(req.get("mib", 64)), cfg["_client_ctx"]))
+            elif path == "/service":   # one of node.json's named commands (opt-in "services")
+                code, body = services.run(req.get("name"), req.get("action"))
+                self.reply(code, body)
             else:
                 self.reply(404, {"ok": False, "error": "unknown path"})
 
