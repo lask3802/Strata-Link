@@ -268,9 +268,11 @@ Where the code differs from the design it was built from, or says more than it:
 - The worker streams its K/V to disk on a save (no host copy) but reads its whole half into RAM on a restore.
 - A temporary file left by a worker ended in the middle of a write is removed at the worker's next start, once it is
   10 minutes old; a worker half whose main file was never written is deleted by the keep-N rule. On the main PC, when
-  the engine is ended during the save before an unload (the server's bound, a `FATAL`), the server deletes the
-  hidden temporary files of `unload-session.bin` (`.unload-session.bin.<16 hex>.tmp`, that name only) in
-  `slot_save_path`; a `/slots` save's temporary file left by an ended engine stays until someone deletes it.
+  the save before an unload fails (the server's bound, a `FATAL`, a crash), the server deletes the hidden temporary
+  files of `unload-session.bin` (`.unload-session.bin.<16 hex>.tmp`, that name only) in `slot_save_path` once the
+  engine has stopped; a `/slots` save's temporary file left by an ended engine stays until someone deletes it.
+- With `session_on_unload` on, `/slots` refuses the file name `unload-session.bin` in any case (400): the save
+  before an unload would replace that file and the load after it delete it. Off, it is a name like any other.
 - Before `SessionPut` a remote main checks its own disk against `--session-min-free-mib` (the reserve alone: the
   main file's size is known only once it is captured), so a full disk on the main PC refuses the save (`storage`)
   without a worker half; a disk between the reserve and the reserve plus the file still leaves an orphan half.

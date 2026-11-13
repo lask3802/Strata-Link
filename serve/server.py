@@ -5330,6 +5330,10 @@ class Service:
         if action not in ("save", "restore"):
             return error(400, "action must be save or restore")
         why = slot_filename_problem(filename)
+        if not why and self.session_on_unload and filename.lower() == UNLOAD_SESSION_FILE:
+            # (lower: Windows and macOS folders ignore case) the save before an unload replaces this file and the
+            # load after it deletes it: a /slots file of this name would be lost
+            why = f"is the name session_on_unload uses ({UNLOAD_SESSION_FILE}); choose another"
         if why:
             return error(400, f"filename {why}")
         path = os.path.join(self.slot_save_path, filename)
@@ -5938,8 +5942,10 @@ class Service:
                 return "busy"
             if self.switching:                          # model_control: the switch command stops it (its own way)
                 return "busy"
-            self._save_before_unload()
+            failed = self._save_before_unload()
             self.engine.unload()
+            if failed:                                  # the engine is stopped now: a temporary file its save left
+                self._drop_unload_temps()               # (ended mid-write: the bound, a FATAL, a crash) is nobody's
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
@@ -5950,21 +5956,22 @@ class Service:
         finally:
             self.fifo.release()
 
-    def _save_before_unload(self) -> None:
+    def _save_before_unload(self) -> bool:
         """session_on_unload (opt-in): the conversation the engine holds, saved to slot_save_path/unload-session.bin
         before the engine stops; the next load restores it (ensure_loaded -> restore_after_load) and deletes the file.
         The caller holds the FIFO.  It never stops the unload: a failure (nothing to save, short of RAM or disk, an
         engine that cannot save, a remote stage whose worker keeps no session files) is one log line, and a save not
         done in session_on_unload_timeout_s ends the engine (the unload was about to stop it).  The FIFO is held
         meanwhile: a request, or a peer server's before_load calling POST /unload here, waits up to that long.  With
-        --session-save-reclaim the save is retried as the /slots save is, within the same time."""
+        --session-save-reclaim the save is retried as the /slots save is, within the same time.  -> True when a save
+        was tried and failed (the caller removes its temporary files once the engine has stopped)."""
         if not self.session_on_unload or not self.slot_save_path or not hasattr(self.engine, "session_file"):
-            return
+            return False
         if getattr(self.engine, "batch", 0):            # parallel requests: no session files (slot_action's reason)
             if not self.session_on_unload_said:
                 self.session_on_unload_said = True
                 print("[strata] session_on_unload is ignored: this engine runs parallel requests", flush=True)
-            return
+            return False
         path = os.path.join(self.slot_save_path, UNLOAD_SESSION_FILE)
         with self.status_lock:
             self.status.update(busy=True, phase="saving the session", started=time.time(), first_token=None,
@@ -5981,21 +5988,19 @@ class Service:
                   "prompt again", flush=True)
             with contextlib.suppress(OSError):          # (an older file, or one a failed save published: not restored)
                 os.unlink(path)
-            alive = getattr(self.engine, "alive", None)
-            if callable(alive) and not alive():         # ended in the middle of its write (the deadline, a FATAL):
-                self._drop_unload_temps()               # its hidden temporary file is nobody's now
-            return
+            return True
         finally:
             with self.status_lock:
                 self.status["busy"] = False
         self.restore_after_load, self.restore_after_load_from = path, "the unload"
         print(f"[strata] the conversation ({r.get('tokens')} tokens, {r.get('bytes')} bytes) saved in "
               f"{float(r.get('ms') or 0) / 1000:.1f} s before the unload; the next load restores it", flush=True)
+        return False
 
     def _drop_unload_temps(self) -> None:
-        """The temporary files an ended engine's save of unload-session.bin left in slot_save_path (the engine names
-        them .<name>.<16 hex>.tmp beside the file and removes its own unless it is ended first).  Only that one name's:
-        a /slots save's temporary files are not touched."""
+        """The temporary files a failed save of unload-session.bin left in slot_save_path, called once the engine has
+        stopped (the engine names them .<name>.<16 hex>.tmp beside the file and removes its own unless it is ended
+        first).  Only that one name's: a /slots save's temporary files are not touched."""
         pat = re.compile(r"\." + re.escape(UNLOAD_SESSION_FILE) + r"\.[0-9a-f]{16}\.tmp")
         gone = 0
         try:

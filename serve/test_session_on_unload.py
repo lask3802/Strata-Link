@@ -148,19 +148,38 @@ class SessionOnUnload(unittest.TestCase):
     def test_a_failed_save_does_not_stop_the_unload(self):
         Path(self.path).write_bytes(b"old")              # an older file is not restored either
         temp = Path(self.dir.name) / f".{UNLOAD_SESSION_FILE}.0123456789abcdef.tmp"
-        temp.write_bytes(b"part")                        # an engine still in step removes its own: not the server's
+        temp.write_bytes(b"part")                        # left by a save that failed: removed once the engine stopped
         self.engine.fail = True                          # SERR invalid: nothing to save
         self.assertEqual(self.svc.unload(), "unloaded")
         self.assertEqual(self.sent(), [f"SAVE {self.path}\n"])
         self.assertTrue(self.engine.unloaded)
         self.assertIsNone(self.svc.restore_after_load)
         self.assertFalse(os.path.exists(self.path))
-        self.assertTrue(temp.exists())
+        self.assertFalse(temp.exists())
         self.assertFalse(self.svc.status["busy"])
         self.engine.fail = False
         with self.svc.fifo:
             self.svc.ensure_loaded()
         self.assertEqual(self.engine.proc.sent, [], "nothing to restore after the load")
+
+    def test_a_saved_unload_leaves_temporary_files_alone(self):
+        # a save that succeeded removed its own temporary file: the server touches nothing (this one is a stand-in)
+        temp = Path(self.dir.name) / f".{UNLOAD_SESSION_FILE}.0123456789abcdef.tmp"
+        temp.write_bytes(b"part")
+        self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertEqual(self.svc.restore_after_load, self.path)
+        self.assertTrue(temp.exists())
+
+    def test_slots_refuse_the_unload_file_name_while_it_is_on(self):
+        # the save before an unload replaces unload-session.bin and the load after it deletes it: a /slots file of
+        # that name would be lost.  Any case (Windows and macOS folders ignore it); off, the name is a name as before.
+        for name in (UNLOAD_SESSION_FILE, UNLOAD_SESSION_FILE.upper()):
+            code, body = self.svc.slot_action("0", "save", name)
+            self.assertEqual(code, 400, name)
+            self.assertIn("session_on_unload", body["error"]["message"])
+        self.assertEqual(self.engine.proc.sent, [], "nothing was sent to the engine")
+        self.svc.session_on_unload = False
+        self.assertEqual(self.svc.slot_action("0", "save", UNLOAD_SESSION_FILE)[0], 200)
 
     def test_a_save_that_does_not_answer_in_time_is_given_up(self):
         # a step announced for an hour (a remote stage's worker writing its half), and then nothing

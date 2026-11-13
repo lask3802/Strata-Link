@@ -4321,8 +4321,9 @@ int main(int argc, char** argv) {
         remote_park_asked = remote_main && o.prompt_cache > 0 && o.conversation_cache_mib > 0 &&
                                        o.conversation_cache_slots > 0;
         if (remote_main && o.conversation_cache_mib > 0 && !remote_park_asked)
-            std::fprintf(stderr, "strata generate: remote stage: conversation parking is off "
-                                 "(--conversation-cache-mib needs --prompt-cache N on the main process)\n");
+            std::fprintf(stderr, "strata generate: remote stage: conversation parking is off (%s)\n",
+                         o.prompt_cache > 0 ? "--conversation-cache-slots is 0"
+                                            : "--conversation-cache-mib needs --prompt-cache N on the main process");
         if (o.prompt_cache > 0)
             std::fprintf(stderr, "strata generate: remote stage: %d conversation checkpoints, at the prompt's turn "
                                  "boundaries only (--prompt-cache-every and --prompt-cache-tail are off)\n",
